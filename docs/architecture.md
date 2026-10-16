@@ -9,13 +9,18 @@ StellarEduPay is a three-tier application: a Next.js frontend, a Node.js/Express
 - [High-Level Overview](#high-level-overview)
 - [Component Diagram](#component-diagram)
 - [Data Flow: Payment Initiation to Confirmation](#data-flow-payment-initiation-to-confirmation)
+- [Payment Confirmation State Machine](#payment-confirmation-state-machine)
 - [Backend Services](#backend-services)
 - [Controllers](#controllers)
 - [Middleware](#middleware)
 - [MongoDB Schema Relationships](#mongodb-schema-relationships)
+- [Replica Set Requirement](#replica-set-requirement)
+- [Kubernetes Deployment](#kubernetes-deployment)
 - [Background Workers](#background-workers)
+- [Queue Durability](#queue-durability)
 - [Multi-School Tenancy](#multi-school-tenancy)
 - [Error Handling and Resilience](#error-handling-and-resilience)
+- [Fee Adjustment Rule Engine](#fee-adjustment-rule-engine)
 
 ---
 
@@ -183,6 +188,40 @@ Admin creates fee  →  Admin registers student  →  Parent gets instructions
 
 ---
 
+## Payment Confirmation State Machine
+
+Implemented in [`backend/src/services/paymentConfirmationStateMachine.js`](../backend/src/services/paymentConfirmationStateMachine.js) (issue #747). Payments move through five ranked states derived from Stellar ledger depth; transitions are monotonic (never regress) and idempotent under re-polling.
+
+```mermaid
+stateDiagram-v2
+    [*] --> detected
+
+    detected --> pending: 1..(CONFIRMATION_THRESHOLD-1) ledgers closed
+    detected --> confirmed: depth >= CONFIRMATION_THRESHOLD (fast-forward)
+    detected --> finalized: depth >= FINALIZATION_THRESHOLD (fast-forward)
+    detected --> failed: flagged suspicious
+
+    pending --> confirmed: depth >= CONFIRMATION_THRESHOLD
+    pending --> finalized: depth >= FINALIZATION_THRESHOLD (fast-forward)
+    pending --> failed: flagged suspicious
+
+    confirmed --> finalized: depth >= FINALIZATION_THRESHOLD
+    confirmed --> failed: flagged suspicious
+
+    finalized --> [*]
+    failed --> [*]
+```
+
+- **detected** — tx observed on Horizon, 0 ledgers closed since. Earliest possible state.
+- **pending** — awaiting enough ledger depth to be safe against a typical Horizon failover/replay.
+- **confirmed** — safe to treat as real money for balance/UI purposes.
+- **finalized** — practically irreversible; terminal.
+- **failed** — memo collision, fraud signal, or other invalid-payment escape; terminal, reachable from any non-terminal state.
+
+Forward jumps that skip intermediate states are allowed (e.g. a payment first observed already past `CONFIRMATION_THRESHOLD` goes straight from `detected` to `confirmed`). `finalized` and `failed` have no outgoing transitions, and re-computing a target state that doesn't outrank the current state is a no-op — see `resolveNextState()` and the transition table (`CONFIRMATION_STATE_TRANSITIONS`) for the enforced source of truth.
+
+---
+
 ## Backend Services
 
 ### `stellarService.js`
@@ -328,6 +367,150 @@ School
 
 ---
 
+## Concurrency Mechanism: Redis Distributed Locks (not MongoDB Transactions)
+
+StellarEduPay's concurrency primitive for financial operations is **Redis-backed distributed locking**, not MongoDB multi-document transactions.
+
+- **Lock service**: `backend/src/services/distributedLock.js` provides Redis-backed locks with `studentBalanceLockKey`.
+- **Call sites**: `stellarService.js`, `paymentController.js`, `underpaidReconciliationService.js` use distributed locks to serialize access to shared resources (e.g. a student's balance during concurrent payments).
+
+**Rationale:** Distributed locks are simpler to reason about than MongoDB transactions, are not affected by replica set configuration, and work across both MongoDB and external state (Stellar blockchain). They scale better under contention because lock holders are individually bounded and timeouts prevent indefinite hangs.
+
+**Not in use:** `backend/src/services/transactionManager.js` was added in commit 43f18e0 as a MongoDB-transaction implementation but was never adopted. It remains unreferenced in the codebase (`grep -r transactionManager backend/src --include='*.js' | grep -v transactionManager.js` yields no results). The module contains latent defects (invalid aggregation operators in non-pipeline updates, unscoped upserts creating tenant-less documents with NaN balances, stale reads between multi-step updates) that would corrupt financial state if adopted. It was deleted in this change.
+
+## Replica Set Requirement
+
+MongoDB **multi-document transactions require a replica set (or a sharded cluster)**. This is an infrastructure requirement, not an application-code concern: against a standalone `mongod`, every attempt to start a transaction fails with
+
+```
+MongoServerError: Transaction numbers are only allowed on a replica set member or mongos
+```
+
+and no change to application code can fix it — the database must run with `--replSet` and be initiated once with `rs.initiate()`.
+
+StellarEduPay configures MongoDB to support transactions on all environments, though transactions are not currently used on core write paths (which rely on distributed locks instead):
+
+- `transactionPollingService.processTransaction` — records the Payment and updates the Student balance atomically
+- `stellarService.verifyTransaction` — same pair of writes for manually verified payments
+- `feeController` and `feeAdjustmentController` batch apply — multi-document fee updates
+
+### How each environment complies
+
+| Environment | Configuration |
+|-------------|---------------|
+| Docker Compose | `mongo` service runs `mongod --replSet rs0` with a boot-generated keyfile; its healthcheck runs `rs.initiate()` and only reports healthy once the node is PRIMARY. Backend/backup URIs include `replicaSet=rs0`. |
+| CI (GitHub Actions) | Both Mongo service containers (`test` and `docker-build` jobs) start with `--replSet rs0`; their healthcheck performs `rs.initiate()` so job steps begin only after initiation. |
+| Kubernetes | `deploy/k8s/mongodb-statefulset.yaml` runs `--replSet rs0 --bind_ip_all` with a postStart hook that initiates rs0; the readiness probe gates traffic on writability (`db.hello().isWritablePrimary`). MONGO_URI must include `?replicaSet=rs0`. |
+| Local development | Run `mongod --replSet rs0` and call `rs.initiate()` once (see README "Prerequisites"). |
+
+> **Note**: MongoDB Atlas deployments are replica sets by default and need no extra configuration. A standalone `mongod` is sufficient ONLY where no code path opens a session — which is nowhere in this backend.
+
+---
+
+## Kubernetes Deployment
+
+StellarEduPay is deployed on Kubernetes using manifests in `deploy/k8s/`, which can be applied directly or overlaid with Kustomize for environment-specific configuration.
+
+### Image Configuration
+
+The base manifests reference placeholder image tags: `stellaredupay/backend:placeholder` and `stellaredupay/frontend:placeholder`. These **must** be overridden in production.
+
+**CI Image Promotion:**
+1. The CI pipeline (`docker-build` job) tags images with a commit SHA on every merge to main: `stellaredupay/backend:sha-<commit>` and `stellaredupay/frontend:sha-<commit>`.
+2. Use Kustomize image overrides in environment-specific overlays to plumb the SHA tag into deployments automatically.
+
+**Example Kustomization (testnet overlay):**
+```yaml
+# deploy/k8s/overlays/testnet/kustomization.yaml
+images:
+  - name: stellaredupay/backend
+    newTag: sha-abc1234  # Updated by your CD pipeline
+  - name: stellaredupay/frontend
+    newTag: sha-abc1234
+```
+
+**Private Registry with imagePullSecrets:**
+
+If your registry requires authentication, create a Kubernetes secret and reference it:
+```bash
+kubectl create secret docker-registry regcred \
+  --docker-server=your.registry.com \
+  --docker-username=<username> \
+  --docker-password=<password> \
+  --docker-email=<email>
+```
+
+Then add to your overlay's `kustomization.yaml`:
+```yaml
+imagePullSecrets:
+  - name: regcred
+```
+
+### TLS / HTTPS Configuration
+
+The ingress manifest (`deploy/k8s/ingress.yaml`) includes automatic TLS termination using cert-manager and Let's Encrypt. **Prerequisites:**
+
+1. **Install cert-manager** in your cluster:
+   ```bash
+   helm repo add jetstack https://charts.jetstack.io
+   helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace \
+     --set installCRDs=true
+   ```
+
+2. **Create a ClusterIssuer** for Let's Encrypt (create a file like `letsencrypt-issuer.yaml`):
+   ```yaml
+   apiVersion: cert-manager.io/v1
+   kind: ClusterIssuer
+   metadata:
+     name: letsencrypt-prod
+   spec:
+     acme:
+       server: https://acme-v02.api.letsencrypt.org/directory
+       email: ops@example.com  # Replace with a real email
+       privateKeySecretRef:
+         name: letsencrypt-prod
+       solvers:
+         - http01:
+             ingress:
+               class: nginx
+   ```
+
+3. **Update the ingress domain:** Replace `YOUR_DOMAIN_HERE` in `deploy/k8s/ingress.yaml` with your actual domain (e.g., `stellaredupay.example.com`):
+   ```yaml
+   spec:
+     tls:
+       - hosts:
+           - stellaredupay.example.com  # Your domain
+         secretName: stellaredupay-tls
+     rules:
+       - host: stellaredupay.example.com  # Match the TLS host
+         http:
+           paths: [...]
+   ```
+
+4. **Deploy the issuer and ingress:**
+   ```bash
+   kubectl apply -f letsencrypt-issuer.yaml
+   kubectl apply -k deploy/k8s/overlays/mainnet  # or testnet
+   ```
+
+**TLS Configuration Details:**
+- `cert-manager.io/cluster-issuer: "letsencrypt-prod"` — annotation tells cert-manager to use the `letsencrypt-prod` ClusterIssuer.
+- `nginx.ingress.kubernetes.io/ssl-redirect: "true"` — enforces HTTPS by redirecting all HTTP traffic to HTTPS.
+- `tls:` block specifies the hosts and the secret name where the certificate is stored (auto-created by cert-manager).
+
+**Verification:**
+
+Once deployed, cert-manager automatically issues a certificate and stores it in the secret. Monitor the issuing process:
+```bash
+kubectl describe certificate stellaredupay-tls
+kubectl describe clusterissuer letsencrypt-prod
+```
+
+Your API traffic (JWT tokens, payment transaction hashes, student PII) is now encrypted end-to-end, and browsers will see a valid HTTPS certificate.
+
+---
+
 ## Background Workers
 
 All workers start on server boot inside the `connectDatabase().then(...)` callback in `app.js` and shut down gracefully on `SIGTERM`/`SIGINT`.
@@ -335,10 +518,79 @@ All workers start on server boot inside the `connectDatabase().then(...)` callba
 | Worker | Start function | Interval | Purpose |
 |---|---|---|---|
 | Transaction poller | `startPolling()` | `POLL_INTERVAL_MS` (30s) | Sync new payments from Stellar |
-| Retry worker | `startRetryWorker()` | `RETRY_INTERVAL_MS` (60s) | Re-attempt failed verifications |
+| Retry worker | `startRetryWorker()` | `RETRY_INTERVAL_MS` (60s) | Re-attempt failed verifications (MongoDB-backed when Redis is absent) |
 | Consistency scheduler | `startConsistencyScheduler()` | configurable | Detect DB/chain drift |
 | Reminder scheduler | `startReminderScheduler()` | `REMINDER_INTERVAL_MS` (24h) | Send fee reminder emails |
-| TX queue worker | `startTxQueueWorker()` | event-driven (BullMQ) | Process queued transactions via Redis |
+| TX processing queue worker | `startTxQueueWorker()` | event-driven (BullMQ, **Durable via MongoDB outbox — see Queue Durability below**) | Process queued transactions submitted via `POST /api/payments/process-queue`, the stuck-payment reconciler, and any internal pathway |
+| Transaction retry + DLQ worker | `initializeRetryQueue()` | event-driven (BullMQ, configurable backoff with jitter) | Re-attempt transaction verifications on transient Horizon errors; permanent failures and retry exhaustion land in the dedicated dead-letter queue |
+| Report generation worker | `startReportQueueWorker()` | event-driven (BullMQ, **durable via `ReportJob` collection**) | Generate CSV/JSON reports and update `ReportJob` status to `completed` / `failed` |
+
+---
+
+## Queue Durability
+
+The codebase has three asynchronous queues. None of them relies solely on Redis — every queue has a MongoDB-backed outbox (or mirror) so no work-in-progress is silently dropped across a server restart, pod eviction, or Redis outage. **There is no in-memory queue that holds primary submission responsibility.**
+
+### Transaction processing queue — `queue/transactionQueue.js`
+
+This is the queue that holds the primary transaction-submission pathway used by:
+
+- The stuck-payment reconciliation scheduler (`stuckPaymentReconciliation.reconcileStuckPayments`)
+- Any internal/manual pathway that re-queues a known `txHash` for re-processing
+
+**Two-tier durability model:**
+
+1. **MongoDB first (durable backing).** Every `enqueueTransaction(txHash, ctx)` performs an `upsert` on `PendingVerification` (scoped on `txHash`, which is globally unique). The document moves through the lifecycle: `pending → processing → resolved | dead_letter`. MongoDB is the durable backing — BullMQ is the actual processor.
+2. **BullMQ second (best-effort dispatcher).** After MongoDB is written, the job is added to BullMQ with `jobId: txHash` so duplicate enqueues are deduplicated.
+
+If BullMQ is unavailable at module-load time (Redis down or network blip means `getRedisClient()` returns `null`, so the module-scope `transactionQueue` instance is `null`), the runtime enters MongoDB-only degraded mode. In that mode the MongoDB record is the source of truth — the job is *still safe* and will be picked up on the next process restart:
+
+- `enqueueTransaction(txHash, ctx)` writes the MongoDB record and returns `null` (the BullMQ step is skipped, `txHash` is just persisted for the next startup).
+- `recoverPendingJobs()` returns `0` and skips the BullMQ requeue loop (no `transactionQueue` to add to).
+- `markResolved`, `markDead`, `markInterrupted`, and `getJobStatus` (the MongoDB-side inspection) continue to work normally because they don't touch Redis.
+- On the **next process restart** with Redis reachable, the startup sweep re-enqueues every still-pending doc. (In-process auto-heal is not implemented — a restart is required to flip out of MongoDB-only mode.)
+
+**Restart recovery.** On server start, `recoverPendingJobs()` runs twice by design — first in `app.js` (after `connectDatabase().then(...)` resolves and `reconcileStuckPayments()` has just requeued any `SUBMITTED` payments older than `STUCK_PAYMENT_THRESHOLD_MS`, before any workers start), then again from `transactionQueueService.startWorker` (after the BullMQ worker is created). The second call is **idempotent rather than a true no-op**: BullMQ rejects `Queue.add()` for jobs whose `jobId: txHash` is already present with `Job with that id already exists`, and the loop logs and continues. The net effect is identical to a single call but produces a handful of expected warn logs on every boot (one per job recovered in the first sweep).
+
+1. Finds every `PendingVerification` doc with `status ∈ {pending, processing}` across all schools.
+2. Resets any `processing` doc back to `pending` so a fresh worker takes over.
+3. Re-adds the job to BullMQ. If BullMQ already holds the job (because its `jobId: txHash` was deduped), `Queue.add()` rejects with `Job with that id already exists`; the loop logs and continues, leaving both the MongoDB record and the existing BullMQ job intact.
+
+**Graceful shutdown.** `shutdownManager.drainWorkers()` calls `transactionQueue.drainWorker()` which:
+
+- Waits up to `DRAIN_TIMEOUT_MS` (default 60s) for in-flight jobs to finish.
+- If the timeout is hit, marks any still-`active` job's `PendingVerification` as `pending` (via `markInterrupted`) with `lastError: 'Job interrupted by shutdown drain timeout — will be recovered on restart'`. Critically, this is **NOT** `dead_letter` — `dead_letter` is reserved for terminal failures from `markDead`. The drain-timeout job is re-processable, so the next startup's `recoverPendingJobs()` sweep picks it up and re-enqueues it.
+
+**Test coverage.** `tests/transactionQueueDurability.test.js` (issue #388) and `tests/issue-800-queue-restart.test.js` (issue #800) verify the persistence-first contract, the recovery sweep, idempotent upsert on duplicate `txHash`, and `markResolved` / `markDead` semantics. The restart-mid-queue scenario ("no transaction submission is silently dropped after a process restart") is exercised by the new `'restart-mid-queue — no transaction is silently dropped (#1053)'` describe block in `tests/transactionQueueDurability.test.js`, which simulates restart by configuring the post-restart MongoDB state and verifying that `recoverPendingJobs()` re-enqueues the `txHash`-keyed job into BullMQ.
+
+### Transaction retry + DLQ queue — `queue/transactionRetryQueue.js`
+
+This queue exists **separately** from the transaction processing queue and serves a different purpose: it retries transaction verifications that failed due to transient errors (e.g. Horizon 429 / 5xx). It is initialised only when `retryServiceSelector.useBullMQ()` returns true (`REDIS_HOST` is configured).
+
+- **Main retry queue** (`transaction-retry-queue`): custom exponential backoff with up to `MAX_RETRY_ATTEMPTS` retries, capped by `MAX_RETRY_DELAY_MS`. The BullMQ Worker is configured with explicit `lockDuration`, `stalledInterval`, and `maxStalledCount` so that jobs whose worker dies mid-flight are reclaimed automatically by BullMQ itself.
+- **Dead-letter queue** (`transaction-dead-letter-queue`): terminal failures (`permanently_failed` errors from `retryContract.isPermanent`, or retry-exhaustion) are written here with the original job data, error code, and `failedAt` timestamp.
+
+The retry service also writes a `PendingVerification` mirror record for cross-school queue stats, so MongoDB remains the system-wide source of truth for "was this tx ever retried".
+
+**Difference from the transaction processing queue:** the retry worker uses BullMQ's built-in stalled-job reclaim (`lockDuration`, `stalledInterval`, `maxStalledCount`) for fast mid-flight recovery, while the transaction processing worker relies entirely on the MongoDB-backed `recoverPendingJobs()` sweep reconstituting the doc on restart. Both paths are durable; they are not the same recovery mechanism.
+
+### Report generation queue — `queue/reportQueue.js`
+
+Mirrors every job into the `ReportJob` collection with a monotonic lifecycle (`pending → processing → completed | failed`). The HTTP status endpoint reads the MongoDB record, not the BullMQ job state, so report status survives a queue restart.
+
+### Summary
+
+| Queue | In-memory only? | Lost on restart? | Cross-restart recovery path |
+|---|---|---|---|
+| Transaction processing (`transactionQueue.js`) | No | No | `recoverPendingJobs()` re-enqueues every `pending`/`processing` `PendingVerification` doc into BullMQ on every restart |
+| Transaction retry + DLQ (`transactionRetryQueue.js`) | No | No | BullMQ persists jobs in Redis; permanent failures are durably written to the DLQ; mirror records in `PendingVerification` survive even a full Redis loss |
+| Report generation (`reportQueue.js`) | No | No | `ReportJob` documents hold the authoritative state machine; `enqueueReportJob` re-creates the Document on every submission; report status queries read the MongoDB record |
+
+Failure modes that *can* lose a transaction, with mitigations:
+
+- **MongoDB write fails before BullMQ enqueue** — `enqueueTransaction` throws and the caller (typically `transactionQueueService.processTransactionJob` or `stuckPaymentReconciliation`) decides whether to retry. The error is logged with `correlationId` for triage.
+- **MongoDB upsert succeeds, BullMQ add succeeds, but the worker crashes before `markResolved` is called** — `PendingVerification.status` is left in `processing`. The startup recovery sweep (`recoverPendingJobs`) resets it to `pending` and re-adds to BullMQ, so the job is reprocessed. Idempotency in `processTransactionJob` (the existing `Payment.findOne({ txHash })` skip) ensures double-processing is a no-op.
+- **Redis backplane loses all data** (e.g. non-persistent Redis in dev) — `PendingVerification` documents with `status=pending|processing` are recovered on the next startup, even though BullMQ state was lost. The `'restart-mid-queue — no transaction is silently dropped (#1053)'` describe block in `tests/transactionQueueDurability.test.js` proves this flow.
 
 ---
 
@@ -360,6 +612,205 @@ Each school has its own `stellarAddress`. The transaction poller fans out to all
 
 ---
 
+## Payment Processing Backpressure
+
+**There is currently no backpressure mechanism on payment processing.** This is a deliberate statement of fact, not an oversight, and it is recorded here so that operators do not infer coverage from monitoring configuration that no longer exists.
+
+### What was removed
+
+`backend/src/services/concurrentPaymentProcessor.js` was deleted (issue #1036). It was an in-process queue that serialized payment processing and exposed a `getStats()` snapshot (`queueDepth`, `maxQueueDepth`) used to throttle intake. Its removal was never completed, which left three artifacts behind:
+
+- **In-process queue and thresholds.** The `MAX_QUEUE_DEPTH` and `QUEUE_BACKPRESSURE_HIGH_WATER` thresholds lived in that module. They no longer exist anywhere in the codebase, and no equivalent constant has replaced them.
+- **Prometheus gauges.** `payment_processor_queue_depth`, `payment_processor_queue_backpressure_high_water`, and `payment_processor_queue_max_depth` were declared in `backend/src/metrics/index.js` and are now removed. `payment_processor_queue_depth` was never actually set after the module was deleted — its `collect()` hook swallowed a `MODULE_NOT_FOUND` on every scrape — so it was exported with no value.
+- **Alert rules.** `monitoring/alerts/queue_backpressure.yml` contained two alerts (`PaymentProcessorQueueBackpressure`, `PaymentProcessorQueueSaturation`) comparing `payment_processor_queue_depth` against the two threshold gauges. Both were permanently unfireable and have been deleted along with the file.
+
+`transactionPollingService.getQueueBackpressureState()` previously attempted to read the processor's stats on every polling cycle, always took its `catch` branch, and logged an identical warning each time. It now returns an explicit `{ active: false }` fallback with no warning, matching the hardcoded `queueDepth = 0` fallback in `healthController.js`.
+
+### What provides backpressure today
+
+Nothing at the payment-processing layer. The mechanisms that do exist bound *adjacent* concerns, not payment intake:
+
+| Mechanism | Where | What it actually bounds |
+|---|---|---|
+| `concurrentRequestHandler` middleware | `backend/src/middleware/` | Concurrent outbound Horizon calls: circuit breaker (opens after 5 failures, resets after 30s) plus a request queue (max 50 concurrent, max 1000 queued). This protects Horizon from request bursts; it does not throttle payment submission. |
+| BullMQ worker concurrency | `queue/transactionQueue.js`, `queue/transactionRetryQueue.js` | How many queued jobs a worker processes at once. Excess work waits in Redis/MongoDB rather than being rejected — this is buffering, not backpressure. |
+| MongoDB-backed outbox | `PendingVerification` collection | Durability of queued work across restarts. Unbounded in size; it absorbs load rather than shedding it. |
+| `rateLimiter` middleware | `backend/src/middleware/rateLimiter.js` | Per-IP HTTP request rate. A coarse abuse control, not a payment-pipeline saturation control. |
+
+### Operator guidance
+
+- **Do not rely on queue-saturation alerting for payment processing.** No such alert exists. If payment intake needs to be throttled, that must be designed and implemented — it is not currently enforced anywhere.
+- **Watch the adjacent signals instead.** Horizon error rates and `concurrentRequestHandler` circuit-breaker state indicate upstream pressure; BullMQ queue depth and `PendingVerification` backlog growth indicate downstream accumulation. Neither is a substitute for intake throttling, but together they show whether the pipeline is falling behind.
+- **If a payment processor is reintroduced**, it must bring its own metrics and alerts. Do not re-add gauge declarations or alert rules that reference a module that does not exist — that is precisely the failure mode this section documents.
+
+---
+
+## Money Representation on the Payment-Verification Path
+
+`paymentController.verifyPayment` and the `studentBalanceUpdater` it shares with
+`submitTransaction` decide whether a student's fee is settled — `valid`,
+`partial`, or `overpaid` — and compute `excessAmount` / `remainingBalance`.
+That decision used to run on IEEE-754 doubles: cumulative totals were summed
+with MongoDB's `{ $sum: '$amount' }` (float addition, done server-side, order
+not guaranteed), rounded with `toFixed(7)`, and re-parsed with `parseFloat`
+before being compared against `feeAmount` with exact `<` / `>` / `===`.
+`toFixed` cannot repair a value already corrupted by float addition, and
+`parseFloat` immediately turns the rounded string back into a double —
+reintroducing the same class of error on the next operation. A fee paid in
+installments that summed, in exact decimal, to precisely the fee amount could
+therefore land one unit-in-the-last-place away and be misclassified `partial`
+or `overpaid` instead of `valid`.
+
+**Chosen representation: `decimal.js`.** This was already the convention
+elsewhere in the codebase (`paymentLimitsService.js`,
+`currencyConversionService.js`, `feeAdjustmentEngine.js`,
+`utils/paymentLimits.js` — see their "ROUNDING POLICY" comments), so extending
+it to the verification path unifies on an existing pattern rather than adding
+a fourth. Integer Stellar stroops (`utils/stellarAmount.js`, used by
+`stellarService.js`) remain the right choice for on-chain amount parsing and
+comparison, and are unaffected by this change.
+
+`backend/src/utils/money.js` is the canonical entry point for this path:
+
+- `toMoney(value)` / `decimalFromMongo(value)` — parse a JS value or a BSON
+  `Decimal128` aggregation result into a `Decimal`.
+- `classifyFeePayment(cumulativeTotal, feeAmount)` — the single place that
+  decides `valid` / `partial` / `overpaid` and derives `excessAmount` /
+  `remainingBalance`, all via exact `Decimal` comparison (`.cmp()`), never
+  float `<`/`>`/`===`.
+- `roundMoney(value)` / `toMoneyNumber(value)` — round to Stellar's 7 decimal
+  places and convert to a plain `Number` **only at the output boundary**
+  (the HTTP response or the Mongo write).
+
+**Conversion boundaries:**
+
+```
+MongoDB (amount: Number)
+      │  $group: { $sum: { $toDecimal: '$amount' } }   ← summed as Decimal128, exact
+      ▼
+Decimal128 (aggregation result)
+      │  decimalFromMongo()
+      ▼
+Decimal (decimal.js) ── classifyFeePayment() ── all arithmetic and comparison here
+      │  toMoneyNumber() / roundMoney().toNumber()
+      ▼
+Number  → HTTP response body / Student.totalPaid, remainingBalance, feePaid
+```
+
+The MongoDB half of the fix matters as much as the JS half: summing
+`{ $sum: '$amount' }` accumulates BSON-double rounding **inside MongoDB**,
+before the result ever reaches Node, so no amount of `decimal.js` downstream
+can recover it. Wrapping the summed field in `$toDecimal` makes MongoDB
+perform the addition in exact Decimal128 space instead.
+
+`parseFloat(x.toFixed(7))` must not reappear anywhere on this path — it is a
+reliable marker of float money arithmetic creeping back in.
+
+---
+
+## Fee Adjustment Rule Engine
+
+School admins create discount/penalty/waiver rules on the **Fee Adjustment
+Rules** admin page. When more than one rule matches the same student and
+payment, the order rules run in — and what happens when they disagree — is
+not visible from the UI alone, so it's documented here in full.
+
+**Live path:** admin page (`frontend/src/pages/fee-adjustments.jsx`) →
+`POST/PUT /api/fee-adjustments` → `feeAdjustmentController.js` →
+`FeeAdjustmentRule` Mongo model → `feeAdjustmentService.js`, which is what
+actually computes the fee used at payment time. See the doc comments atop
+`feeAdjustmentRuleModel.js` and `feeAdjustmentService.js` for the
+implementation-level detail this section summarizes.
+
+> **Not the live path:** `backend/src/services/feeAdjustmentEngine.js`
+> (`DynamicFeeAdjustmentEngine`) is a separate, self-contained engine with its
+> own hardcoded rule set. It is exercised only by
+> `tests/feeAdjustment.test.js` and `tests/feeAdjustmentEngine-interactions.test.js`
+> — nothing under `backend/src/controllers` or `backend/src/routes` calls it, so
+> it has no effect on any real fee. It also sorts priority in the **opposite**
+> direction (highest number first) from the live engine below and always
+> stacks every match. Its own header comment documents its behavior in detail
+> so it isn't mistaken for the production rules.
+
+### Rule application order
+
+Rules are sorted **ascending by `priority`** — the **lowest number runs
+first** — with ties broken by `name` ascending, so evaluation order is always
+fully deterministic (`feeAdjustmentService._fetchSortedRules`). Each rule
+operates on the fee amount **left by the previous rule**, not the original
+base amount, so for percentage rules the order changes the numeric result.
+
+### Conflict resolution strategy
+
+Only rules whose `conditions` match the student/payment context are
+considered. The `conflictResolutionPolicy` on the **first matching rule** (by
+priority) governs how the rest of the matches are handled:
+
+| Policy | Behavior |
+|---|---|
+| `stack` (default) | All matching rules apply in priority order, each on the fee left by the one before it. |
+| `first_only` | Only the highest-priority match applies; every other match is skipped. |
+| `best_for_student` | Among matching **discount** rules, only the one with the largest reduction applies; matching **penalty** rules always stack regardless of this policy. |
+
+A `waiver` rule sets the fee to 0 and stops processing immediately,
+regardless of policy. The final fee is always clamped to 0 (never negative).
+
+### Worked example: a percentage scholarship vs. an absolute surcharge
+
+Base fee: **₦10,000**. Two active rules match the same student:
+
+| Priority | Name | Type | Value |
+|---|---|---|---|
+| 5 | Sibling Scholarship | `discount_percentage` | 15 |
+| 20 | Late Registration Surcharge | `penalty_fixed` | 800 |
+
+**Policy `stack` (default, set on the priority-5 rule):**
+1. Priority 5 runs first — 15% off 10,000 → **8,500**
+2. Priority 20 runs next — flat +800 on the fee it inherited → **9,300**
+
+Final fee: **₦9,300**. If the priorities were reversed (surcharge at 5,
+scholarship at 20), the surcharge would apply to 10,000 first (→ 10,800) and
+the 15% discount would then apply to that larger number (→ 9,180) — a
+different final fee from the exact same two rules and values, purely because
+of priority order. This is why priority (not creation order) is what admins
+must set deliberately when rules are meant to interact.
+
+**Same two rules, policy `first_only` instead** (set on the priority-5 rule):
+only the Sibling Scholarship applies — final fee **₦8,500**. The surcharge is
+evaluated, matches, but is skipped because a higher-priority rule already
+applied.
+
+**Same two rules, policy `best_for_student`:** the surcharge is a penalty, so
+it always stacks; the scholarship is the only matching discount, so it also
+applies. Result is identical to `stack` here (**₦9,300**) — this policy only
+changes behavior once *more than one discount* matches at once, by keeping
+the single best one instead of stacking all of them.
+
+---
+
+## Frontend ↔ API Topologies
+
+Every client call in the frontend — the axios instance, `/auth/me` and
+`/auth/logout` in `useAdminAuth`, the SSE stream in `usePaymentEvents` and CSV
+report downloads — derives its URL from **one** value: `API_BASE_URL` in
+`frontend/src/config/apiBase.js`. It defaults to the relative base `/api` and
+only honours `NEXT_PUBLIC_API_URL` as an explicit override (#1578).
+
+Auth cookies are `HttpOnly; SameSite=Strict` with no `Domain`, so they are only
+sent on first-party requests to the host that issued them. The supported
+topologies are:
+
+| Topology | `NEXT_PUBLIC_API_URL` | How `/api` reaches the backend | Extra config |
+|----------|-----------------------|--------------------------------|--------------|
+| Same host via Ingress (Kubernetes) | `/api` (default) | `deploy/k8s/ingress.yaml` routes `/api` to the backend service | none |
+| Same host via Next rewrite (Docker Compose, local dev, Codespaces) | `/api` (default) | `next.config.js` `rewrites()` proxies `/api/*` to `BACKEND_PROXY_TARGET` | `BACKEND_PROXY_TARGET` (build-time; `http://backend:5000` in Compose, `http://localhost:5000` locally) |
+| Cross host (UI and API on different hosts) | absolute, e.g. `https://api.school.example/api` | browser calls the API host directly | backend must issue cookies with `SameSite=None; Secure` and a shared parent `Domain`, allow the UI origin in CORS; the API origin is added to CSP `connect-src` automatically |
+
+Prefer one of the same-host topologies: they need no CORS preflights, no CSP
+widening and keep cookies first-party.
+
+---
+
 ## Content Security Policy (CSP) Strategy
 
 CSP is enforced at two distinct layers, each appropriate to what it serves.
@@ -375,7 +826,7 @@ The browser-facing CSP is configured in `frontend/next.config.js` via the `heade
 | `style-src` | `'self'` | No inline styles |
 | `img-src` | `'self' data:` | Allows base64 data URIs for QR codes |
 | `font-src` | `'self'` | Same-origin fonts only |
-| `connect-src` | `'self' https://horizon-testnet.stellar.org https://horizon.stellar.org` | Allows fetch to the backend API and Stellar Horizon |
+| `connect-src` | `'self' https://horizon-testnet.stellar.org https://horizon.stellar.org` | Allows fetch to the same-origin `/api` and Stellar Horizon (the API origin is appended only for a cross-host `NEXT_PUBLIC_API_URL`) |
 | `object-src` | `'none'` | Blocks Flash and plugins |
 | `frame-ancestors` | `'none'` | Prevents clickjacking |
 | `base-uri` | `'self'` | Prevents base tag injection |

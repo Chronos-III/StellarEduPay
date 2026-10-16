@@ -3,15 +3,49 @@
 const database = require('../config/database');
 const { horizonClient, CB_FAILURE_THRESHOLD, CB_RESET_TIMEOUT_MS, CB_HALF_OPEN_SUCCESS_THRESHOLD } = require('../config/stellarConfig');
 const config = require('../config');
-const { concurrentPaymentProcessor } = require('../services/concurrentPaymentProcessor');
 const { getReminderStatus } = require('../services/reminderService');
 const { getCachedRates } = require('../services/currencyConversionService');
 const { getAuditHealth } = require('../services/auditService');
 const { getRedisStatus } = require('../config/redisClient');
+const { checkLiveness, WORKER_NAMES } = require('../services/workerHeartbeat');
+const { getRecoveryStatus } = require('../queue/transactionQueue');
 const logger = require('../utils/logger');
 const { isReady: isShutdownReady } = require('../services/shutdownManager');
 
 const STELLAR_CHECK_TIMEOUT_MS = 3000; // 3 second timeout for Stellar health check
+
+/**
+ * Map a raw dependency error to a stable, non-sensitive reason code (#1540).
+ *
+ * Raw error strings frequently include hostnames, ports and driver internals
+ * (e.g. "getaddrinfo ENOTFOUND mongo-0.mongo.svc"), so they are logged
+ * server-side and never returned in an HTTP response.
+ *
+ * @param {string|null|undefined} message
+ * @returns {string|null}
+ */
+function toReasonCode(message) {
+  if (!message) return null;
+  const m = String(message);
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(m)) return 'DNS_RESOLUTION_FAILED';
+  if (/ECONNREFUSED/i.test(m)) return 'CONNECTION_REFUSED';
+  if (/ECONNRESET|socket hang up/i.test(m)) return 'CONNECTION_RESET';
+  if (/timed? ?out|ETIMEDOUT|did not respond within/i.test(m)) return 'TIMEOUT';
+  if (/circuit/i.test(m)) return 'CIRCUIT_OPEN';
+  if (/auth|NOAUTH|WRONGPASS|unauthori[sz]ed|forbidden/i.test(m)) return 'AUTH_FAILED';
+  if (/not (yet )?connected|disconnected|readyState/i.test(m)) return 'NOT_CONNECTED';
+  return 'UNAVAILABLE';
+}
+
+/**
+ * Log a dependency failure with its raw message (server-side only) and return
+ * the reason code to expose instead.
+ */
+function reasonFor(dependency, message) {
+  const code = toReasonCode(message);
+  if (code) logger.warn('Health check dependency failure', { dependency, reason: code, error: String(message) });
+  return code;
+}
 
 async function checkStellar() {
   const start = Date.now();
@@ -51,7 +85,14 @@ async function checkStellar() {
   }
 }
 
-async function healthCheck(req, res) {
+/**
+ * Collect the full health report. Returns the HTTP status code and the
+ * detailed body served (behind admin auth) by GET /api/admin/health/details.
+ * Raw error messages are replaced with stable reason codes (#1540).
+ *
+ * @returns {Promise<{statusCode: number, body: object}>}
+ */
+async function buildHealthReport() {
   const [dbResult, stellarResult] = await Promise.allSettled([
     database.healthCheck(),
     checkStellar(),
@@ -75,18 +116,34 @@ async function healthCheck(req, res) {
   let overallStatus = 'healthy';
   let statusCode = 200;
 
+  // If the background poller has had Horizon unreachable for longer than its
+  // own max backoff window, no payments have synced since startup or the
+  // outage began — surface that explicitly rather than letting a healthy DB
+  // mask it. See issue #1340.
+  const POLL_MAX_BACKOFF_MS = parseInt(process.env.POLL_MAX_BACKOFF_MS || '300000', 10);
+  const { getHorizonUnreachableSince } = require('../services/transactionPollingService');
+  const horizonUnreachableSinceMs = getHorizonUnreachableSince();
+  const horizonUnreachableTooLong =
+    horizonUnreachableSinceMs !== null && Date.now() - horizonUnreachableSinceMs > POLL_MAX_BACKOFF_MS;
+
   if (db.healthy !== true) {
     overallStatus = 'unhealthy';
     statusCode = 503;
   } else if (redisConfigured && redisStatus.status !== 'ready') {
     overallStatus = 'degraded';
     statusCode = 200;
-  } else if (stellar.status !== 'ok') {
+  } else if (stellar.status !== 'ok' || horizonUnreachableTooLong) {
     overallStatus = 'degraded';
     statusCode = 200; // Still return 200 since DB is up and cached data can be served
   }
 
-  const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
+  // concurrentPaymentProcessor was removed (#1036) and its removal completed in
+  // #1275: no module emits payment-processor queue stats any more, so there is
+  // nothing to read here. This explicit zero fallback mirrors the one in
+  // transactionPollingService.js#getQueueBackpressureState() so the health
+  // payload and the polling backpressure path always agree.
+  const queueDepth = 0;
+  const maxQueueDepth = config.MAX_QUEUE_DEPTH;
 
   // Retry queue init status. For the Redis-backed BullMQ pipeline this reflects
   // whether initializeRetryQueue() succeeded; for the MongoDB fallback it reflects
@@ -105,6 +162,41 @@ async function healthCheck(req, res) {
   // surface that as degraded (DB is still up, so not fully unhealthy).
   if (retryQueueStatus === 'failed' && overallStatus === 'healthy') {
     overallStatus = 'degraded';
+  }
+
+  // Pending-job recovery degraded (#1381): Redis wasn't ready within the
+  // startup retry budget, so jobs that survived a restart are still sitting in
+  // MongoDB. Not unhealthy — the periodic jobRecoveryScheduler will drain them
+  // as soon as Redis reconnects — but worth surfacing so on-call can see it.
+  const jobRecovery = getRecoveryStatus();
+  if (jobRecovery.status === 'degraded' && overallStatus === 'healthy') {
+    overallStatus = 'degraded';
+  }
+
+  // Worker liveness check — any stale/not_started worker triggers 503 so
+  // orchestrators can restart the pod. "starting" is healthy (within grace).
+  const workerLiveness = checkLiveness();
+  if (!workerLiveness.allHealthy && overallStatus !== 'unhealthy') {
+    overallStatus = 'unhealthy';
+    statusCode = 503;
+  }
+
+  // BullMQ transaction queue worker heartbeat — a silently crashed worker stops
+  // payment processing without tripping the generic staleness check above (whose
+  // threshold is tuned for a quiet queue). Degrade/alert sooner based directly on
+  // POLL_INTERVAL_MS so on-call is paged before parents notice stuck payments.
+  const pollIntervalMs = parseInt(process.env.POLL_INTERVAL_MS || '30000', 10);
+  const txQueueWorker = workerLiveness.workers[WORKER_NAMES.TX_QUEUE_WORKER];
+  const txQueueHeartbeatAgeMs =
+    txQueueWorker?.lastBeatMs != null ? Date.now() - txQueueWorker.lastBeatMs : null;
+
+  if (txQueueHeartbeatAgeMs !== null) {
+    if (txQueueHeartbeatAgeMs > pollIntervalMs * 5) {
+      overallStatus = 'unhealthy';
+      statusCode = 503;
+    } else if (txQueueHeartbeatAgeMs > pollIntervalMs * 2 && overallStatus === 'healthy') {
+      overallStatus = 'degraded';
+    }
   }
 
   // Price feed status
@@ -130,12 +222,12 @@ async function healthCheck(req, res) {
         status: db.healthy ? 'healthy' : 'unhealthy',
         ...(db.latency !== undefined && { latency_ms: db.latency }),
         ...(db.readyState !== undefined && { readyState: db.readyState }),
-        ...(db.reason && { error: db.reason }),
+        ...(db.reason && { reason: reasonFor('database', db.reason) }),
       },
       stellar: {
         status: stellar.status,
         ...(stellar.latencyMs !== undefined && { latency_ms: stellar.latencyMs }),
-        ...(stellar.error && { error: stellar.error }),
+        ...(stellar.error && { reason: reasonFor('stellar', stellar.error) }),
         network: config.STELLAR_NETWORK,
         horizonUrl: stellar.activeUrl || config.HORIZON_URL,
         activeEndpoint: stellar.activeUrl || config.HORIZON_URL,
@@ -145,6 +237,9 @@ async function healthCheck(req, res) {
           resetTimeoutMs: CB_RESET_TIMEOUT_MS,
           halfOpenSuccessThreshold: CB_HALF_OPEN_SUCCESS_THRESHOLD,
         },
+        ...(horizonUnreachableSinceMs !== null && {
+          horizonUnreachableSince: new Date(horizonUnreachableSinceMs).toISOString(),
+        }),
       },
       paymentProcessor: {
         queueDepth,
@@ -157,7 +252,7 @@ async function healthCheck(req, res) {
         redisConfigured,
         redisStatus: redisStatus.status,
         ...(redisConfigured && { redisHost: process.env.REDIS_HOST }),
-        ...(redisStatus.reason && { error: redisStatus.reason }),
+        ...(redisStatus.reason && { reason: reasonFor('redis', redisStatus.reason) }),
         ...(redisStatus.lastUpdatedAt && { lastUpdatedAt: redisStatus.lastUpdatedAt }),
       },
       priceFeed: {
@@ -165,10 +260,54 @@ async function healthCheck(req, res) {
         rates: priceFeedStatus,
       },
       auditLog: getAuditHealth(),
+      jobRecovery: (() => {
+        const { lastError, ...rest } = jobRecovery;
+        return { ...rest, ...(lastError && { reason: reasonFor('jobRecovery', lastError) }) };
+      })(),
+      workers: {
+        healthy: workerLiveness.allHealthy,
+        detail: workerLiveness.workers,
+        transactionQueueWorker: {
+          heartbeatAgeMs: txQueueHeartbeatAgeMs,
+          degradedThresholdMs: pollIntervalMs * 2,
+          unhealthyThresholdMs: pollIntervalMs * 5,
+        },
+      },
     },
   };
 
-  return res.status(statusCode).json(body);
+  return { statusCode, body };
+}
+
+/**
+ * GET /health — public, unauthenticated (#1540).
+ *
+ * Returns only { status } with HTTP 200 (healthy/degraded) or 503 (unhealthy)
+ * so load balancers and uptime checks keep working without disclosing
+ * hostnames, Horizon endpoints, error strings, queue depths or worker state.
+ * The detailed report is served by GET /api/admin/health/details.
+ */
+async function healthCheck(req, res) {
+  try {
+    const { statusCode, body } = await buildHealthReport();
+    return res.status(statusCode).json({ status: body.status });
+  } catch (err) {
+    logger.error('Health check failed', { error: err.message });
+    return res.status(503).json({ status: 'unhealthy' });
+  }
+}
+
+/**
+ * GET /api/admin/health/details — admin-authenticated detailed diagnostics (#1540).
+ */
+async function healthDetails(req, res) {
+  try {
+    const { statusCode, body } = await buildHealthReport();
+    return res.status(statusCode).json(body);
+  } catch (err) {
+    logger.error('Health details failed', { error: err.message });
+    return res.status(503).json({ status: 'unhealthy', reason: toReasonCode(err.message) });
+  }
 }
 
 /**
@@ -213,19 +352,22 @@ async function healthReady(req, res) {
   const ready = db.healthy === true && stellar.status === 'ok';
   const statusCode = ready ? 200 : 503;
 
+  // #1540: this probe is unauthenticated — expose per-dependency status and a
+  // stable reason code only (no Horizon URLs, hostnames or raw errors).
   return res.status(statusCode).json({
     status: ready ? 'ready' : 'not_ready',
     timestamp: new Date().toISOString(),
     checks: {
-      database: { status: db.healthy ? 'healthy' : 'unhealthy', ...(db.reason && { error: db.reason }) },
+      database: {
+        status: db.healthy ? 'healthy' : 'unhealthy',
+        ...(db.reason && { reason: reasonFor('database', db.reason) }),
+      },
       stellar: {
         status: stellar.status,
-        activeEndpoint: stellar.activeUrl || config.HORIZON_URL,
-        endpoints: stellar.endpoints || [],
-        ...(stellar.error && { error: stellar.error }),
+        ...(stellar.error && { reason: reasonFor('stellar', stellar.error) }),
       },
     },
   });
 }
 
-module.exports = { healthCheck, healthLive, healthReady };
+module.exports = { healthCheck, healthDetails, healthLive, healthReady, buildHealthReport, toReasonCode };

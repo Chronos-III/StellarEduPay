@@ -7,11 +7,18 @@ const net = require('net');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 
+const School = require('../models/schoolModel');
 const WebhookRetry = require('../models/webhookRetryModel');
 const WebhookEndpoint = require('../models/webhookEndpointModel');
+const { decryptLeanEndpoint } = require('../models/webhookEndpointModel');
 const WebhookDelivery = require('../models/webhookDeliveryModel');
 const { validateWebhookUrl, validateResolvedIp } = require('../utils/validateWebhookUrl');
+const { resolveDnsWithCache } = require('../utils/dnsCache');
 const { buildWebhookPayload } = require('../utils/buildWebhookPayload');
+const {
+  resolveSignatureVersions,
+  signatureVersionLabel,
+} = require('../utils/webhookSignaturePolicy');
 const logger = require('../utils/logger').child('WebhookService');
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
@@ -49,8 +56,31 @@ async function _isReplay(deliveryId) {
   if (isRedisReady()) {
     const redis = getRedisClient();
     const key = `webhook:nonce:${deliveryId}`;
-    const result = await redis.set(key, '1', 'EX', REPLAY_WINDOW_S, 'NX');
-    return result === null;
+    try {
+      const result = await redis.set(key, '1', 'EX', REPLAY_WINDOW_S, 'NX');
+      return result === null;
+    } catch (redisErr) {
+      // Redis operation failed during an otherwise-ready connection (e.g. a
+      // transient command error). Fail closed: treat as a replay rather than
+      // silently allowing the delivery through with no dedup guarantee.
+      logger.error('Redis error in _isReplay — failing closed', {
+        deliveryId, error: redisErr.message,
+      });
+      return true;
+    }
+  }
+  // Redis is not configured or not ready. In a multi-replica deployment the
+  // per-process Map provides no cross-replica dedup guarantee. Fail closed so
+  // integrators receive a clear operational signal (Redis required) rather than
+  // silently degraded replay protection.
+  //
+  // If Redis is intentionally absent (single-process dev/test), set
+  // WEBHOOK_REPLAY_NONCES_LOCAL=true to restore the previous in-process fallback.
+  if (!process.env.WEBHOOK_REPLAY_NONCES_LOCAL) {
+    logger.warn('Redis unavailable in _isReplay — failing closed (set WEBHOOK_REPLAY_NONCES_LOCAL=true to enable in-process fallback)', {
+      deliveryId,
+    });
+    return true;
   }
   _evictExpiredNonces();
   if (_localNonces.has(deliveryId)) return true;
@@ -61,14 +91,63 @@ async function _isReplay(deliveryId) {
 function _resetNonces() { _localNonces.clear(); }
 
 // ── HMAC helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * V1 signature — signs only the JSON body (legacy, kept for backward compat).
+ * @param {object} payload
+ * @param {string} secret
+ * @returns {string} hex digest
+ */
 function generateSignature(payload, secret) {
   return crypto.createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
+}
+
+/**
+ * V2 signature — signs `${timestamp}.${deliveryId}.${rawBody}` where rawBody
+ * is the exact serialised JSON string that is transmitted on the wire.
+ *
+ * This binds the timestamp and delivery-ID to the signature so an attacker
+ * cannot replay a valid signature with a rewritten timestamp or a fresh
+ * delivery-ID.
+ *
+ * @param {number|string} timestamp  Unix epoch seconds
+ * @param {string}        deliveryId UUID of this delivery
+ * @param {string}        rawBody    The exact JSON string sent in the HTTP body
+ * @param {string}        secret     HMAC secret
+ * @returns {string} hex digest
+ */
+function generateSignatureV2(timestamp, deliveryId, rawBody, secret) {
+  const signingBase = `${timestamp}.${deliveryId}.${rawBody}`;
+  return crypto.createHmac('sha256', secret).update(signingBase).digest('hex');
 }
 
 function verifySignature(payload, providedSignature, secret) {
   const expected = generateSignature(payload, secret);
   const expectedBuf = Buffer.from(expected, 'hex');
   const actualBuf   = Buffer.from(providedSignature, 'hex');
+  if (expectedBuf.length !== actualBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, actualBuf);
+}
+
+/**
+ * Verify a V2 signature (constant-time comparison).
+ *
+ * @param {number|string} timestamp
+ * @param {string}        deliveryId
+ * @param {string}        rawBody    Exact bytes received
+ * @param {string}        providedSignature  Hex digest (without 'sha256=' prefix)
+ * @param {string}        secret
+ * @returns {boolean}
+ */
+function verifySignatureV2(timestamp, deliveryId, rawBody, providedSignature, secret) {
+  const expected = generateSignatureV2(timestamp, deliveryId, rawBody, secret);
+  const expectedBuf = Buffer.from(expected, 'hex');
+  let actualBuf;
+  try {
+    actualBuf = Buffer.from(providedSignature, 'hex');
+  } catch {
+    return false;
+  }
   if (expectedBuf.length !== actualBuf.length) return false;
   return crypto.timingSafeEqual(expectedBuf, actualBuf);
 }
@@ -81,8 +160,12 @@ function getBackoffDelay(attemptNumber) {
 
 // ── DNS pinning: re-resolve at send time ──────────────────────────────────────
 /**
- * Re-resolve the hostname at send time and verify every returned IP against
- * the deny list (DNS-rebinding defence).
+ * Re-resolve the hostname at send time with TTL-aware caching and verify
+ * every returned IP against the deny list (DNS-rebinding defence).
+ *
+ * Uses TTL-aware caching to detect DNS changes when TTL expires, ensuring
+ * a post-registration DNS rebinding attack (where DNS record changes to point
+ * to a private IP) is caught at delivery time.
  *
  * @param {string} url
  * @returns {Promise<{ ok: boolean, reason?: string }>}
@@ -101,13 +184,13 @@ async function _validateAtSendTime(url) {
     return check.blocked ? { ok: false, reason: check.reason } : { ok: true };
   }
 
-  // DNS re-resolution
-  const [v4, v6] = await Promise.all([
-    dns.resolve4(hostname).catch(() => []),
-    dns.resolve6(hostname).catch(() => []),
-  ]);
-  const all = [...v4, ...v6];
-  if (all.length === 0) return { ok: false, reason: 'DNS_RESOLUTION_FAILED' };
+  // DNS re-resolution with TTL-aware caching (cache expires when TTL expires)
+  let all;
+  try {
+    all = await resolveDnsWithCache(hostname);
+  } catch {
+    return { ok: false, reason: 'DNS_RESOLUTION_FAILED' };
+  }
 
   for (const addr of all) {
     const check = validateResolvedIp(addr);
@@ -166,6 +249,62 @@ async function _writeDeliveryLog({
   }
 }
 
+// ── Signing context — Issues #1538 / #1539 ───────────────────────────────────
+
+/**
+ * Return the endpoint's previous secret if its rotation overlap window is
+ * still open, otherwise null.
+ *
+ * @param {object} ep  WebhookEndpoint (document or decrypted lean object)
+ * @param {Date} [now]
+ * @returns {string|null}
+ */
+function _activePreviousSecret(ep, now = new Date()) {
+  if (!ep || !ep.previousSecret || !ep.previousSecretExpiresAt) return null;
+  return new Date(ep.previousSecretExpiresAt).getTime() > now.getTime() ? ep.previousSecret : null;
+}
+
+/**
+ * Resolve the secret(s) and signature versions for a delivery at send time.
+ *
+ *   - endpointId → the WebhookEndpoint's (decrypted) secret, overlap secret and
+ *                  signatureVersions
+ *   - otherwise  → the School's legacy webhookSecret with the legacy
+ *                  ['v1','v2'] signature set
+ *
+ * Falls back to the explicitly passed secret when nothing can be loaded.
+ *
+ * @param {object} opts
+ * @param {string|null} opts.endpointId
+ * @param {string|null} opts.schoolId
+ * @param {string|null} opts.secret
+ * @returns {Promise<{secret: string|null, previousSecret: string|null, signatureVersions: string[]|null}>}
+ */
+async function _resolveSigningContext({ endpointId = null, schoolId = null, secret = null }) {
+  try {
+    if (endpointId) {
+      const ep = decryptLeanEndpoint(
+        await WebhookEndpoint.findById(endpointId).select('+secret +previousSecret').lean()
+      );
+      if (ep) {
+        return {
+          secret: ep.secret || secret || null,
+          previousSecret: _activePreviousSecret(ep),
+          signatureVersions: ep.signatureVersions || null,
+        };
+      }
+    } else if (!secret && schoolId) {
+      const school = await School.findOne({ schoolId }).select('webhookSecret');
+      if (school?.webhookSecret) {
+        return { secret: school.webhookSecret, previousSecret: null, signatureVersions: null };
+      }
+    }
+  } catch (err) {
+    logger.warn('Failed to resolve webhook signing context', { endpointId, schoolId, error: err.message });
+  }
+  return { secret: secret || null, previousSecret: null, signatureVersions: null };
+}
+
 // ── Core delivery function ────────────────────────────────────────────────────
 /**
  * Fire a single webhook delivery to one URL.
@@ -180,6 +319,11 @@ async function _writeDeliveryLog({
  * @param {object}  opts.filteredPayload   PII-filtered payload (from buildWebhookPayload)
  * @param {object}  opts.rawPayload        Original payload for retry queue storage
  * @param {string|null} opts.secret
+ * @param {string|null} [opts.previousSecret]  Secret replaced by a rotation; while
+ *                                     still inside its overlap window the delivery
+ *                                     is additionally signed with it (#1538)
+ * @param {string[]|null} [opts.signatureVersions]  Endpoint's signature versions
+ *                                     (#1539). null → legacy ['v1','v2'].
  * @param {string}  opts.deliveryId
  * @param {string|null} opts.endpointId    ObjectId string of WebhookEndpoint (null for legacy)
  * @param {string|null} opts.schoolId
@@ -189,6 +333,7 @@ async function _writeDeliveryLog({
 async function _sendToUrl({
   url, event, filteredPayload, rawPayload, secret, deliveryId,
   endpointId = null, schoolId = null, attemptCount = 1,
+  previousSecret = null, signatureVersions = null,
 }) {
   const correlationId = rawPayload?.correlationId || null;
 
@@ -211,9 +356,12 @@ async function _sendToUrl({
   const timestamp = Math.floor(Date.now() / 1000);
   const body = {
     event,
-    timestamp: new Date().toISOString(),
+    timestamp: new Date(timestamp * 1000).toISOString(),
     data: filteredPayload,
   };
+
+  // Serialize exactly once so the bytes we sign are the bytes we transmit.
+  const rawBody = JSON.stringify(body);
 
   const headers = {
     'Content-Type': 'application/json',
@@ -223,7 +371,29 @@ async function _sendToUrl({
     'X-StellarEduPay-Delivery-ID': deliveryId,
   };
   if (correlationId) headers['X-StellarEduPay-Correlation-Id'] = correlationId;
-  if (secret) headers['X-StellarEduPay-Signature'] = `sha256=${generateSignature(body, secret)}`;
+  // #1539: which signature headers to emit is decided per endpoint and by the
+  // WEBHOOK_V1_SUNSET date — see utils/webhookSignaturePolicy.js.
+  const versions = resolveSignatureVersions(signatureVersions);
+  const sigLabel = signatureVersionLabel(versions, Boolean(secret));
+  if (secret) {
+    if (versions.includes('v1')) {
+      // V1 — deprecated, emitted only for endpoints that still opt in and only
+      // until the sunset date. Signs JSON.stringify(body) only; timestamp and
+      // deliveryId are NOT covered. Computed over rawBody so it always matches
+      // the transmitted bytes.
+      headers['X-StellarEduPay-Signature'] = `sha256=${crypto.createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+    }
+    if (versions.includes('v2')) {
+      // V2 — signs `timestamp.deliveryId.rawBody` so the timestamp and delivery-ID
+      // are bound to the signature and cannot be rewritten by an attacker.
+      headers['X-StellarEduPay-Signature-V2'] = `sha256=${generateSignatureV2(timestamp, deliveryId, rawBody, secret)}`;
+      // #1538: during a secret-rotation overlap window, also sign with the
+      // previous secret so receivers can switch over without dropping events.
+      if (previousSecret) {
+        headers['X-StellarEduPay-Signature-V2-Previous'] = `sha256=${generateSignatureV2(timestamp, deliveryId, rawBody, previousSecret)}`;
+      }
+    }
+  }
 
   // Generic tracing header (#978); the vendor-specific correlation + signature
   // headers are already set above.
@@ -233,7 +403,7 @@ async function _sendToUrl({
   const startTime = Date.now();
 
   try {
-    const response = await http.post(url, body, {
+    const response = await http.post(url, rawBody, {
       headers,
       validateStatus: (s) => s >= 200 && s < 300,
     });
@@ -247,7 +417,7 @@ async function _sendToUrl({
     // #868: record success metric
     try {
       const { recordDeliverySuccess } = require('../metrics/webhookMetrics');
-      recordDeliverySuccess(event, durationMs);
+      recordDeliverySuccess(event, durationMs, sigLabel);
     } catch (_) {}
 
     if (endpointId) {
@@ -293,7 +463,7 @@ async function _sendToUrl({
     // #868: record failure metric
     try {
       const { recordDeliveryFailure } = require('../metrics/webhookMetrics');
-      recordDeliveryFailure(event, durationMs, false, schoolId);
+      recordDeliveryFailure(event, durationMs, false, schoolId, sigLabel);
     } catch (_) {}
 
     if (endpointId) {
@@ -331,11 +501,13 @@ async function fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields
   const filteredPayload = buildWebhookPayload(rawPayload, allowedFields);
 
   // #865: query active endpoints subscribed to this event
-  const endpoints = await WebhookEndpoint.find({
+  // #1538: secrets are select:false and encrypted at rest — opt in explicitly
+  // and decrypt (lean() skips the model's post('init') decryption hook).
+  const endpoints = (await WebhookEndpoint.find({
     schoolId,
     isActive: true,
     subscribedEvents: event,
-  }).lean();
+  }).select('+secret +previousSecret').lean()).map(decryptLeanEndpoint);
 
   if (endpoints.length === 0) return [];
 
@@ -373,6 +545,8 @@ async function fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields
       filteredPayload,
       rawPayload,
       secret: ep.secret,
+      previousSecret: _activePreviousSecret(ep),
+      signatureVersions: ep.signatureVersions,
       deliveryId,
       endpointId: ep._id,
       schoolId,
@@ -408,9 +582,13 @@ async function fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields
  * @param {string|null} deliveryId
  * @param {string|null} endpointId  ObjectId string if known (for delivery log)
  * @param {string|null} schoolId
+ * @param {object} [signing]           Optional signing options (#1538, #1539)
+ * @param {string|null} [signing.previousSecret]
+ * @param {string[]|null} [signing.signatureVersions]
+ *   When omitted and endpointId is given, both are loaded from the endpoint.
  * @returns {Promise<{success, statusCode?, error?, queued?, deliveryId}>}
  */
-async function fireWebhook(url, event, payload, secret = null, deliveryId = null, endpointId = null, schoolId = null) {
+async function fireWebhook(url, event, payload, secret = null, deliveryId = null, endpointId = null, schoolId = null, signing = null) {
   const correlationId = payload?.correlationId || null;
 
   if (!url) return { success: false, error: 'No webhook URL configured', deliveryId: null };
@@ -430,11 +608,18 @@ async function fireWebhook(url, event, payload, secret = null, deliveryId = null
     return { success: false, error: 'Replay detected: delivery already processed', deliveryId: id };
   }
 
+  const signingCtx = signing || (endpointId
+    ? await _resolveSigningContext({ endpointId, schoolId, secret })
+    : { secret, previousSecret: null, signatureVersions: null });
+
   const result = await _sendToUrl({
     url, event,
     filteredPayload: payload,
     rawPayload: payload,
-    secret, deliveryId: id,
+    secret: signing ? secret : signingCtx.secret,
+    previousSecret: signingCtx.previousSecret || null,
+    signatureVersions: signingCtx.signatureVersions || null,
+    deliveryId: id,
     endpointId, schoolId, attemptCount: 1,
   });
 
@@ -558,12 +743,22 @@ async function retryWebhook(retry) {
 
   const attemptNumber = retry.attemptCount + 1;
 
+  // The signing secret is never persisted on WebhookRetry (Issue #75) — resolve
+  // it (and the endpoint's signature versions, #1539) at send time.
+  const signingCtx = await _resolveSigningContext({
+    endpointId: retry.endpointId || null,
+    schoolId: retry.schoolId || null,
+    secret: retry.secret || null,
+  });
+
   const result = await _sendToUrl({
     url: retry.url,
     event: retry.event,
     filteredPayload: retry.payload,
     rawPayload: retry.payload,
-    secret: retry.secret,
+    secret: signingCtx.secret,
+    previousSecret: signingCtx.previousSecret,
+    signatureVersions: signingCtx.signatureVersions,
     deliveryId: retry.deliveryId,
     endpointId: retry.endpointId || null,
     schoolId: retry.schoolId || null,
@@ -604,7 +799,10 @@ async function retryWebhook(retry) {
     // #868: increment dead-letter metric
     try {
       const { recordDeliveryFailure } = require('../metrics/webhookMetrics');
-      recordDeliveryFailure(retry.event, 0, true, retry.schoolId || 'unknown');
+      recordDeliveryFailure(
+        retry.event, 0, true, retry.schoolId || 'unknown',
+        signatureVersionLabel(resolveSignatureVersions(signingCtx.signatureVersions), Boolean(signingCtx.secret)),
+      );
       // Refresh gauge asynchronously
       const { refreshDeadLetterGauge } = require('../metrics/webhookMetrics');
       refreshDeadLetterGauge().catch(() => {});
@@ -725,22 +923,18 @@ async function notifyPaymentSuspicious(webhookUrl, payment, reason, secret = nul
   return null;
 }
 
-/** Legacy fire-and-forget helper used by concurrentPaymentProcessor. */
-function sendPaymentWebhook(url, data, secret = null) {
-  return fireWebhook(url, 'payment.confirmed', data, secret);
-}
-
 /**
  * Notify external system that a dispute has been opened for a payment.
- * Fires the 'dispute.created' event so the school's webhook receiver can
- * take immediate action (e.g. pause settlement, alert staff).
+ * Fires the 'dispute.created' event through both the unified per-endpoint
+ * webhook system (#865) and the legacy single-URL mechanism.
  *
- * @param {string} webhookUrl - Registered webhook URL
+ * @param {string} webhookUrl - Registered webhook URL (legacy path)
  * @param {object} dispute - Dispute document from MongoDB
  * @param {string|null} [secret] - Per-school HMAC secret
+ * @param {string|null} [schoolId] - For routing to unified per-endpoint system
  */
-async function notifyDisputeCreated(webhookUrl, dispute, secret = null) {
-  return fireWebhook(webhookUrl, 'dispute.created', {
+async function notifyDisputeCreated(webhookUrl, dispute, secret = null, schoolId = null) {
+  const payload = {
     disputeId:  dispute._id.toString(),
     schoolId:   dispute.schoolId,
     txHash:     dispute.txHash,
@@ -750,20 +944,37 @@ async function notifyDisputeCreated(webhookUrl, dispute, secret = null) {
     status:     dispute.status,
     holdSet:    true,
     createdAt:  dispute.createdAt,
-  }, secret);
+  };
+
+  // #1478: route through unified per-endpoint webhook system first
+  const school = schoolId ? await School.findOne({ schoolId }) : null;
+  const allowedFields = school?.webhookPayloadConfig?.allowedFields || null;
+  if (schoolId) {
+    const results = await fireWebhookToEndpoints(schoolId, 'dispute.created', payload, allowedFields);
+    // If endpoints exist, don't fall back to legacy path
+    if (results.length > 0) return results;
+  }
+
+  // Fallback: legacy single-URL on the School document (backward compat)
+  if (webhookUrl) {
+    return fireWebhook(webhookUrl, 'dispute.created', payload, secret);
+  }
+
+  return null;
 }
 
 /**
  * Notify external system that a dispute has been resolved or rejected.
- * Fires the 'dispute.resolved' event so the school's webhook receiver can
- * resume normal processing for the affected payment/student.
+ * Fires the 'dispute.resolved' event through both the unified per-endpoint
+ * webhook system (#865) and the legacy single-URL mechanism.
  *
- * @param {string} webhookUrl - Registered webhook URL
+ * @param {string} webhookUrl - Registered webhook URL (legacy path)
  * @param {object} dispute - Updated Dispute document from MongoDB
  * @param {string|null} [secret] - Per-school HMAC secret
+ * @param {string|null} [schoolId] - For routing to unified per-endpoint system
  */
-async function notifyDisputeResolved(webhookUrl, dispute, secret = null) {
-  return fireWebhook(webhookUrl, 'dispute.resolved', {
+async function notifyDisputeResolved(webhookUrl, dispute, secret = null, schoolId = null) {
+  const payload = {
     disputeId:      dispute._id.toString(),
     schoolId:       dispute.schoolId,
     txHash:         dispute.txHash,
@@ -773,7 +984,23 @@ async function notifyDisputeResolved(webhookUrl, dispute, secret = null) {
     resolutionNote: dispute.resolutionNote,
     resolvedAt:     dispute.resolvedAt,
     holdLifted:     dispute.holdLifted ?? true,
-  }, secret);
+  };
+
+  // #1478: route through unified per-endpoint webhook system first
+  const school = schoolId ? await School.findOne({ schoolId }) : null;
+  const allowedFields = school?.webhookPayloadConfig?.allowedFields || null;
+  if (schoolId) {
+    const results = await fireWebhookToEndpoints(schoolId, 'dispute.resolved', payload, allowedFields);
+    // If endpoints exist, don't fall back to legacy path
+    if (results.length > 0) return results;
+  }
+
+  // Fallback: legacy single-URL on the School document (backward compat)
+  if (webhookUrl) {
+    return fireWebhook(webhookUrl, 'dispute.resolved', payload, secret);
+  }
+
+  return null;
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
@@ -781,7 +1008,6 @@ module.exports = {
   // Core dispatch
   fireWebhook,
   fireWebhookToEndpoints,
-  sendPaymentWebhook,
   // Event helpers
   notifyPaymentConfirmed,
   notifyPaymentPending,
@@ -793,6 +1019,8 @@ module.exports = {
   // HMAC
   generateSignature,
   verifySignature,
+  generateSignatureV2,
+  verifySignatureV2,
   // Retry
   queueWebhookRetry,
   processPendingRetries,

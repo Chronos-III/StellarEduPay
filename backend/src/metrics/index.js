@@ -38,6 +38,22 @@ const syncDurationSeconds = new client.Histogram({
   registers: [registry],
 });
 
+// payment_processing_duration_seconds — latency of the full payment confirmation
+// pipeline from transaction detection to SUCCESS status (recorded in paymentConfirmationStateMachine)
+const paymentProcessingDurationSeconds = new client.Histogram({
+  name: 'payment_processing_duration_seconds',
+  help: 'Duration of payment processing from detection to confirmation in seconds',
+  buckets: [0.5, 1, 2, 5, 10, 30, 60, 120],
+  registers: [registry],
+});
+
+// nodejs_heap_used_ratio — heap utilization ratio from heapMonitoring.js
+const nodejsHeapUsedRatio = new client.Gauge({
+  name: 'nodejs_heap_used_ratio',
+  help: 'Node.js heap usage as a ratio of total heap size (0.0 to 1.0)',
+  registers: [registry],
+});
+
 // queue_depth{queue} — queried live from BullMQ on each scrape.
 // Tracks actionable (non-completed) jobs: waiting + active + delayed.
 new client.Gauge({
@@ -189,6 +205,18 @@ const suspiciousPaymentFlagged = new client.Counter({
   registers: [registry],
 });
 
+// Payment limit rejections (#1117). Without this there is no signal telling
+// operators that the configured limits are being hit often enough to warrant
+// adjusting — the limits were previously a control nobody could observe.
+// `code` distinguishes AMOUNT_TOO_LOW from AMOUNT_TOO_HIGH: a spike in the
+// latter is the fraud/misconfiguration signal worth alerting on.
+const paymentLimitTriggeredTotal = new client.Counter({
+  name: 'payment_limit_triggered_total',
+  help: 'Number of payments rejected by the configured payment limits',
+  labelNames: ['school_id', 'asset', 'code'],
+  registers: [registry],
+});
+
 // Concurrent payment batch metrics — recorded by the concurrentPaymentProcessor
 // after each processBatch() call so batch throughput and per-item outcomes are
 // observable and alertable.
@@ -304,17 +332,164 @@ const horizonRateLimitedTotal = new client.Counter({
   registers: [registry],
 });
 
+const pollingCycleDurationSeconds = new client.Histogram({
+  name: 'polling_cycle_duration_seconds',
+  help: 'Duration of a complete transaction polling cycle in seconds',
+  buckets: [1, 5, 10, 30, 60, 120, 300],
+  registers: [registry],
+});
+
+// mongodb_connection_state — live mongoose readyState (0=disconnected,
+// 1=connected, 2=connecting, 3=disconnecting). Read fresh on each scrape so it
+// reflects reality even across reconnect cycles the app never explicitly logs.
+const mongoConnectionState = new client.Gauge({
+  name: 'mongodb_connection_state',
+  help: 'Current MongoDB connection state (0=disconnected, 1=connected, 2=connecting, 3=disconnecting)',
+  registers: [registry],
+  collect() {
+    try {
+      const mongoose = require('mongoose');
+      this.set(mongoose.connection.readyState);
+    } catch (_) {
+      // mongoose not loaded — scrape still succeeds
+    }
+  },
+});
+
+// mongodb_connection_errors_total — incremented from the driver's 'error'
+// event handler in config/database.js. Connection state alone can't tell a
+// clean disconnect from a string of driver errors that never trip readyState.
+const mongoConnectionErrorsTotal = new client.Counter({
+  name: 'mongodb_connection_errors_total',
+  help: 'Total number of MongoDB connection error events emitted by the driver',
+  registers: [registry],
+});
+
+// backup_last_success_timestamp_seconds — Unix timestamp of the most recent
+// successful backup. Updated by POST /api/internal/backup-heartbeat which
+// backup.sh calls on success. Initialised to 0 (meaning "never recorded") so
+// the BackupNotRun alert fires immediately when the process first starts and no
+// heartbeat has arrived yet. See issue #1102.
+const backupLastSuccessTimestamp = new client.Gauge({
+  name: 'backup_last_success_timestamp_seconds',
+  help: 'Unix timestamp of the most recent successful backup (0 = never recorded since process start)',
+  registers: [registry],
+});
+
+// horizon_unreachable_since_seconds — Unix timestamp of the first Horizon
+// poll failure in the current outage (0 = currently reachable). Set by
+// transactionPollingService on first failure, cleared on first success. Lets
+// the health check and alerting distinguish a transient blip from an outage
+// that has persisted since startup. See issue #1340.
+const horizonUnreachableSince = new client.Gauge({
+  name: 'horizon_unreachable_since_seconds',
+  help: 'Unix timestamp when Horizon first became unreachable in the current outage (0 = reachable)',
+  registers: [registry],
+});
+
+// leader_election_is_leader / leader_election_tenure_seconds — leadership state
+// for the singleton schedulers. Without these, a split brain (two replicas both
+// holding the lock after a Redis partition) is invisible: it shows up only as
+// duplicate reminders and doubled audit events after the fact. Both are read
+// from leaderElection on each scrape rather than pushed, so they cannot drift
+// out of step with the service's own state. See issue #1378.
+const leaderElectionIsLeader = new client.Gauge({
+  name: 'leader_election_is_leader',
+  help: 'Whether this instance currently holds the scheduler leader lock (1 = leader, 0 = follower)',
+  registers: [registry],
+  collect() {
+    try {
+      const leaderElection = require('../services/leaderElection');
+      this.set(leaderElection.isLeader() ? 1 : 0);
+    } catch (_) {
+      // Leader election may not be wired up yet — scrape still succeeds
+    }
+  },
+});
+
+const leaderElectionTenureSeconds = new client.Gauge({
+  name: 'leader_election_tenure_seconds',
+  help: 'Seconds this instance has continuously held leadership (0 when not the leader)',
+  registers: [registry],
+  collect() {
+    try {
+      const leaderElection = require('../services/leaderElection');
+      this.set(leaderElection.getTenureSeconds());
+    } catch (_) {
+      // Leader election may not be wired up yet — scrape still succeeds
+    }
+  },
+});
+
+// last_backup_verification_age_seconds — seconds since the most recent
+// successful backup restore-verification (scripts/test-backup-recovery.sh),
+// recorded via POST /api/internal/backup-verification-heartbeat. Recomputed
+// fresh on every scrape (collect()) since it is an age, not a timestamp.
+// A very large sentinel is reported before the first verification ever
+// succeeds so the "not verified within 8 days" alert fires immediately.
+// See issue #1343.
+let _lastBackupVerificationSuccessAt = 0; // unix seconds; 0 = never recorded
+const NEVER_VERIFIED_AGE_SECONDS = 30 * 24 * 3600; // sentinel: 30 days
+const lastBackupVerificationAgeSeconds = new client.Gauge({
+  name: 'last_backup_verification_age_seconds',
+  help: 'Seconds since the last successful backup integrity verification (large sentinel if never verified)',
+  registers: [registry],
+  collect() {
+    this.set(
+      _lastBackupVerificationSuccessAt
+        ? Math.floor(Date.now() / 1000) - _lastBackupVerificationSuccessAt
+        : NEVER_VERIFIED_AGE_SECONDS
+    );
+  },
+});
+
+function recordBackupVerificationSuccess(timestampSeconds = Math.floor(Date.now() / 1000)) {
+  _lastBackupVerificationSuccessAt = timestampSeconds;
+}
+
+// last_backup_restore_test_age_seconds — seconds since the weekly CI job
+// (.github/workflows/backup-restore-test.yml) last ran
+// scripts/test-backup-recovery.sh successfully, recorded via
+// POST /api/internal/backup-restore-test-heartbeat. Recomputed fresh on every
+// scrape since it is an age, not a timestamp. A large sentinel is reported
+// before the first successful run so the "not run within 8 days" alert fires
+// immediately. See issue #1413.
+let _lastBackupRestoreTestSuccessAt = 0; // unix seconds; 0 = never recorded
+const NEVER_RESTORE_TESTED_AGE_SECONDS = 30 * 24 * 3600; // sentinel: 30 days
+const lastBackupRestoreTestAgeSeconds = new client.Gauge({
+  name: 'last_backup_restore_test_age_seconds',
+  help: 'Seconds since test-backup-recovery.sh last succeeded in CI (large sentinel if never run)',
+  registers: [registry],
+  collect() {
+    this.set(
+      _lastBackupRestoreTestSuccessAt
+        ? Math.floor(Date.now() / 1000) - _lastBackupRestoreTestSuccessAt
+        : NEVER_RESTORE_TESTED_AGE_SECONDS
+    );
+  },
+});
+
+function recordBackupRestoreTestSuccess(timestampSeconds = Math.floor(Date.now() / 1000)) {
+  _lastBackupRestoreTestSuccessAt = timestampSeconds;
+}
+
 module.exports = {
   registry,
+  mongoConnectionState,
+  mongoConnectionErrorsTotal,
   horizonPollBudgetRemaining,
   horizonPollBudgetCeiling,
   horizonPollDeferredSchools,
   horizonPollMaxDeferralCycles,
   horizonPollRequestsTotal,
   horizonRateLimitedTotal,
+  pollingCycleDurationSeconds,
   syncDurationSeconds,
+  paymentProcessingDurationSeconds,
+  nodejsHeapUsedRatio,
   httpRequestDurationSeconds,
   suspiciousPaymentFlagged,
+  paymentLimitTriggeredTotal,
   paymentBatchTotal,
   paymentBatchItemsTotal,
   paymentBatchDurationSeconds,
@@ -323,4 +498,12 @@ module.exports = {
   horizonRequestDurationSeconds,
   webhookDeliveryTotal,
   notificationSentTotal,
+  backupLastSuccessTimestamp,
+  horizonUnreachableSince,
+  leaderElectionIsLeader,
+  leaderElectionTenureSeconds,
+  lastBackupVerificationAgeSeconds,
+  recordBackupVerificationSuccess,
+  lastBackupRestoreTestAgeSeconds,
+  recordBackupRestoreTestSuccess,
 };

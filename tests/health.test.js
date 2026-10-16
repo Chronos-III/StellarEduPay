@@ -98,12 +98,6 @@ jest.mock('../backend/src/middleware/concurrentRequestHandler', () => ({
   })),
 }));
 
-jest.mock('../backend/src/services/concurrentPaymentProcessor', () => ({
-  concurrentPaymentProcessor: {
-    getStats: jest.fn().mockReturnValue({ queueDepth: 0, maxQueueDepth: 1000 }),
-  },
-}));
-
 // Route mocks — bypass pre-existing syntax errors in some route files
 jest.mock('../backend/src/routes/schoolRoutes', () => {
   const fn = jest.fn((req, res, next) => next && next());
@@ -149,6 +143,24 @@ jest.mock('../backend/src/routes/reportRoutes', () => {
 
 jest.mock('../backend/src/controllers/consistencyController', () => ({
   runConsistencyCheck: jest.fn((req, res) => res.json({ status: 'ok' })),
+}));
+
+// Mock worker heartbeat to return all-healthy so existing health tests are not
+// affected by the new liveness check introduced in #1103.
+jest.mock('../backend/src/services/workerHeartbeat', () => ({
+  checkLiveness: jest.fn().mockReturnValue({ allHealthy: true, workers: {} }),
+  ping: jest.fn(),
+  markStarted: jest.fn(),
+  markStopped: jest.fn(),
+  WORKER_NAMES: {
+    POLLING_SYNC:          'polling_sync',
+    RETRY_WORKER:          'retry_worker',
+    CONSISTENCY_SCHEDULER: 'consistency_scheduler',
+    REMINDER_SCHEDULER:    'reminder_scheduler',
+    TX_QUEUE_WORKER:       'tx_queue_worker',
+  },
+  WORKER_CONFIG: {},
+  _reset: jest.fn(),
 }));
 
 const app = require('../backend/src/app');

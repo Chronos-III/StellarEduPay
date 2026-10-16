@@ -7,7 +7,7 @@
 
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
 process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
-process.env.JWT_SECRET = 'test-secret';
+process.env.JWT_SECRET = 'test-jwt-secret-1234567890abcdef';
 
 const jwt = require('jsonwebtoken');
 const request = require('supertest');
@@ -76,10 +76,6 @@ jest.mock('../backend/src/middleware/concurrentRequestHandler', () => ({
     rateLimiter: jest.fn(() => (req, res, next) => next()),
     requestQueue: jest.fn(() => (req, res, next) => next()),
   })),
-}));
-
-jest.mock('../backend/src/services/concurrentPaymentProcessor', () => ({
-  concurrentPaymentProcessor: { getStats: jest.fn().mockReturnValue({ queueDepth: 0, maxQueueDepth: 50 }) },
 }));
 
 jest.mock('../backend/src/models/auditLogModel', () => ({

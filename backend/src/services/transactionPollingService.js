@@ -50,6 +50,24 @@ const MAX_TRANSACTIONS_PER_POLL = 50;
 const POLL_MAX_BACKOFF_MS = parseInt(process.env.POLL_MAX_BACKOFF_MS || '300000', 10);
 let consecutiveErrors = 0;
 let currentIntervalMs = SYNC_INTERVAL_MS;
+// Timestamp (ms) of the first poll failure in the current outage; null while
+// Horizon is reachable. Backs the health check's horizonUnreachableSince
+// field and the horizon_unreachable_since_seconds gauge (#1340).
+let horizonUnreachableSince = null;
+
+function _markPollFailure() {
+  if (horizonUnreachableSince === null) horizonUnreachableSince = Date.now();
+  try {
+    require('../metrics').horizonUnreachableSince.set(horizonUnreachableSince / 1000);
+  } catch (_) { /* metrics module unavailable */ }
+}
+
+function _markPollSuccess() {
+  horizonUnreachableSince = null;
+  try {
+    require('../metrics').horizonUnreachableSince.set(0);
+  } catch (_) { /* metrics module unavailable */ }
+}
 
 // Coordinated cross-school Horizon request budget (#1124). Schools no longer
 // poll as independent operations that each assume the whole rate limit is
@@ -95,7 +113,10 @@ async function processTransaction(tx, school, fencingToken) {
   const paymentAmount = normalizeToNumber(payOp.amount);
 
   // Validate payment amount is within configured limits
-  const limitValidation = validatePaymentAmount(paymentAmount);
+  const limitValidation = await validatePaymentAmount(paymentAmount, {
+    schoolId,
+    asset: asset?.code,
+  });
   if (!limitValidation.valid) {
     logger.warn('Payment outside limits', {
       txHash: tx.hash,
@@ -295,21 +316,22 @@ async function processTransaction(tx, school, fencingToken) {
  * duplicate writes does not depend on the lock: the unique index on Payment
  * remains the authoritative dedup guard if the lock ever expires mid-poll.
  */
+/**
+ * Read the payment-processor queue depth that drives polling backpressure.
+ *
+ * The concurrent payment processor was removed (#1036) and no replacement
+ * currently emits queue depth, so this reports an empty queue. That is the
+ * explicit no-throttle fallback — the same `const queueDepth = 0;` pattern
+ * used in healthController.js — rather than a guarded `require` of a module
+ * that no longer exists. See docs/architecture.md for what now provides
+ * backpressure on payment processing.
+ */
 function getQueueBackpressureState() {
-  try {
-    const { concurrentPaymentProcessor } = require('./concurrentPaymentProcessor');
-    const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
-    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
-    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
-    return { queueDepth, maxQueueDepth, highWater, lowWater };
-  } catch (error) {
-    logger.warn('Unable to read payment processor stats for polling backpressure', {
-      error: error.message,
-    });
-    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, config.MAX_QUEUE_DEPTH);
-    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
-    return { queueDepth: 0, maxQueueDepth: config.MAX_QUEUE_DEPTH, highWater, lowWater };
-  }
+  const queueDepth = 0;
+  const maxQueueDepth = config.MAX_QUEUE_DEPTH;
+  const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
+  const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
+  return { queueDepth, maxQueueDepth, highWater, lowWater };
 }
 
 function getEffectiveBatchSize(queueDepth) {
@@ -591,9 +613,12 @@ function _recordBudgetMetrics(stats) {
 async function pollAllSchools() {
   if (!isPolling) return;
 
+  const cycleId = require('../utils/correlationId').generateId();
+  const cycleStartTime = Date.now();
+
   try {
     const schools = await School.find({ isActive: true });
-    
+
     if (schools.length === 0) {
       logger.debug('No active schools to poll');
       scheduleNextPoll();
@@ -665,6 +690,7 @@ async function pollAllSchools() {
     if (summary.errors > 0) {
       // At least one school hit a Horizon error — back off.
       consecutiveErrors++;
+      _markPollFailure();
       const backoff = Math.min(SYNC_INTERVAL_MS * Math.pow(2, consecutiveErrors), POLL_MAX_BACKOFF_MS);
       currentIntervalMs = backoff;
       logger.info('Horizon errors detected; backing off polling interval', {
@@ -680,16 +706,50 @@ async function pollAllSchools() {
       }
       consecutiveErrors = 0;
       currentIntervalMs = SYNC_INTERVAL_MS;
+      _markPollSuccess();
+    }
+
+    const cycleDurationMs = Date.now() - cycleStartTime;
+    const budgetStats = pollBudget.getStats();
+
+    logger.info('Polling cycle summary', {
+      cycleId,
+      schoolsPolled: schools.length,
+      transactionsProcessed: summary.processed,
+      transactionsSkipped: summary.skipped,
+      newPayments: summary.processed,
+      durationMs: cycleDurationMs,
+      budgetPagesUsed: budgetStats.consumedThisCycle || 0,
+      errors: summary.errors,
+      rateLimited: summary.rateLimited,
+    });
+
+    // Emit polling cycle duration metric
+    try {
+      require('../metrics').pollingCycleDurationSeconds.observe(cycleDurationMs / 1000);
+    } catch (_) {
+      // metrics module unavailable
     }
 
     if (summary.processed > 0 || summary.errors > 0) {
       logger.info('Polling cycle completed', summary);
     }
   } catch (error) {
+    const cycleDurationMs = Date.now() - cycleStartTime;
     consecutiveErrors++;
+    _markPollFailure();
     const backoff = Math.min(SYNC_INTERVAL_MS * Math.pow(2, consecutiveErrors), POLL_MAX_BACKOFF_MS);
     currentIntervalMs = backoff;
-    logger.error('Error in polling cycle', { error: error.message, nextIntervalMs: currentIntervalMs });
+    logger.error('Error in polling cycle', { cycleId, durationMs: cycleDurationMs, error: error.message, nextIntervalMs: currentIntervalMs });
+  }
+
+  // Record heartbeat after every cycle (success or error) so the health check
+  // can confirm the polling loop is still alive.
+  try {
+    const { ping, WORKER_NAMES } = require('./workerHeartbeat');
+    ping(WORKER_NAMES.POLLING_SYNC);
+  } catch (_) {
+    // Non-critical — do not interrupt polling if heartbeat module is unavailable.
   }
 
   scheduleNextPoll();
@@ -722,7 +782,13 @@ function startPolling() {
   isPolling = true;
   consecutiveErrors = 0;
   currentIntervalMs = SYNC_INTERVAL_MS;
+  horizonUnreachableSince = null;
   logger.info('Starting transaction polling service', { intervalMs: SYNC_INTERVAL_MS });
+
+  try {
+    const { markStarted, WORKER_NAMES } = require('./workerHeartbeat');
+    markStarted(WORKER_NAMES.POLLING_SYNC);
+  } catch (_) { /* non-critical */ }
 
   // Run immediately on startup, then self-schedule via setTimeout for backoff support
   pollAllSchools();
@@ -739,6 +805,10 @@ function stopPolling() {
     clearTimeout(pollingInterval);
     pollingInterval = null;
   }
+  try {
+    const { markStopped, WORKER_NAMES } = require('./workerHeartbeat');
+    markStopped(WORKER_NAMES.POLLING_SYNC);
+  } catch (_) { /* non-critical */ }
   logger.info('Transaction polling service stopped');
 }
 
@@ -750,6 +820,7 @@ module.exports = {
   processTransaction,
   // Exposed for testing
   _getBackoffState: () => ({ consecutiveErrors, currentIntervalMs }),
+  getHorizonUnreachableSince: () => horizonUnreachableSince,
   _getBudgetStats: () => pollBudget.getStats(),
   _setPollBudget: (budget) => { pollBudget = budget; },
   _runWithConcurrency: runWithConcurrency,
@@ -757,6 +828,7 @@ module.exports = {
   _resetBackoffState: () => {
     consecutiveErrors = 0;
     currentIntervalMs = SYNC_INTERVAL_MS;
+    horizonUnreachableSince = null;
     pollBudget = new HorizonPollBudget({ intervalMs: SYNC_INTERVAL_MS });
     isPolling = true; // allow direct pollAllSchools() calls in tests
     if (pollingInterval) { clearTimeout(pollingInterval); pollingInterval = null; }
