@@ -2,6 +2,7 @@
 
 const OutboxEvent = require('../models/OutboxEvent');
 const logger = require('../utils/logger');
+const { withSpan, withExtractedContext } = require('../tracing');
 const { createScheduledJob } = require('../utils/scheduledJob');
 
 const DEFAULT_INTERVAL_MS = 5000;
@@ -67,7 +68,12 @@ class OutboxDispatcher {
     }
 
     try {
-      await handler(event.payload, event);
+      // #1636: continue the trace of the transaction that wrote the event.
+      await withExtractedContext(event.traceContext, () => withSpan(`outbox.dispatch ${event.type}`, {
+        'outbox.event_id': String(event._id),
+        'outbox.event_type': event.type,
+        'outbox.attempt': (event.attempts || 0) + 1,
+      }, () => handler(event.payload, event)));
       await OutboxEvent.updateOne(
         { _id: event._id },
         { $set: { status: 'completed', processedAt: new Date() } }

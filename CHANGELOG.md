@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Release process (#1634)**: semantic-versioned releases via release-please (`.github/workflows/release.yml`, `release-please-config.json`, `.release-please-manifest.json`) driven by conventional commits; the previous `[Unreleased]` history is now `v1.0.0`. New `GET /api/version` (`{ service, version, commit, buildTime, node }`), `version`/`commit` on `GET /health/live`, and a `build_info{version,commit,node_version}` metric. Release images are pushed to GHCR tagged with the version and `sha-<commit>`. See [docs/releasing.md](docs/releasing.md).
+- **Coverage ratchet (#1635)**: `scripts/coverage-ratchet.js` + `coverage-baseline.json` fail CI when global coverage or the coverage of a changed file decreases, and post a coverage table as a PR comment. `npm run coverage:ratchet -- --update` raises the baseline and syncs the Jest floors. New `tests/routerInventory.test.js` fails on unmounted, unloadable or empty routers.
+- **Distributed tracing (#1636)**: optional OpenTelemetry tracing (`OTEL_TRACING_ENABLED`, off by default) with auto-instrumentation for HTTP/Express, MongoDB/Mongoose, ioredis and axios; trace context carried through BullMQ jobs and outbox events; spans for Horizon calls (endpoint, attempt, failover) and `withStellarRetry`; `trace_id`/`span_id` on every log line and `correlation.id` on spans. Jaeger added to `docker-compose.monitoring.yml`. See [docs/tracing.md](docs/tracing.md).
+- **Parent self-service portal (#1637)**: `/parent` page and `/api/parent/*` API behind signed, expiring, revocable per-family magic links (`ParentAccessToken` model). Parents see balances, payment plans and payment history, download receipts, raise disputes and toggle reminders for their own children only; staff issue (`POST /api/parent/links`), list and revoke links. Optional portal links in reminder emails (`PARENT_PORTAL_EMAIL_LINKS`). See [docs/parent-portal.md](docs/parent-portal.md).
+
+### Fixed
+
+- **Truncated source files**: `backend/src/middleware/rateLimiter.js` had lost `publicStudentLimiter` and its entire `module.exports`, and `backend/src/routes/paymentRoutes.js` had lost its lock/unlock, status, refund, receipt-verification and reconciliation routes plus `module.exports`; both are restored. `backend/src/routes/disputeRoutes.js` used `requireSchoolAuth` without importing it.
+
+<!-- release-please appends new entries above this line on every release (#1634). -->
+
+## [1.0.0] - 2026-10-17
+
+First tagged release (#1634). Everything below was previously held under `[Unreleased]`; it is now the content of `v1.0.0`.
+
 ### Security
 
 - **Per-endpoint webhook secrets encrypted at rest (#1538)**: `WebhookEndpoint.secret` is now encrypted with `webhookSecretEncryption` (AES-256-GCM, `WEBHOOK_SECRET_ENCRYPTION_KEY`) via the same `pre('save')`/`post('init')` pattern as `School.webhookSecret`, and is `select: false` so list queries never load it. Caller-supplied secrets must be ≥ 32 characters with enough estimated entropy (`400 WEAK_WEBHOOK_SECRET` otherwise); omitted secrets are generated server-side. New `POST /api/webhook-endpoints/:id/rotate-secret` returns a new server-generated secret once and dual-signs deliveries (`X-StellarEduPay-Signature-V2-Previous`) for a configurable overlap (`WEBHOOK_SECRET_ROTATION_OVERLAP_S`, default 24h). `scripts/rotate-webhook-encryption-key.js` now re-encrypts endpoint secrets too. Webhook retries now resolve the signing secret at send time instead of relying on a field that is never persisted.
@@ -61,8 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.0] - 2026-05-29
-
 ### Initial Release
 
 - Decentralized school fee payment system built on Stellar blockchain
@@ -91,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Migration Guide
 
-### Upgrading to Unreleased
+### Upgrading to 1.0.0
 
 #### Breaking Changes
 
@@ -113,27 +128,24 @@ None in this release.
 
 ## Contributing
 
-When submitting a pull request that modifies API routes, models, or controllers, please:
+Entries are generated from commit messages by [release-please](https://github.com/googleapis/release-please) (#1634), so PR titles / squash-merge commits must follow [Conventional Commits](https://www.conventionalcommits.org/):
 
-1. Add an entry to the `[Unreleased]` section of this `CHANGELOG.md`
-2. Use the format: `- **Feature Name (#issue-number)**: Description`
-3. Categorize under `Added`, `Changed`, `Fixed`, or `Deprecated`
-4. Include any breaking changes in a separate section
+- `feat: …` → **Added** (minor bump)
+- `fix: …` → **Fixed** (patch bump)
+- `feat!: …` or a `BREAKING CHANGE:` footer → **Breaking** (major bump)
+- `docs:`, `chore:`, `test:`, `ci:`, `refactor:` → no release on their own
 
-CI will verify that `CHANGELOG.md` has been updated for PRs modifying:
-- `backend/src/routes/**`
-- `backend/src/models/**`
-- `backend/src/controllers/**`
+Hand-written detail (migrations, operator actions) may still be added to the release PR that release-please opens before it is merged.
 
 ---
 
 ## Release Process
 
-1. Update version in `package.json` following Semantic Versioning
-2. Move `[Unreleased]` section to a new version section with date
-3. Create a git tag: `git tag v1.2.3`
-4. Push tag: `git push origin v1.2.3`
-5. Create GitHub release with changelog excerpt
+See [docs/releasing.md](docs/releasing.md).
+
+1. Merge PRs to `main` with conventional-commit titles.
+2. release-please keeps a **release PR** open that bumps the version in every `package.json` and moves the pending notes into a new section of this file.
+3. Merging the release PR tags `vX.Y.Z`, publishes a GitHub release with the generated notes, and the release workflow pushes Docker images tagged with the version as well as the commit SHA.
 
 ---
 

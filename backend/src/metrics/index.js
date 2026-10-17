@@ -47,6 +47,21 @@ const paymentProcessingDurationSeconds = new client.Histogram({
   registers: [registry],
 });
 
+// build_info{version,commit} — constant 1, labelled with the running release
+// (#1634), so dashboards can annotate deploys and alert on version skew
+// between replicas.
+const { getBuildInfo } = require('../utils/buildInfo');
+const buildInfoGauge = new client.Gauge({
+  name: 'build_info',
+  help: 'Build information for the running backend (value is always 1)',
+  labelNames: ['version', 'commit', 'node_version'],
+  registers: [registry],
+});
+{
+  const { version, commit, node } = getBuildInfo();
+  buildInfoGauge.set({ version, commit, node_version: node }, 1);
+}
+
 // nodejs_heap_used_ratio — heap utilization ratio from heapMonitoring.js
 const nodejsHeapUsedRatio = new client.Gauge({
   name: 'nodejs_heap_used_ratio',
@@ -522,6 +537,7 @@ function recordBackupRestoreTestSuccess(timestampSeconds = Math.floor(Date.now()
 
 module.exports = {
   registry,
+  buildInfoGauge,
   mongoConnectionState,
   mongoConnectionErrorsTotal,
   paymentProcessorQueueDepth,

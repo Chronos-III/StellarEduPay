@@ -19,11 +19,23 @@ const outboxSchema = new mongoose.Schema(
     deadLettered:       { type: Boolean, default: false, index: true },
     deadLetteredAt:     { type: Date, default: null },
     deadLetterReason:   { type: String, default: null },
+
+    // #1636: W3C trace context ({ traceparent, tracestate }) of the operation
+    // that wrote the event, so dispatch continues the same trace.
+    traceContext:       { type: mongoose.Schema.Types.Mixed, default: undefined },
   },
   {
     timestamps: true,
   }
 );
+
+outboxSchema.pre('validate', function captureTraceContext(next) {
+  if (this.isNew && !this.traceContext) {
+    const traceContext = require('../tracing').injectTraceContext();
+    if (traceContext) this.traceContext = traceContext;
+  }
+  next();
+});
 
 outboxSchema.index({ processed: 1, deadLettered: 1, createdAt: 1 });
 outboxSchema.index({ eventType: 1, processed: 1 });
