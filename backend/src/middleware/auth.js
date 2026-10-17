@@ -7,6 +7,7 @@ const { get, set } = require('../cache');
 const { sendAdminAlert } = require('../services/alertService');
 const { getRedisClient, isRedisReady } = require('../config/redisClient');
 const { hashIp } = require('../utils/piiRedaction');
+const User = require('../models/User');
 
 // ── IP failure tracking constants ──────────────────────────────────────────────
 const IP_FAIL_WINDOW = 300;  // 5 minutes (seconds)
@@ -19,6 +20,46 @@ function ipFailKey(ip) {
 
 function ipBlockKey(ip) {
   return `ip_blocked:${ip}`;
+}
+
+// ── Session revocation check ──────────────────────────────────────────────────
+// Deactivation and role changes bump user.tokenVersion and revoke refresh
+// families. Access tokens carry the tokenVersion they were minted with, so a
+// mismatch (or an inactive user) means the session must be rejected now rather
+// than at access-token expiry.
+//
+// Returns null when the token is still valid, or a { status, body } object to
+// send back when it has been revoked.
+async function checkSessionRevoked(decoded) {
+  // Env super-admin tokens (role:'admin') are not backed by a DB user row.
+  if (decoded.role === 'admin' && !decoded.userId && !decoded.sub) return null;
+
+  const userId = decoded.userId || decoded.sub || decoded.id;
+  if (!userId) return null;
+
+  let user;
+  try {
+    user = await User.findById(userId).select('isActive tokenVersion').lean();
+  } catch (err) {
+    logger.error('[AuthMiddleware] Failed to load user for session check', { error: err.message, userId });
+    return { status: 500, body: { error: 'Server error validating session.', code: 'SESSION_CHECK_FAILED' } };
+  }
+
+  if (!user) {
+    return { status: 401, body: { error: 'Session is no longer valid.', code: 'SESSION_REVOKED' } };
+  }
+
+  if (user.isActive === false) {
+    return { status: 401, body: { error: 'Account is deactivated.', code: 'SESSION_REVOKED' } };
+  }
+
+  const storedVersion = user.tokenVersion || 0;
+  const tokenVersion = decoded.tokenVersion || 0;
+  if (storedVersion !== tokenVersion) {
+    return { status: 401, body: { error: 'Session has been revoked.', code: 'SESSION_REVOKED' } };
+  }
+
+  return null;
 }
 
 // ── Shared failure handler (used by both middleware factories) ────────────────
@@ -143,6 +184,12 @@ async function requireAdminAuth(req, res, next) {
       return res.status(403).json({ error: 'Forbidden. Admin role required.', code: 'INSUFFICIENT_ROLE' });
     }
 
+    // Reject tokens whose session has been revoked (deactivated/demoted user).
+    const revoked = await checkSessionRevoked(decoded);
+    if (revoked) {
+      return res.status(revoked.status).json(revoked.body);
+    }
+
     req.admin = decoded;
     req.user = decoded; // alias so downstream code works regardless of which middleware ran
     next();
@@ -216,6 +263,12 @@ function requireSchoolAuth(allowedRoles = []) {
         return handleAuthFailure(req, res, ip, 'Token has expired.', 'TOKEN_EXPIRED', { countTowardsBlock: false });
       }
       return handleAuthFailure(req, res, ip, 'Invalid token.', 'INVALID_AUTH_TOKEN');
+    }
+
+    // Reject tokens whose session has been revoked (deactivated/demoted user).
+    const revoked = await checkSessionRevoked(decoded);
+    if (revoked) {
+      return res.status(revoked.status).json(revoked.body);
     }
 
     // Super-admin bypass — break-glass access to all tenants

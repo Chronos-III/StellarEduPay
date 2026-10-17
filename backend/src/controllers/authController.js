@@ -86,6 +86,20 @@ function makeRedisStore(client) {
       }
       return result;
     },
+    // #1772 — Revoke every refresh token and refresh family belonging to a
+    // user. Used when a user is deactivated or demoted so they cannot keep
+    // refreshing with stale role metadata.
+    async revokeAllUserTokens(userId, ttlSeconds) {
+      const ids = await client.smembers(`sessions:user:${userId}`);
+      for (const id of ids) {
+        const sess = await this.getSession(id);
+        if (sess?.familyId) {
+          await client.set(`refresh:revoked:${sess.familyId}`, '1', 'EX', ttlSeconds);
+        }
+        await this.delSession(id);
+      }
+      await client.del(`sessions:user:${userId}`);
+    },
   };
 }
 
@@ -152,6 +166,18 @@ function makeMemoryStore() {
       }
       return result;
     },
+    // #1772 — Revoke every refresh token and refresh family belonging to a user.
+    async revokeAllUserTokens(userId, ttlSeconds) {
+      const ids = userSessions.get(userId) || new Set();
+      for (const id of [...ids]) {
+        const sess = await this.getSession(id);
+        if (sess?.familyId) {
+          revoked.set(sess.familyId, Date.now() + ttlSeconds * 1000);
+        }
+        await this.delSession(id);
+      }
+      userSessions.delete(userId);
+    },
   };
 }
 
@@ -174,6 +200,39 @@ function getStore() {
 }
 
 function _resetStore() { _store = null; }
+
+// ── Session revocation helper (#1772) ─────────────────────────────────────────
+// Revokes all refresh tokens/families for a user and bumps their tokenVersion
+// so any access token already issued is rejected by the auth middleware.
+// Returns the new tokenVersion (or null when the user cannot be found).
+async function revokeUserSessions(userId) {
+  if (!userId) return null;
+
+  const store = getStore();
+  const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
+
+  try {
+    await store.revokeAllUserTokens(userId, refreshTTL);
+  } catch (err) {
+    logger.warn('[AuthController] Failed to revoke user sessions', { userId, error: err.message });
+  }
+
+  // Bump tokenVersion so outstanding access tokens are invalidated immediately.
+  let newVersion = null;
+  try {
+    const User = require('../models/userModel');
+    const updated = await User.findByIdAndUpdate(
+      userId,
+      { $inc: { tokenVersion: 1 } },
+      { new: true, projection: { tokenVersion: 1 } }
+    );
+    newVersion = updated?.tokenVersion ?? null;
+  } catch (err) {
+    logger.warn('[AuthController] Failed to bump tokenVersion', { userId, error: err.message });
+  }
+
+  return newVersion;
+}
 
 // ── Per-account login lockout ─────────────────────────────────────────────────
 
@@ -745,5 +804,6 @@ module.exports = {
   handleListSessions,
   handleRevokeSession,
   handleChangePassword,
+  revokeUserSessions,
   _resetStore,
 };

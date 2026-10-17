@@ -67,6 +67,29 @@ const schema = Joi.object({
   // ── Auth ────────────────────────────────────────────────────────────────────
   JWT_EXPIRES_IN: Joi.string().default("8h"),
 
+  // ── Public links ────────────────────────────────────────────────────────────
+  // Canonical public base URL used to build every outbound link (invitations,
+  // password resets, unsubscribe links, …). Required and https-only in
+  // production; falls back to localhost outside production. FRONTEND_URL is
+  // still accepted as a legacy alias during migration.
+  APP_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.string()
+        .uri({ scheme: ["https"] })
+        .required()
+        .messages({
+          "any.required":
+            "APP_URL is required in production (e.g. https://app.example.com)",
+          "string.uriCustomScheme":
+            "APP_URL must be an absolute https:// URL in production",
+        }),
+      otherwise: Joi.string()
+        .uri({ scheme: ["http", "https"] })
+        .default("http://localhost:3000"),
+    }),
+
   // ── Fee reminders ───────────────────────────────────────────────────────────
   REMINDER_INTERVAL_MS: Joi.number().integer().min(0).default(60 * 60 * 1000),
   REMINDER_COOLDOWN_HOURS: Joi.number().integer().min(0).default(48),
@@ -269,6 +292,30 @@ const JWT_SECRET = env.JWT_SECRET;
 const JWT_SECRET_MIN_LENGTH = 32;
 const JWT_EXPIRES_IN = env.JWT_EXPIRES_IN;
 
+// ── Public links ──────────────────────────────────────────────────────────────
+// Single source of truth for outbound links. Normalised without a trailing
+// slash so callers can safely append paths (`${APP_URL}/set-password`).
+// Legacy FRONTEND_URL is honoured only when APP_URL is not set.
+const APP_URL = (env.APP_URL || process.env.FRONTEND_URL || "http://localhost:3000")
+  .trim()
+  .replace(/\/+$/, "");
+
+if (env.NODE_ENV === "production") {
+  let parsedAppUrl;
+  try {
+    parsedAppUrl = new URL(APP_URL);
+  } catch {
+    throw new Error(
+      `[Config] APP_URL must be an absolute URL in production, got: ${APP_URL}`,
+    );
+  }
+  if (parsedAppUrl.protocol !== "https:") {
+    throw new Error(
+      `[Config] APP_URL must use https:// in production, got: ${APP_URL}`,
+    );
+  }
+}
+
 // ── Fee Reminders ─────────────────────────────────────────────────────────────
 // How often the scheduler checks for unpaid fees (default: 1 hour).
 // Schools are only processed during their configured send window, so a shorter
@@ -331,6 +378,7 @@ module.exports = {
   JWT_SECRET,
   JWT_SECRET_MIN_LENGTH,
   JWT_EXPIRES_IN,
+  APP_URL,
   REMINDER_INTERVAL_MS,
   REMINDER_COOLDOWN_HOURS,
   REMINDER_MAX_COUNT,
