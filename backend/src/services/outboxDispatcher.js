@@ -121,4 +121,18 @@ class OutboxDispatcher {
   }
 }
 
+let defaultDispatcher = null;
+
+function startOutboxDispatcher(options) {
+  if (!defaultDispatcher) defaultDispatcher = new OutboxDispatcher(options);
+  return defaultDispatcher.start();
+}
+
+async function stopOutboxDispatcher() {
+  if (defaultDispatcher) await defaultDispatcher.stop();
+}
+
 module.exports = OutboxDispatcher;
+module.exports.OutboxDispatcher = OutboxDispatcher;
+module.exports.startOutboxDispatcher = startOutboxDispatcher;
+module.exports.stopOutboxDispatcher = stopOutboxDispatcher;
