@@ -42,6 +42,9 @@ jobs:
       - name: Run backup + restore verification
         env:
           MONGO_URI: mongodb://localhost:27017/stellaredupay
+          # The CI service container is a standalone mongod, which cannot serve
+          # --oplog dumps (production runs a replica set and keeps the default).
+          BACKUP_OPLOG: "false"
           BACKEND_INTERNAL_URL: ${{ secrets.BACKUP_HEARTBEAT_URL }}
           BACKUP_NOTIFY_TOKEN: ${{ secrets.BACKUP_NOTIFY_TOKEN }}
         run: bash scripts/test-backup-recovery.sh
