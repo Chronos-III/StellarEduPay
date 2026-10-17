@@ -164,58 +164,6 @@ async function generateReceipt(req, res, next) {
   }
 }
 
-async function lockPaymentForUpdate(req, res, next) {
-  try {
-    const { schoolId } = req;
-    const { paymentId } = req.params;
-    const lockDurationMs = req.body.lockDurationMs || 30000;
-    const lockId = `lock_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const lockDeadline = new Date(Date.now() + lockDurationMs);
-
-    const payment = await Payment.findOneAndUpdate(
-      {
-        _id: paymentId,
-        schoolId,
-        $or: [{ lockedUntil: null }, { lockedUntil: { $exists: false } }, { lockedUntil: { $lte: new Date() } }],
-      },
-      { $set: { lockedUntil: lockDeadline, lockHolder: lockId } },
-      { new: true },
-    );
-
-    if (!payment) {
-      const exists = await Payment.findOne({ _id: paymentId, schoolId });
-      if (!exists) return res.status(404).json({ error: 'Payment not found', code: 'NOT_FOUND' });
-      return res.status(409).json({ error: 'Payment is currently locked by another process', code: 'PAYMENT_LOCKED', lockedUntil: exists.lockedUntil });
-    }
-
-    res.json({ locked: true, lockId, lockedUntil: lockDeadline, paymentId: payment._id });
-  } catch (err) {
-    next(err);
-  }
-}
-
-async function unlockPayment(req, res, next) {
-  try {
-    const { schoolId } = req;
-    const { paymentId } = req.params;
-    const { lockId } = req.body;
-
-    if (!lockId) return res.status(400).json({ error: 'lockId is required', code: 'VALIDATION_ERROR' });
-
-    const payment = await Payment.findOneAndUpdate(
-      { _id: paymentId, schoolId, lockHolder: lockId },
-      { $set: { lockedUntil: null, lockHolder: null } },
-      { new: true },
-    );
-
-    if (!payment) return res.status(404).json({ error: 'Payment not found or lockId does not match', code: 'NOT_FOUND' });
-
-    res.json({ unlocked: true, paymentId: payment._id });
-  } catch (err) {
-    next(err);
-  }
-}
-
 async function getDeadLetterJobs(req, res, next) {
   try {
     const { getDeadLetterQueue } = require('../config/retryQueueSetup');
@@ -936,8 +884,6 @@ module.exports = {
   getSyncStatus,
   finalizePayments,
   generateReceipt,
-  lockPaymentForUpdate,
-  unlockPayment,
   getDeadLetterJobs,
   retryDeadLetterJob,
   getQueueJobStatus,

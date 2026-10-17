@@ -11,8 +11,41 @@ const { checkLiveness, WORKER_NAMES } = require('../services/workerHeartbeat');
 const { getRecoveryStatus } = require('../queue/transactionQueue');
 const logger = require('../utils/logger');
 const { isReady: isShutdownReady } = require('../services/shutdownManager');
+const { isEncryptionEnabled: isPiiEncryptionEnabled } = require('../services/studentPiiEncryption');
+const { isEncryptionEnabled: isWebhookSecretEncryptionEnabled } = require('../services/webhookSecretEncryption');
 
 const STELLAR_CHECK_TIMEOUT_MS = 3000; // 3 second timeout for Stellar health check
+
+/**
+ * Report whether at-rest encryption is active for PII and webhook secrets.
+ * Both services silently no-op without a key, so this is the only way an
+ * operator can tell whether data is actually being encrypted (#1778).
+ *
+ * @returns {{pii: boolean, webhookSecrets: boolean}}
+ */
+function getEncryptionStatus() {
+  return {
+    pii: Boolean(isPiiEncryptionEnabled()),
+    webhookSecrets: Boolean(isWebhookSecretEncryptionEnabled()),
+  };
+}
+
+let encryptionStatusLogged = false;
+
+/**
+ * Log the encryption status once at boot so operators can see whether PII and
+ * webhook secrets are being encrypted (#1778). Safe to call more than once.
+ */
+function logEncryptionStatusOnce() {
+  if (encryptionStatusLogged) return;
+  encryptionStatusLogged = true;
+  const status = getEncryptionStatus();
+  if (status.pii && status.webhookSecrets) {
+    logger.info('At-rest encryption enabled', status);
+  } else {
+    logger.warn('At-rest encryption is NOT fully enabled — data may be stored in plaintext', status);
+  }
+}
 
 /**
  * Map a raw dependency error to a stable, non-sensitive reason code (#1540).
@@ -257,6 +290,7 @@ async function buildHealthReport() {
         rates: priceFeedStatus,
       },
       auditLog: getAuditHealth(),
+      encryption: getEncryptionStatus(),
       jobRecovery: (() => {
         const { lastError, ...rest } = jobRecovery;
         return { ...rest, ...(lastError && { reason: reasonFor('jobRecovery', lastError) }) };
@@ -367,4 +401,13 @@ async function healthReady(req, res) {
   });
 }
 
-module.exports = { healthCheck, healthDetails, healthLive, healthReady, buildHealthReport, toReasonCode };
+module.exports = {
+  healthCheck,
+  healthDetails,
+  healthLive,
+  healthReady,
+  buildHealthReport,
+  toReasonCode,
+  getEncryptionStatus,
+  logEncryptionStatusOnce,
+};

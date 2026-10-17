@@ -32,6 +32,11 @@ const STUDENT_BALANCE_LOCK_TTL_MS = parseInt(process.env.STUDENT_BALANCE_LOCK_TT
 
 /**
  * Fetch the student's active payment plan, if any.
+ *
+ * At most one active plan per student is enforced by a unique partial index
+ * (#1765); the sort keeps the lookup deterministic even if legacy data still
+ * holds duplicates, so the same plan is always picked.
+ *
  * @param {string} schoolId
  * @param {string} studentId
  * @returns {Promise<object|null>} the active plan, or null when the student pays in full
@@ -42,7 +47,44 @@ async function getActivePaymentPlan(schoolId, studentId) {
     studentId,
     status: 'active',
     deletedAt: null,
-  });
+  }).sort({ createdAt: -1, _id: -1 });
+}
+
+/**
+ * Whether a plan's total still reconciles with the student's fee.
+ *
+ * A plan created before the fee changed (or one written before #1765 added
+ * validation) may no longer cover the amount actually owed. Such a plan must
+ * not be trusted to reclassify payments: doing so would silently turn real
+ * underpayments into "valid installments".
+ *
+ * @param {object} plan
+ * @param {object|null} student - Student document (needs feeAmount)
+ * @returns {boolean} true when the plan total matches the fee owed
+ */
+function planReconcilesWithFee(plan, student) {
+  if (!plan || !student) return false;
+
+  const feeAmount = Number(student.feeAmount);
+  if (!Number.isFinite(feeAmount) || feeAmount <= 0) return false;
+
+  const totalAmount = Number(plan.totalAmount);
+  if (!Number.isFinite(totalAmount) || totalAmount <= 0) return false;
+
+  // The plan must cover the full fee, and its installments must add up to the
+  // plan total — otherwise the plan is internally inconsistent.
+  if (compareMoney(totalAmount, feeAmount) !== 0) return false;
+
+  const installments = plan.installments || [];
+  if (installments.length === 0) return false;
+
+  const installmentSum = installments.reduce((sum, inst) => {
+    const amount = Number(inst?.amount);
+    return Number.isFinite(amount) ? sum + amount : NaN;
+  }, 0);
+  if (!Number.isFinite(installmentSum)) return false;
+
+  return compareMoney(installmentSum, totalAmount) === 0;
 }
 
 /**
@@ -73,10 +115,32 @@ function expectedInstallmentAmount(plan) {
  */
 async function evaluateUnderpayment(payment) {
   const plan = await getActivePaymentPlan(payment.schoolId, payment.studentId);
-  const expectedAmount = plan ? expectedInstallmentAmount(plan) : null;
+
+  let expectedAmount = null;
+  if (plan) {
+    // #1765: only trust a plan that still reconciles with the student's fee.
+    // A stale or malformed plan falls back to fee-based classification rather
+    // than converting a real underpayment into a valid installment.
+    const student = await Student.findOne({
+      schoolId: payment.schoolId,
+      studentId: payment.studentId,
+    });
+
+    if (planReconcilesWithFee(plan, student)) {
+      expectedAmount = expectedInstallmentAmount(plan);
+    } else {
+      logger.warn('[UnderpaidReconciliation] Ignoring non-reconciling payment plan', {
+        planId: plan._id,
+        schoolId: payment.schoolId,
+        studentId: payment.studentId,
+        planTotal: plan.totalAmount,
+        feeAmount: student?.feeAmount,
+      });
+    }
+  }
 
   if (expectedAmount === null) {
-    // No plan (or an empty one): the existing fee-based classification stands.
+    // No plan (or an empty/invalid one): the existing fee-based classification stands.
     return {
       underpaid: true,
       basis: 'fee',
@@ -457,6 +521,7 @@ async function getUnderpaidReconciliationSummary(schoolId) {
 
 module.exports = {
   getActivePaymentPlan,
+  planReconcilesWithFee,
   expectedInstallmentAmount,
   evaluateUnderpayment,
   applyPartialCredit,

@@ -75,6 +75,66 @@ const schema = Joi.object({
   // ── Student PII retention ───────────────────────────────────────────────────
   STUDENT_PII_RETENTION_DAYS: Joi.number().integer().min(0).default(90),
 
+  // ── Encryption keys (issue #1778) ───────────────────────────────────────────
+  // Both keys are 32-byte AES keys expressed as 64 hex characters. They are
+  // required in production: without them the PII and webhook-secret helpers
+  // silently fall back to storing plaintext. ALLOW_PLAINTEXT_PII is a
+  // development-only escape hatch and is rejected in production.
+  STUDENT_PII_ENCRYPTION_KEY: Joi.string()
+    .pattern(/^[0-9a-fA-F]{64}$/)
+    .allow(null, "")
+    .default(null)
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.string()
+        .pattern(/^[0-9a-fA-F]{64}$/)
+        .required()
+        .messages({
+          "any.required":
+            "STUDENT_PII_ENCRYPTION_KEY is required in production (64 hex chars). " +
+            "Without it parent email/phone are stored in plaintext.",
+          "string.pattern.base":
+            "STUDENT_PII_ENCRYPTION_KEY must be exactly 64 hex characters.",
+        }),
+    }),
+  STUDENT_PII_ENCRYPTION_KEY_PREVIOUS: Joi.string()
+    .pattern(/^[0-9a-fA-F]{64}$/)
+    .allow(null, "")
+    .default(null)
+    .messages({
+      "string.pattern.base":
+        "STUDENT_PII_ENCRYPTION_KEY_PREVIOUS must be exactly 64 hex characters.",
+    }),
+  WEBHOOK_SECRET_ENCRYPTION_KEY: Joi.string()
+    .pattern(/^[0-9a-fA-F]{64}$/)
+    .allow(null, "")
+    .default(null)
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.string()
+        .pattern(/^[0-9a-fA-F]{64}$/)
+        .required()
+        .messages({
+          "any.required":
+            "WEBHOOK_SECRET_ENCRYPTION_KEY is required in production (64 hex chars). " +
+            "Without it webhook secrets are stored in plaintext.",
+          "string.pattern.base":
+            "WEBHOOK_SECRET_ENCRYPTION_KEY must be exactly 64 hex characters.",
+        }),
+    }),
+  ALLOW_PLAINTEXT_PII: Joi.boolean()
+    .truthy("true")
+    .falsy("false")
+    .default(false)
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.boolean().valid(false).messages({
+        "any.only":
+          "ALLOW_PLAINTEXT_PII is not permitted in production; configure " +
+          "STUDENT_PII_ENCRYPTION_KEY and WEBHOOK_SECRET_ENCRYPTION_KEY instead.",
+      }),
+    }),
+
   // ── SMTP ────────────────────────────────────────────────────────────────────
   SMTP_HOST: Joi.string().allow(null, "").default(null),
   SMTP_PORT: Joi.number().integer().min(0).max(65535).default(587),
@@ -285,6 +345,24 @@ const REMINDER_MAX_COUNT = env.REMINDER_MAX_COUNT;
 // After the retention window, sensitive fields are cleared to reduce breach exposure.
 const STUDENT_PII_RETENTION_DAYS = env.STUDENT_PII_RETENTION_DAYS;
 
+// ── Encryption keys (issue #1778) ─────────────────────────────────────────────
+// The helpers in services/studentPiiEncryption.js and
+// services/webhookSecretEncryption.js treat a missing key as "store plaintext".
+// The schema above makes that impossible in production; these derived flags let
+// boot logging and the admin health endpoint report the effective state.
+const STUDENT_PII_ENCRYPTION_KEY = env.STUDENT_PII_ENCRYPTION_KEY || null;
+const STUDENT_PII_ENCRYPTION_KEY_PREVIOUS =
+  env.STUDENT_PII_ENCRYPTION_KEY_PREVIOUS || null;
+const WEBHOOK_SECRET_ENCRYPTION_KEY = env.WEBHOOK_SECRET_ENCRYPTION_KEY || null;
+const ALLOW_PLAINTEXT_PII = env.ALLOW_PLAINTEXT_PII;
+
+const ENCRYPTION_STATUS = Object.freeze({
+  pii: Boolean(STUDENT_PII_ENCRYPTION_KEY),
+  piiRotation: Boolean(STUDENT_PII_ENCRYPTION_KEY_PREVIOUS),
+  webhookSecrets: Boolean(WEBHOOK_SECRET_ENCRYPTION_KEY),
+  allowPlaintextPii: ALLOW_PLAINTEXT_PII,
+});
+
 // SMTP settings for nodemailer
 const SMTP_HOST = env.SMTP_HOST;
 const SMTP_PORT = env.SMTP_PORT;
@@ -335,6 +413,11 @@ module.exports = {
   REMINDER_COOLDOWN_HOURS,
   REMINDER_MAX_COUNT,
   STUDENT_PII_RETENTION_DAYS,
+  STUDENT_PII_ENCRYPTION_KEY,
+  STUDENT_PII_ENCRYPTION_KEY_PREVIOUS,
+  WEBHOOK_SECRET_ENCRYPTION_KEY,
+  ALLOW_PLAINTEXT_PII,
+  ENCRYPTION_STATUS,
   SMTP_HOST,
   SMTP_PORT,
   SMTP_SECURE,

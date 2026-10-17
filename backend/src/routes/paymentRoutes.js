@@ -30,8 +30,6 @@ const {
   getSyncStatus,
   finalizePayments,
   generateReceipt,
-  lockPaymentForUpdate,
-  unlockPayment,
   getDeadLetterJobs,
   retryDeadLetterJob,
   getQueueJobStatus,
