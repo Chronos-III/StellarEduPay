@@ -1,3 +1,5 @@
+'use strict';
+
 const express = require("express");
 
 /**
@@ -11,6 +13,12 @@ const express = require("express");
  * These tests assert that no two declared routes share the same method +
  * path pattern (which would shadow one another) and that the receipt
  * verification route is reachable on its own distinct path.
+ *
+ * Regression test for issue #1723:
+ * paymentRoutes.js was truncated mid-statement, losing lock/unlock, refund,
+ * admin status patch, and reconciliation routes. These tests assert every
+ * expected method + path pair is registered so a repeat truncation is caught
+ * immediately by CI.
  */
 
 /**
@@ -78,6 +86,21 @@ function findShadowedRoutes(routes) {
   return shadowed;
 }
 
+/**
+ * Returns true if `routes` contains a route matching the given method and
+ * normalised path pattern.  `:param` segments in `expectedPath` are
+ * normalised to `:` before comparison so the caller does not have to know
+ * the exact param name used in the router.
+ */
+function hasRoute(routes, method, expectedPath) {
+  const normExpected = normalizePath(expectedPath);
+  return routes.some(
+    (r) =>
+      r.method === method.toUpperCase() &&
+      normalizePath(r.path) === normExpected,
+  );
+}
+
 describe("payment routes (#1594)", () => {
   let paymentRoutes;
 
@@ -125,5 +148,219 @@ describe("payment routes (#1594)", () => {
     );
 
     expect(shadowedReceipt).toBeUndefined();
+  });
+});
+
+/**
+ * Issue #1723 — router.stack coverage.
+ *
+ * Every route that existed before commit ab0e00a truncated the file must be
+ * present. If any of these assertions fails it means the route was removed or
+ * the file was truncated again.
+ */
+describe("payment routes (#1723) — all required routes are registered", () => {
+  let routes;
+
+  beforeAll(() => {
+    const paymentRoutes = require("../paymentRoutes");
+    routes = collectRoutes(paymentRoutes);
+  });
+
+  // ── Core payment endpoints ──────────────────────────────────────────────
+  it("registers GET /verify/:txHash", () => {
+    expect(hasRoute(routes, "GET", "/verify/:txHash")).toBe(true);
+  });
+
+  it("registers GET /receipts/:receiptId/verify", () => {
+    expect(hasRoute(routes, "GET", "/receipts/:receiptId/verify")).toBe(true);
+  });
+
+  it("registers POST /intent", () => {
+    expect(hasRoute(routes, "POST", "/intent")).toBe(true);
+  });
+
+  it("registers POST /submit", () => {
+    expect(hasRoute(routes, "POST", "/submit")).toBe(true);
+  });
+
+  it("registers POST /verify", () => {
+    expect(hasRoute(routes, "POST", "/verify")).toBe(true);
+  });
+
+  it("registers POST /sync", () => {
+    expect(hasRoute(routes, "POST", "/sync")).toBe(true);
+  });
+
+  it("registers POST /finalize", () => {
+    expect(hasRoute(routes, "POST", "/finalize")).toBe(true);
+  });
+
+  // ── Query / read endpoints ──────────────────────────────────────────────
+  it("registers GET /", () => {
+    expect(hasRoute(routes, "GET", "/")).toBe(true);
+  });
+
+  it("registers GET /summary", () => {
+    expect(hasRoute(routes, "GET", "/summary")).toBe(true);
+  });
+
+  it("registers GET /accepted-assets", () => {
+    expect(hasRoute(routes, "GET", "/accepted-assets")).toBe(true);
+  });
+
+  it("registers GET /limits", () => {
+    expect(hasRoute(routes, "GET", "/limits")).toBe(true);
+  });
+
+  it("registers GET /sync/status", () => {
+    expect(hasRoute(routes, "GET", "/sync/status")).toBe(true);
+  });
+
+  it("registers GET /events", () => {
+    expect(hasRoute(routes, "GET", "/events")).toBe(true);
+  });
+
+  it("registers GET /overpayments", () => {
+    expect(hasRoute(routes, "GET", "/overpayments")).toBe(true);
+  });
+
+  it("registers GET /suspicious", () => {
+    expect(hasRoute(routes, "GET", "/suspicious")).toBe(true);
+  });
+
+  it("registers GET /pending", () => {
+    expect(hasRoute(routes, "GET", "/pending")).toBe(true);
+  });
+
+  it("registers GET /stuck", () => {
+    expect(hasRoute(routes, "GET", "/stuck")).toBe(true);
+  });
+
+  it("registers GET /retry-queue", () => {
+    expect(hasRoute(routes, "GET", "/retry-queue")).toBe(true);
+  });
+
+  it("registers GET /rates", () => {
+    expect(hasRoute(routes, "GET", "/rates")).toBe(true);
+  });
+
+  it("registers GET /dlq", () => {
+    expect(hasRoute(routes, "GET", "/dlq")).toBe(true);
+  });
+
+  it("registers POST /dlq/:id/retry", () => {
+    expect(hasRoute(routes, "POST", "/dlq/:id/retry")).toBe(true);
+  });
+
+  it("registers GET /balance/:studentId", () => {
+    expect(hasRoute(routes, "GET", "/balance/:studentId")).toBe(true);
+  });
+
+  it("registers GET /instructions/:studentId", () => {
+    expect(hasRoute(routes, "GET", "/instructions/:studentId")).toBe(true);
+  });
+
+  it("registers GET /receipt/:txHash", () => {
+    expect(hasRoute(routes, "GET", "/receipt/:txHash")).toBe(true);
+  });
+
+  it("registers GET /queue/:txHash", () => {
+    expect(hasRoute(routes, "GET", "/queue/:txHash")).toBe(true);
+  });
+
+  it("registers GET /:studentId", () => {
+    expect(hasRoute(routes, "GET", "/:studentId")).toBe(true);
+  });
+
+  // ── Lock / unlock (lost in truncation) ─────────────────────────────────
+  it("registers POST /:paymentId/lock", () => {
+    expect(hasRoute(routes, "POST", "/:paymentId/lock")).toBe(true);
+  });
+
+  it("registers POST /:paymentId/unlock", () => {
+    expect(hasRoute(routes, "POST", "/:paymentId/unlock")).toBe(true);
+  });
+
+  // ── Status patches (lost in truncation) ────────────────────────────────
+  it("registers PATCH /bulk/status", () => {
+    expect(hasRoute(routes, "PATCH", "/bulk/status")).toBe(true);
+  });
+
+  it("registers PATCH /:txHash/status", () => {
+    expect(hasRoute(routes, "PATCH", "/:txHash/status")).toBe(true);
+  });
+
+  it("registers PATCH /:txHash/suspicion-review", () => {
+    expect(hasRoute(routes, "PATCH", "/:txHash/suspicion-review")).toBe(true);
+  });
+
+  it("registers PATCH /:txHash/correct-placeholder", () => {
+    expect(hasRoute(routes, "PATCH", "/:txHash/correct-placeholder")).toBe(true);
+  });
+
+  // ── Reconciliation (lost in truncation) ────────────────────────────────
+  it("registers GET /reconciliation/reports", () => {
+    expect(hasRoute(routes, "GET", "/reconciliation/reports")).toBe(true);
+  });
+
+  it("registers POST /reconciliation/report", () => {
+    expect(hasRoute(routes, "POST", "/reconciliation/report")).toBe(true);
+  });
+
+  // ── Refunds (lost in truncation) ───────────────────────────────────────
+  it("registers GET /refunds/school/list", () => {
+    expect(hasRoute(routes, "GET", "/refunds/school/list")).toBe(true);
+  });
+
+  it("registers POST /refunds/:refundId/approve", () => {
+    expect(hasRoute(routes, "POST", "/refunds/:refundId/approve")).toBe(true);
+  });
+
+  it("registers POST /refunds/:refundId/reject", () => {
+    expect(hasRoute(routes, "POST", "/refunds/:refundId/reject")).toBe(true);
+  });
+
+  it("registers POST /refunds/:refundId/complete", () => {
+    expect(hasRoute(routes, "POST", "/refunds/:refundId/complete")).toBe(true);
+  });
+
+  it("registers POST /:txHash/refund", () => {
+    expect(hasRoute(routes, "POST", "/:txHash/refund")).toBe(true);
+  });
+
+  it("registers GET /:txHash/refunds", () => {
+    expect(hasRoute(routes, "GET", "/:txHash/refunds")).toBe(true);
+  });
+
+  // ── Ordering invariants ─────────────────────────────────────────────────
+  // /refunds/school/list must appear before any /:txHash/* route so Express
+  // does not swallow the literal "refunds" path segment as a txHash value.
+  it("registers /refunds/school/list before /:txHash/* routes", () => {
+    const stack = collectRoutes(require("../paymentRoutes"));
+    const schoolListIdx = stack.findIndex(
+      (r) =>
+        r.method === "GET" &&
+        normalizePath(r.path) === normalizePath("/refunds/school/list"),
+    );
+    // Find the first parameterised /:txHash/... route (normalized to /:/...)
+    const firstTxHashRouteIdx = stack.findIndex(
+      (r) => normalizePath(r.path).startsWith("/:"),
+    );
+    expect(schoolListIdx).toBeGreaterThan(-1);
+    expect(firstTxHashRouteIdx).toBeGreaterThan(-1);
+    expect(schoolListIdx).toBeLessThan(firstTxHashRouteIdx);
+  });
+
+  it("registers /reconciliation/* before /:txHash/* routes", () => {
+    const stack = collectRoutes(require("../paymentRoutes"));
+    const reconciliationIdx = stack.findIndex(
+      (r) => r.path.startsWith("/reconciliation"),
+    );
+    const firstTxHashRouteIdx = stack.findIndex(
+      (r) => normalizePath(r.path).startsWith("/:"),
+    );
+    expect(reconciliationIdx).toBeGreaterThan(-1);
+    expect(firstTxHashRouteIdx).toBeGreaterThan(-1);
+    expect(reconciliationIdx).toBeLessThan(firstTxHashRouteIdx);
   });
 });

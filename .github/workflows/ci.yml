@@ -192,8 +192,38 @@ jobs:
       - name: Run axe scans of /pay-fees, /login and /dashboard
         run: cd frontend && npm run test:a11y:e2e
 
+  # ── #1723: Standalone syntax gate ──────────────────────────────────────────
+  # Runs `node --check` over every tracked backend JS file.  Requires only a
+  # Node.js install — no npm install, no MongoDB, no Redis — so it fires on
+  # every push/PR within seconds and catches truncation or parse errors before
+  # the heavier test job even starts.
+  syntax-check:
+    name: Syntax check (node --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - name: Check JS syntax (backend/src)
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r -d '' file; do
+            if ! node --check "$file" 2>&1; then
+              echo "SYNTAX ERROR: $file"
+              failed=1
+            fi
+          done < <(find backend/src -name '*.js' -not -path '*/node_modules/*' -print0)
+          if [ "$failed" -ne 0 ]; then
+            echo "One or more files failed node --check"
+            exit 1
+          fi
+          echo "All backend/src JS files passed node --check"
+
   test:
     runs-on: ubuntu-latest
+    needs: [syntax-check]
     env:
       STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
       MONGO_URI: mongodb://localhost:27017/stellaredupay_test?replicaSet=rs0

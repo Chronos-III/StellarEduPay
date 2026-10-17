@@ -253,6 +253,36 @@ router.get("/receipt/:txHash", generateReceipt);
 router.get("/queue/:txHash", requireSchoolAuth(['owner', 'staff', 'read_only']), getQueueJobStatus);
 router.get("/:studentId", validateStudentIdParam, requireSchoolAuth(['owner', 'staff', 'read_only']), getStudentPayments);
 
-router.post("/:paymentId/
+// ── Distributed lock / unlock ─────────────────────────────────────────────
+// Allows an admin to hold an optimistic write-lock on a payment record while
+// performing a multi-step correction, preventing concurrent modifications.
+router.post("/:paymentId/lock", requireSchoolAuth(['owner', 'staff']), auditContext, lockPaymentForUpdate);
+router.post("/:paymentId/unlock", requireSchoolAuth(['owner', 'staff']), auditContext, unlockPayment);
 
-/* … truncated 1838 chars — edit only what you need near the top … */
+// ── Status patches ────────────────────────────────────────────────────────
+// /bulk/status must be declared before /:txHash/status so the literal segment
+// "bulk" is not swallowed by the :txHash param.
+router.patch("/bulk/status", requireSchoolAuth(['owner', 'staff']), auditContext, bulkUpdatePaymentStatus);
+router.patch("/:txHash/status", validateTxHashParam, requireSchoolAuth(['owner', 'staff']), auditContext, updatePaymentStatus);
+router.patch("/:txHash/suspicion-review", validateTxHashParam, requireSchoolAuth(['owner', 'staff']), auditContext, reviewSuspiciousPayment);
+router.patch("/:txHash/correct-placeholder", validateTxHashParam, requireSchoolAuth(['owner', 'staff']), auditContext, correctPlaceholderPayment);
+
+// ── Reconciliation ────────────────────────────────────────────────────────
+// /reconciliation/* must be registered before /:txHash/* routes so the
+// literal path segment "reconciliation" is not consumed by the :txHash param.
+router.get("/reconciliation/reports", requireSchoolAuth(['owner', 'staff', 'read_only']), getReconciliationReports);
+router.post("/reconciliation/report", requireSchoolAuth(['owner', 'staff']), auditContext, generateSchoolReconciliationReport);
+
+// ── Refunds ───────────────────────────────────────────────────────────────
+// /refunds/school/list must be registered before /:txHash/* routes so the
+// literal path segment "refunds" is not consumed by the :txHash param.
+router.get("/refunds/school/list", requireSchoolAuth(['owner', 'staff', 'read_only']), getSchoolRefunds);
+router.post("/refunds/:refundId/approve", requireSchoolAuth(['owner', 'staff']), auditContext, approvePaymentRefund);
+router.post("/refunds/:refundId/reject", requireSchoolAuth(['owner', 'staff']), auditContext, rejectPaymentRefund);
+router.post("/refunds/:refundId/complete", requireSchoolAuth(['owner', 'staff']), auditContext, completePaymentRefund);
+
+// Parameterised /:txHash routes come after all literal-prefix routes above.
+router.post("/:txHash/refund", validateTxHashParam, requireSchoolAuth(['owner', 'staff']), auditContext, initiatePaymentRefund);
+router.get("/:txHash/refunds", validateTxHashParam, requireSchoolAuth(['owner', 'staff', 'read_only']), getPaymentRefunds);
+
+module.exports = router;
