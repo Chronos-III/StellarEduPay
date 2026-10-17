@@ -229,6 +229,9 @@ router.get("/stuck", requireSchoolAuth(['owner', 'staff']), getStuckPayments);
 router.get("/retry-queue", requireSchoolAuth(['owner', 'staff']), getRetryQueue);
 router.get("/rates", requireSchoolAuth(['owner', 'staff', 'read_only']), getExchangeRates);
 router.get("/dlq", requireSchoolAuth(['owner', 'staff']), getDeadLetterJobs);
+// Super-admin view of the global dead-letter queue (all schools). School users
+// are restricted to their own jobs by getDeadLetterJobs (#1768).
+router.get("/dlq/admin", requireAdminAuth, getDeadLetterJobs);
 
 router.post(
   "/verify",
@@ -241,6 +244,8 @@ router.post(
 router.post("/sync", strictLimiter, requireSchoolAuth(['owner', 'staff']), syncLimiter, auditContext, syncAllPayments);
 router.post("/finalize", requireSchoolAuth(['owner', 'staff']), auditContext, finalizePayments);
 router.post("/dlq/:id/retry", requireSchoolAuth(['owner', 'staff']), auditContext, retryDeadLetterJob);
+// Super-admin retry across schools; school users may only retry their own jobs.
+router.post("/dlq/admin/:id/retry", requireAdminAuth, auditContext, retryDeadLetterJob);
 
 router.get("/balance/:studentId", validateStudentIdParam, requireSchoolAuth(['owner', 'staff', 'read_only']), getStudentBalance);
 router.get(

@@ -159,7 +159,22 @@ const paymentSchema = new mongoose.Schema(
       ],
     },
     feeCategory: { type: String, default: null, index: true },
-    feeValidationStatus: { type: String, enum: ['valid', 'underpaid', 'overpaid', 'partial', 'unknown'], default: 'unknown' },
+    // #1766 — Canonical fee-validation vocabulary. Writers MUST assign this
+    // field only via utils/money.classifyFeePayment so every code path agrees
+    // on the meaning of each value:
+    //   'valid'     — cumulative total equals the expected amount
+    //   'partial'   — cumulative total is below the fee; the payment is
+    //                 accepted as an installment toward the balance
+    //   'underpaid' — payment is below the expected *installment* when a
+    //                 payment plan exists (see #1379 semantics)
+    //   'overpaid'  — cumulative total exceeds the expected amount
+    //   'unknown'   — no fee/expected amount is known yet
+    // See docs/payment-plans-underpaid-reconciliation.md.
+    feeValidationStatus: {
+      type: String,
+      enum: ['valid', 'underpaid', 'overpaid', 'partial', 'unknown'],
+      default: 'unknown',
+    },
     excessAmount: {
       type: Number,
       default: 0,

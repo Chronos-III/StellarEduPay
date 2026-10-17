@@ -12,7 +12,8 @@ const Payment = require("../models/paymentModel");
 const Student = require("../models/studentModel");
 const PaymentIntent = require("../models/paymentIntentModel");
 const { validatePaymentAmount } = require("../utils/paymentLimits");
-const { toStroops, stroopsToNumber, compareAmounts } = require("../utils/stellarAmount");
+const { toStroops, stroopsToNumber } = require("../utils/stellarAmount");
+const { classifyFeePayment } = require("../utils/money");
 const {
   SUPPORTED_MEMO_TYPES,
   normalizeMemoType,
@@ -852,19 +853,15 @@ async function syncPaymentsForSchool(school) {
       );
 
       // Partial payments are accepted in the sync path — cumulative total determines status.
-      // A single payment below the fee is recorded as 'partial' (credit toward remainingBalance).
-      // Compare in exact stroop space (#842) so an exact cumulative match is never
-      // mis-classified as partial/overpaid by a float rounding epsilon.
-      const cumulativeVsFee = compareAmounts(cumulativeTotal, student.feeAmount);
-      let cumulativeStatus;
-      if (cumulativeVsFee < 0) cumulativeStatus = "partial";
-      else if (cumulativeVsFee > 0) cumulativeStatus = "overpaid";
-      else cumulativeStatus = "valid";
-
-      const excessAmount =
-        cumulativeStatus === "overpaid"
-          ? stroopsToNumber(toStroops(cumulativeTotal) - toStroops(student.feeAmount))
-          : 0;
+      // Classification is delegated to the canonical classifyFeePayment helper (#1766)
+      // so the sync path, verify path and updateStudentBalance cannot diverge on the
+      // vocabulary used for a cumulative total below the fee.
+      const cumulativeClassification = classifyFeePayment(
+        cumulativeTotal,
+        student.feeAmount,
+      );
+      const cumulativeStatus = cumulativeClassification.status;
+      const excessAmount = cumulativeClassification.excessAmount;
 
       let session;
       try {
