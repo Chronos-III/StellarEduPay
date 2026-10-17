@@ -51,6 +51,9 @@ const STATUS_TO_CONFIRMATION_STATE = Object.freeze({
   SUCCESS: CONFIRMATION_STATES.FINALIZED,
   FAILED: CONFIRMATION_STATES.FAILED,
   REFUNDED: CONFIRMATION_STATES.FINALIZED,
+  // #1761 — A REJECTED row is a durable verification-failure marker, not a
+  // credited payment. It maps to the terminal failed sub-state.
+  REJECTED: CONFIRMATION_STATES.FAILED,
 });
 
 const STATUS_TO_CONFIRMATION_STATUS = Object.freeze({
@@ -59,7 +62,19 @@ const STATUS_TO_CONFIRMATION_STATUS = Object.freeze({
   SUCCESS: 'confirmed',
   FAILED: 'failed',
   REFUNDED: 'confirmed',
+  // #1761 — REJECTED is a verification-failure marker, never a confirmed payment.
+  REJECTED: 'failed',
 });
+
+/**
+ * #1761 — Statuses that represent a durable verification-failure marker rather
+ * than a credited payment. Rows with these statuses must be excluded from every
+ * "existing payment" lookup used for idempotency / duplicate detection so that
+ * a transaction rejected for a configuration-dependent reason (limits, accepted
+ * assets, wrong school) can be re-verified and credited once the configuration
+ * changes.
+ */
+const REJECTION_STATUSES = Object.freeze(['REJECTED']);
 
 /**
  * Derive the fine-grained confirmation state from the authoritative `status`.
@@ -106,6 +121,32 @@ function isCountedAsPaid(paymentOrStatus) {
  */
 function countedAsPaidFilter() {
   return { status: { $in: ['SUCCESS', 'REFUNDED'] } };
+}
+
+/**
+ * #1761 — Mongo filter matching every payment that should be treated as an
+ * "existing" record for idempotency / duplicate detection. REJECTED rows are
+ * durable verification-failure markers and must NOT block a later
+ * re-verification, so they are excluded.
+ *
+ * @param {object} [base] additional filter fields to merge in
+ * @returns {object} a Mongo filter
+ */
+function existingPaymentFilter(base = {}) {
+  return { ...base, status: { $nin: REJECTION_STATUSES } };
+}
+
+/**
+ * #1761 — Predicate: is this payment a durable rejection marker?
+ * @param {object|string} paymentOrStatus
+ * @returns {boolean}
+ */
+function isRejected(paymentOrStatus) {
+  const status =
+    typeof paymentOrStatus === 'string'
+      ? paymentOrStatus
+      : paymentOrStatus && paymentOrStatus.status;
+  return REJECTION_STATUSES.includes(status);
 }
 
 const paymentSchema = new mongoose.Schema(
@@ -212,7 +253,22 @@ const paymentSchema = new mongoose.Schema(
     // #1560 — AUTHORITATIVE lifecycle field. Canonical status values are
     // imported from constants/paymentStatus.js (Issue #72). All other
     // lifecycle fields below are derived from this one.
-    status: { type: String, enum: PAYMENT_STATUS_VALUES, default: 'PENDING' },
+    // #1761 — 'REJECTED' is a durable verification-failure marker (see
+    // rejectionCode below). It is never counted as paid and is excluded from
+    // every "existing payment" lookup used for idempotency/duplicate detection.
+    status: {
+      type: String,
+      enum: [...PAYMENT_STATUS_VALUES, 'REJECTED'],
+      default: 'PENDING',
+    },
+    // #1761 — Machine-readable reason a payment was rejected during
+    // verification (e.g. TX_FAILED, MISSING_MEMO, INVALID_DESTINATION,
+    // UNSUPPORTED_ASSET, AMOUNT_TOO_LOW, AMOUNT_TOO_HIGH, UNDERPAID). Only set
+    // on REJECTED rows. Several of these are configuration-dependent, so a
+    // REJECTED row must never block a later re-verification.
+    rejectionCode: { type: String, default: null, index: true },
+    rejectionMessage: { type: String, default: null },
+    rejectedAt: { type: Date, default: null },
     memo: { type: String },
     senderAddress: { type: String, default: null },
     isSuspicious: { type: Boolean, default: false },
@@ -298,6 +354,10 @@ paymentSchema.pre('save', function syncDerivedLifecycleFields(next) {
     this.confirmationState = deriveConfirmationState(this.status);
     this.confirmationStatus = deriveConfirmationStatus(this.status);
   }
+  // #1761 — Keep rejection metadata consistent with the authoritative status.
+  if (this.status === 'REJECTED' && !this.rejectedAt) {
+    this.rejectedAt = new Date();
+  }
   next();
 });
 
@@ -308,12 +368,19 @@ paymentSchema.statics.isCountedAsPaid = isCountedAsPaid;
 paymentSchema.statics.countedAsPaidFilter = countedAsPaidFilter;
 paymentSchema.statics.deriveConfirmationState = deriveConfirmationState;
 paymentSchema.statics.deriveConfirmationStatus = deriveConfirmationStatus;
+// #1761 — Expose the rejection helpers so every idempotency / duplicate
+// detection path can share one definition of "existing payment".
+paymentSchema.statics.existingPaymentFilter = existingPaymentFilter;
+paymentSchema.statics.isRejected = isRejected;
+paymentSchema.statics.REJECTION_STATUSES = REJECTION_STATUSES;
 
 // Indexes
 // Compound unique index enforces per-school, per-operation uniqueness: the same
 // transaction may legitimately contain several payment operations (one per
 // student), so identity is (schoolId, txHash, opIndex) rather than
-// txHash alone.
+// txHash alone. This is the ONLY unique index on txHash — a legacy
+// { schoolId, txHash } unique index would reject the second operation of a
+// multi-operation transaction and must not exist (see migration 035).
 paymentSchema.index({ schoolId: 1, txHash: 1, opIndex: 1 }, { unique: true });
 
 const Payment = mongoose.model('Payment', paymentSchema);
@@ -323,3 +390,6 @@ module.exports.isCountedAsPaid = isCountedAsPaid;
 module.exports.countedAsPaidFilter = countedAsPaidFilter;
 module.exports.deriveConfirmationState = deriveConfirmationState;
 module.exports.deriveConfirmationStatus = deriveConfirmationStatus;
+module.exports.existingPaymentFilter = existingPaymentFilter;
+module.exports.isRejected = isRejected;
+module.exports.REJECTION_STATUSES = REJECTION_STATUSES;
