@@ -20,8 +20,14 @@ const {
 const { requireAdminAuth } = require('../middleware/auth');
 const { auditContext } = require('../middleware/auditContext');
 
+// ?includeInactive=true requires admin auth (cookie or Bearer, admin/super_admin)
+function adminAuthForInactive(req, res, next) {
+  if (req.query.includeInactive === 'true') return requireAdminAuth(req, res, next);
+  next();
+}
+
 // Public read endpoints
-router.get('/',                 getAllSchools);
+router.get('/',                 adminAuthForInactive, getAllSchools);
 router.get('/:schoolId',        getSchool);
 
 // Admin-only write endpoints — require JWT auth
