@@ -50,6 +50,7 @@ const DEFAULT_SIGNATURE_VERSIONS = ['v2'];
  *                       are additionally signed with it until
  *                       previousSecretExpiresAt so receivers can roll over (#1538).
  *   signatureVersions — which signature headers this endpoint receives (#1539).
+ *   eventSequence     — last per-endpoint delivery sequence issued (#1815)
  *   subscribedEvents  — subset of WEBHOOK_EVENTS this endpoint receives
  *   isActive          — when false, the endpoint is skipped on all deliveries
  *   description       — optional human-readable label for admin UIs
@@ -95,6 +96,9 @@ const webhookEndpointSchema = new mongoose.Schema(
         message: 'signatureVersions must contain at least one signature version',
       },
     },
+    // #1815: last sequence number issued to this endpoint. Incremented
+    // atomically per delivery so consumers can detect gaps and reorder.
+    eventSequence: { type: Number, default: 0, min: 0 },
     subscribedEvents: {
       type: [String],
       enum: WEBHOOK_EVENTS,
