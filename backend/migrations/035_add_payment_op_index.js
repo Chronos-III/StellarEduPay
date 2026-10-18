@@ -18,7 +18,11 @@
  * place; it is scoped per school and does not block multi-op transactions.
  */
 
+const VERSION = '035_add_payment_op_index';
+
 module.exports = {
+  version: VERSION,
+
   async up(db) {
     const payments = db.collection('payments');
 
