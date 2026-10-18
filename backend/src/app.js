@@ -51,6 +51,7 @@ const analyticsRoutes = require('./routes/analyticsRoutes');
 const userRoutes = require('./routes/userRoutes');
 const academicPeriodRoutes = require('./routes/academicPeriodRoutes');
 const anchorRoutes = require('./routes/anchorRoutes');
+const publicConfigRoutes = require('./routes/publicConfigRoutes');
 
 const { registerPaymentSavedSubscribers } = require('./services/paymentSavedSubscribers');
 const { startPolling, stopPolling } = require('./services/transactionPollingService');
@@ -207,6 +208,10 @@ const concurrentMiddleware = createConcurrentRequestMiddleware({
 // ── Metrics ───────────────────────────────────────────────────────────────────
 // Mounted before the rate-limiter so Prometheus scrapes are never throttled.
 app.use('/metrics', metricsRoute);
+
+// Issue #1792 — unauthenticated runtime config read on every frontend page load
+// (TestnetBanner network-mismatch guard), so it is mounted before the rate limiter.
+app.use('/api/public-config', publicConfigRoutes);
 
 app.use(concurrentMiddleware.rateLimiter((req) => req.ip));
 app.use(concurrentMiddleware.requestQueue());
