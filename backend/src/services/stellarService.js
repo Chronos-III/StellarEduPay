@@ -43,6 +43,7 @@ const {
 } = require("./paymentConfirmationStateMachine");
 const logger = require("../utils/logger").child("StellarService");
 const { getEngineForSchool } = require("./feeAdjustmentEngine");
+const { recordUnmatchedPayment } = require("./unmatchedPaymentService");
 
 // TTL for the per-student balance lock (#1026), shared with paymentController's
 // verifyPayment. Guards the read-aggregate-then-write sequence that computes
@@ -785,7 +786,12 @@ async function syncPaymentsForSchool(school) {
           });
         }
       }
-      if (!student) { summary.unmatched++; continue; }
+      if (!student) {
+        // Issue #1798 — persist the unattributed inflow for the unmatched queue.
+        await recordUnmatchedPayment({ schoolId, tx, payOp, memo, memoType: valid.memoType, asset, reason: 'student_not_found' });
+        summary.unmatched++;
+        continue;
+      }
 
       summary.matched++;
 
