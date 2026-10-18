@@ -1,11 +1,12 @@
 # ── Stage 1: build ────────────────────────────────────────────
-FROM node:20-alpine AS builder
+# node:20-alpine pinned to this immutable manifest digest.
+FROM node@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS builder
 
 WORKDIR /app
 
 # Install dependencies
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 # Issue #1583: NEXT_PUBLIC_STELLAR_NETWORK is now read at runtime from
 # GET /api/public-config, so this image is environment-agnostic.
@@ -24,7 +25,8 @@ COPY . .
 RUN npm run build
 
 # ── Stage 2: run ──────────────────────────────────────────────
-FROM node:20-alpine AS runner
+# node:20-alpine pinned to the same immutable manifest digest as the builder.
+FROM node@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runner
 
 # Non-root user for security
 RUN addgroup -S -g 1001 appgroup && adduser -S -u 1001 -G appgroup appuser

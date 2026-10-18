@@ -1,0 +1,8 @@
+# Default review owner for all repository changes.
+* @Mystery-CLI
+
+# Require maintainers familiar with the affected security boundary.
+/.github/ @Mystery-CLI
+/deploy/ @Mystery-CLI
+/backend/src/middleware/ @Mystery-CLI
+/backend/src/services/ @Mystery-CLI

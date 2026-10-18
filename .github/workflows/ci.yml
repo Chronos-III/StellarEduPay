@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -14,8 +17,8 @@ jobs:
     name: Check dependency version drift
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
       - name: Detect major-version mismatches
@@ -25,11 +28,11 @@ jobs:
     name: Dependency security audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             backend/node_modules
@@ -38,9 +41,9 @@ jobs:
           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-node-
-      - run: npm ci
-      - run: cd backend && npm ci && cd ..
-      - run: cd frontend && npm ci && cd ..
+      - run: npm ci --ignore-scripts
+      - run: cd backend && npm ci --ignore-scripts && cd ..
+      - run: cd frontend && npm ci --ignore-scripts && cd ..
       - name: Audit root
         run: node scripts/check-dependency-audit.js .
       - name: Audit backend
@@ -52,8 +55,8 @@ jobs:
     name: Scan example files for real-format secrets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
       - name: Scan example files for secret material
@@ -63,8 +66,8 @@ jobs:
     name: Scan repository for committed Stellar secret keys
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
       - name: Scan tracked files for Stellar secret key material
@@ -74,28 +77,28 @@ jobs:
     name: Validate migration numbering
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: node scripts/validate-migrations.js
 
   orphan-dirs:
     name: Check for stray duplicate directories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: node scripts/check-orphan-dirs.js
 
   error-response-shape:
     name: Check 401/403 response shape
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: node scripts/check-error-response-shape.js
 
   k8s-ingress-tls:
     name: Verify Kubernetes ingress has TLS configuration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check ingress TLS block exists
         run: |
           if ! grep -q "tls:" deploy/k8s/ingress.yaml; then
@@ -108,18 +111,18 @@ jobs:
     name: Lint backend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: backend/node_modules
           key: ${{ runner.os }}-backend-node-${{ hashFiles('backend/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-backend-node-
       - name: Install backend dependencies
-        run: cd backend && npm ci
+        run: cd backend && npm ci --ignore-scripts
       - name: Run ESLint (backend)
         run: cd backend && npx eslint src/ --max-warnings=0
 
@@ -127,18 +130,18 @@ jobs:
     name: Lint frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: frontend/node_modules
           key: ${{ runner.os }}-frontend-node-${{ hashFiles('frontend/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-frontend-node-
       - name: Install frontend dependencies
-        run: cd frontend && npm ci
+        run: cd frontend && npm ci --ignore-scripts
       - name: Run next lint (frontend)
         run: cd frontend && npm run lint
 
@@ -148,18 +151,18 @@ jobs:
     env:
       NEXT_PUBLIC_API_URL: /api
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: frontend/node_modules
           key: ${{ runner.os }}-frontend-node-${{ hashFiles('frontend/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-frontend-node-
       - name: Install frontend dependencies
-        run: cd frontend && npm ci
+        run: cd frontend && npm ci --ignore-scripts
       - name: Build frontend (next build)
         run: cd frontend && npm run build
 
@@ -173,18 +176,18 @@ jobs:
     env:
       NEXT_PUBLIC_API_URL: http://localhost:5000/api
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: frontend/node_modules
           key: ${{ runner.os }}-frontend-node-${{ hashFiles('frontend/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-frontend-node-
       - name: Install frontend dependencies
-        run: cd frontend && npm ci
+        run: cd frontend && npm ci --ignore-scripts
       - name: Run jest-axe component assertions
         run: cd frontend && npm run test:a11y
       - name: Install Playwright browsers
@@ -213,11 +216,11 @@ jobs:
           --health-start-period 20s
 
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: '.nvmrc'
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             backend/node_modules
@@ -226,9 +229,9 @@ jobs:
           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-node-
-      - run: npm ci
-      - run: cd backend && npm ci && cd ..
-      - run: cd frontend && npm ci && cd ..
+      - run: npm ci --ignore-scripts
+      - run: cd backend && npm ci --ignore-scripts && cd ..
+      - run: cd frontend && npm ci --ignore-scripts && cd ..
       - name: Syntax check
         run: npm run check:syntax
       - name: Validate migration policy

@@ -13,6 +13,7 @@ Thank you for your interest in contributing to StellarEduPay! This guide will he
 - [Coding Standards](#-coding-standards)
 - [Testing Requirements](#-testing-requirements)
 - [Pull Request Process](#-pull-request-process)
+- [Issue Triage](#-issue-triage)
 - [Architecture Guidelines](#-architecture-guidelines)
 - [Security Best Practices](#-security-best-practices)
 
@@ -40,16 +41,16 @@ Before you begin, ensure you have the following installed:
 
 2. **Install Dependencies**
    ```bash
-   # Root dependencies (for testing)
-   npm install
+   # Root dependencies (for testing); install scripts are not needed for CI-style setup.
+   npm install --ignore-scripts
    
    # Backend dependencies
    cd backend
-   npm install
+   npm install --ignore-scripts
    
    # Frontend dependencies
    cd ../frontend
-   npm install
+   npm install --ignore-scripts
    cd ..
    ```
 
@@ -544,7 +545,6 @@ Your PR must meet these criteria before merging:
 - [ ] **No sensitive data** - No secrets, API keys, or PII in code
 
 ### Review Process
-
 1. Maintainers will review your PR within 2-3 business days
 2. Address any requested changes by pushing new commits
 3. Once approved, a maintainer will merge your PR
@@ -552,6 +552,11 @@ Your PR must meet these criteria before merging:
 
 ---
 
+## 🔍 Issue Triage
+
+Use the [issue triage guide](docs/issue-triage.md) before opening, duplicating, or closing an issue. Reports should include reproduction steps, expected and actual behavior, environment, impact, and sanitized evidence. Suspected regressions remain open until the fix is merged and verification evidence is recorded.
+
+---
 ## 🏗 Architecture Guidelines
 
 ### Service-Oriented Architecture

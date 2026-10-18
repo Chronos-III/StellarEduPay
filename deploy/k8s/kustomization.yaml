@@ -26,6 +26,7 @@ kind: Kustomization
 #    --docker-server=<registry> --docker-username=<user> --docker-password=<pass>)
 
 resources:
+  - policies/verify-stellaredupay-images.yaml
   - backend-deployment.yaml
   - backend-hpa.yaml
   - backend-pdb.yaml
