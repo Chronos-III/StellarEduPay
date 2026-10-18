@@ -1,5 +1,17 @@
 "use strict";
 
+// Issue #1557 — path payments deliver funds to the school wallet just like a
+// plain payment (the destination amount/asset are on the operation), so they
+// must be credited too. Previously only type "payment" was accepted.
+const CREDITABLE_OP_TYPES = new Set([
+  "payment",
+  "path_payment_strict_receive",
+  "path_payment_strict_send",
+]);
+function isCreditableOpType(type) {
+  return CREDITABLE_OP_TYPES.has(type);
+}
+
 const { Operation } = require("@stellar/stellar-sdk");
 const {
   server,
@@ -136,7 +148,7 @@ async function extractValidPayment(tx, walletAddress) {
   // is creditable. detectAsset then enforces the asset/issuer (#841): a
   // wrong-asset or fake-issuer operation yields null and is rejected here.
   const payOp = ops.records.find(
-    (op) => op.type === "payment" && op.to === walletAddress,
+    (op) => isCreditableOpType(op.type) && op.to === walletAddress,
   );
   if (!payOp) return null;
 
@@ -538,7 +550,7 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
     context: `Transaction ${txHash} operations`,
   });
   const payOp = ops.records.find(
-    (op) => op.type === "payment" && op.to === walletAddress,
+    (op) => isCreditableOpType(op.type) && op.to === walletAddress,
   );
   if (!payOp) {
     const err = new Error(
@@ -1123,7 +1135,7 @@ async function parseIncomingTransaction(txHash, walletAddress = null) {
   const payments = ops.records
     .filter(
       (op) =>
-        op.type === "payment" && (!walletAddress || op.to === walletAddress),
+        isCreditableOpType(op.type) && (!walletAddress || op.to === walletAddress),
     )
     .map((op) => ({
       from: op.from || null,

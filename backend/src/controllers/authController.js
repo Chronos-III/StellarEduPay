@@ -155,25 +155,31 @@ function makeMemoryStore() {
   };
 }
 
-let _store;
+// Issue #1795 — the Redis store is cached once it exists, but the in-memory
+// fallback is only used while Redis is unavailable. It is never cached over the
+// Redis store, so a Redis outage at first call no longer pins the process to
+// memory for its whole lifetime.
+let _redisStore;
+let _memoryStore;
 
 function getStore() {
-  if (_store) return _store;
-
   if (process.env.REDIS_HOST) {
     const client = getRedisClient();
     if (client && client.status === 'ready') {
-      _store = makeRedisStore(client);
-      return _store;
+      if (!_redisStore) _redisStore = makeRedisStore(client);
+      return _redisStore;
     }
-    logger.warn('[AuthController] Redis unavailable — falling back to in-memory token store');
+    logger.warn('[AuthController] Redis unavailable — using in-memory token store until it recovers');
   }
 
-  _store = makeMemoryStore();
-  return _store;
+  if (!_memoryStore) _memoryStore = makeMemoryStore();
+  return _memoryStore;
 }
 
-function _resetStore() { _store = null; }
+function _resetStore() {
+  _redisStore = null;
+  _memoryStore = null;
+}
 
 // ── Per-account login lockout ─────────────────────────────────────────────────
 
@@ -184,8 +190,20 @@ const LOGIN_LOCK_TTL = 900;
 function loginLockKey(id) { return `loginLock:${id}`; }
 function loginFailKey(id) { return `loginFail:${id}`; }
 
-function isLockedOut(loginId) {
-  return Boolean(get(loginLockKey(loginId)));
+// Issue #1795 — a lock written to Redis by another replica must be honoured,
+// so Redis is consulted in addition to the in-process cache.
+async function isLockedOut(loginId) {
+  if (get(loginLockKey(loginId))) return true;
+
+  const redis = getRedisClient();
+  if (redis && isRedisReady()) {
+    try {
+      return (await redis.exists(loginLockKey(loginId))) === 1;
+    } catch (e) {
+      logger.warn('[AuthController] Redis error checking login lockout', { error: e.message });
+    }
+  }
+  return false;
 }
 
 async function recordLoginFailure(loginId) {
@@ -304,7 +322,7 @@ async function handleLogin(req, res) {
   const { username, email, password, mfaCode } = req.body || {};
   const loginId = ((email || username) || '').trim().toLowerCase();
 
-  if (isLockedOut(loginId)) {
+  if (await isLockedOut(loginId)) {
     return res.status(429).json({
       error: 'Too many failed login attempts. Account temporarily locked.',
       code: 'ACCOUNT_LOCKED',
@@ -746,4 +764,6 @@ module.exports = {
   handleRevokeSession,
   handleChangePassword,
   _resetStore,
+  getStore,
+  isLockedOut,
 };

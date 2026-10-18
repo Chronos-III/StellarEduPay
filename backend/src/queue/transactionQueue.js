@@ -28,7 +28,7 @@ const PendingVerification = require('../models/pendingVerificationModel');
 const logger = require('../utils/logger');
 const { resolveCorrelationId } = require('../utils/correlationId');
 const { getRedisClient, isRedisReady } = require('../config/redisClient');
-const { transactionQueueProcessingDurationSeconds, transactionQueueFailedTotal } = require('../metrics');
+const { transactionQueueProcessingDurationSeconds, transactionQueueFailedTotal, transactionQueueDepth } = require('../metrics');
 
 const QUEUE_NAME = 'transaction-processing';
 
@@ -367,6 +367,8 @@ async function getQueueCounts() {
     transactionQueue.getDelayedCount(),
     transactionQueue.getFailedCount(),
   ]);
+  // Issue #1795 — keep the transaction_queue_depth gauge in step with the counts.
+  transactionQueueDepth.set(waiting + active + delayed);
   return { waiting, active, delayed, failed };
 }
 

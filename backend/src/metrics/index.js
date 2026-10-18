@@ -205,6 +205,29 @@ const suspiciousPaymentFlagged = new client.Counter({
   registers: [registry],
 });
 
+// Issue #1795 — these three metrics were referenced by alert rules and by
+// callers (`require('../metrics').receiptGenerationFailuresTotal.inc(...)`)
+// but never registered, so the calls threw inside try/catch blocks and the
+// alerts could never fire.
+const receiptGenerationFailuresTotal = new client.Counter({
+  name: 'receipt_generation_failures_total',
+  help: 'Number of receipt generation failures, labelled by source',
+  labelNames: ['source'],
+  registers: [registry],
+});
+
+const sendAdminAlertTotal = new client.Counter({
+  name: 'send_admin_alert_total',
+  help: 'Total number of admin alerts triggered',
+  registers: [registry],
+});
+
+const transactionQueueDepth = new client.Gauge({
+  name: 'transaction_queue_depth',
+  help: 'Number of actionable (waiting, active, delayed) transaction queue jobs',
+  registers: [registry],
+});
+
 // Payment limit rejections (#1117). Without this there is no signal telling
 // operators that the configured limits are being hit often enough to warrant
 // adjusting — the limits were previously a control nobody could observe.
@@ -539,6 +562,9 @@ module.exports = {
   nodejsHeapUsedRatio,
   httpRequestDurationSeconds,
   suspiciousPaymentFlagged,
+  receiptGenerationFailuresTotal,
+  sendAdminAlertTotal,
+  transactionQueueDepth,
   paymentLimitTriggeredTotal,
   paymentBatchTotal,
   paymentBatchItemsTotal,
