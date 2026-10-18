@@ -172,8 +172,8 @@ export const resetPassword = (data) => api.post('/users/reset-password', data);
 // Payment plans
 export const createPaymentPlan = (studentId, data) =>
   api.post(`/payment-plans/${studentId}`, data);
-export const getPaymentPlan = (studentId) =>
-  api.get(`/payment-plans/${studentId}`);
+export const getPaymentPlan = (studentId, { signal } = {}) =>
+  api.get(`/payment-plans/${studentId}`, { signal });
 export const updateInstallment = (studentId, installmentIndex, data) =>
   api.patch(`/payment-plans/${studentId}/installment/${installmentIndex}`, data);
 export const cancelPaymentPlan = (studentId) =>
