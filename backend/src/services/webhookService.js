@@ -10,7 +10,7 @@ const { v4: uuidv4 } = require('uuid');
 const School = require('../models/schoolModel');
 const WebhookRetry = require('../models/webhookRetryModel');
 const WebhookEndpoint = require('../models/webhookEndpointModel');
-const { decryptLeanEndpoint } = require('../models/webhookEndpointModel');
+const { decryptLeanEndpoint, TEST_EVENT } = require('../models/webhookEndpointModel');
 const WebhookDelivery = require('../models/webhookDeliveryModel');
 const { validateWebhookUrl, validateResolvedIp } = require('../utils/validateWebhookUrl');
 const { resolveDnsWithCache } = require('../utils/dnsCache');
@@ -152,6 +152,53 @@ function verifySignatureV2(timestamp, deliveryId, rawBody, providedSignature, se
   return crypto.timingSafeEqual(expectedBuf, actualBuf);
 }
 
+/**
+ * Format the X-StellarEduPay-Signature-V2 header value (#1639).
+ *
+ * Normally a single `sha256=<hex>`. During a secret-rotation overlap window
+ * the header carries one value per active secret, newest first, separated by
+ * commas (as Stripe does): `sha256=<new>,sha256=<previous>`. A receiver
+ * accepts the delivery when any value matches its secret, so it keeps
+ * verifying whether it has deployed the new secret yet or not.
+ *
+ * @param {number|string} timestamp
+ * @param {string}        deliveryId
+ * @param {string}        rawBody
+ * @param {string[]}      secrets  Active secrets, newest first
+ * @returns {string}
+ */
+function buildSignatureV2Header(timestamp, deliveryId, rawBody, secrets) {
+  return secrets
+    .filter(Boolean)
+    .map((s) => `sha256=${generateSignatureV2(timestamp, deliveryId, rawBody, s)}`)
+    .join(',');
+}
+
+/**
+ * Verify an X-StellarEduPay-Signature-V2 header that may carry several
+ * comma-separated `sha256=<hex>` values (#1639). Returns true when any value
+ * matches `secret`.
+ *
+ * @param {number|string} timestamp
+ * @param {string}        deliveryId
+ * @param {string}        rawBody
+ * @param {string}        headerValue
+ * @param {string}        secret
+ * @returns {boolean}
+ */
+function verifySignatureV2Header(timestamp, deliveryId, rawBody, headerValue, secret) {
+  if (!headerValue || !secret) return false;
+  return String(headerValue)
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .some((v) => verifySignatureV2(
+      timestamp, deliveryId, rawBody,
+      v.startsWith('sha256=') ? v.slice(7) : v,
+      secret,
+    ));
+}
+
 // ── Backoff ──────────────────────────────────────────────────────────────────
 function getBackoffDelay(attemptNumber) {
   const delays = [60_000, 300_000, 900_000]; // 1 min, 5 min, 15 min
@@ -269,10 +316,11 @@ function _activePreviousSecret(ep, now = new Date()) {
  *
  *   - endpointId → the WebhookEndpoint's (decrypted) secret, overlap secret and
  *                  signatureVersions
- *   - otherwise  → the School's legacy webhookSecret with the legacy
- *                  ['v1','v2'] signature set
  *
- * Falls back to the explicitly passed secret when nothing can be loaded.
+ * Falls back to the explicitly passed secret when nothing can be loaded. The
+ * School.webhookSecret fallback was removed with the legacy delivery path
+ * (#1640); retries queued before migration 036 are re-pointed at the
+ * migrated endpoint by that migration.
  *
  * @param {object} opts
  * @param {string|null} opts.endpointId
@@ -292,11 +340,6 @@ async function _resolveSigningContext({ endpointId = null, schoolId = null, secr
           previousSecret: _activePreviousSecret(ep),
           signatureVersions: ep.signatureVersions || null,
         };
-      }
-    } else if (!secret && schoolId) {
-      const school = await School.findOne({ schoolId }).select('webhookSecret');
-      if (school?.webhookSecret) {
-        return { secret: school.webhookSecret, previousSecret: null, signatureVersions: null };
       }
     }
   } catch (err) {
@@ -328,7 +371,7 @@ async function _resolveSigningContext({ endpointId = null, schoolId = null, secr
  * @param {string|null} opts.endpointId    ObjectId string of WebhookEndpoint (null for legacy)
  * @param {string|null} opts.schoolId
  * @param {number}  [opts.attemptCount=1]
- * @returns {Promise<{success: boolean, statusCode?: number, error?: string, deliveryId: string}>}
+ * @returns {Promise<{success: boolean, statusCode?: number, error?: string, deliveryId: string, durationMs: number}>}
  */
 async function _sendToUrl({
   url, event, filteredPayload, rawPayload, secret, deliveryId,
@@ -350,7 +393,7 @@ async function _sendToUrl({
         attemptCount, durationMs: 0, error: `SSRF_BLOCKED: ${sendCheck.reason}`,
       });
     }
-    return { success: false, error: 'SSRF_BLOCKED', deliveryId };
+    return { success: false, error: 'SSRF_BLOCKED', deliveryId, durationMs: 0 };
   }
 
   const timestamp = Math.floor(Date.now() / 1000);
@@ -386,9 +429,14 @@ async function _sendToUrl({
     if (versions.includes('v2')) {
       // V2 — signs `timestamp.deliveryId.rawBody` so the timestamp and delivery-ID
       // are bound to the signature and cannot be rewritten by an attacker.
-      headers['X-StellarEduPay-Signature-V2'] = `sha256=${generateSignatureV2(timestamp, deliveryId, rawBody, secret)}`;
-      // #1538: during a secret-rotation overlap window, also sign with the
-      // previous secret so receivers can switch over without dropping events.
+      // #1639: during a secret-rotation overlap window the header carries one
+      // value per active secret (new first), so receivers verify against
+      // either secret without dropping events.
+      headers['X-StellarEduPay-Signature-V2'] = buildSignatureV2Header(
+        timestamp, deliveryId, rawBody, [secret, previousSecret],
+      );
+      // #1538: the previous-secret signature is also sent on its own header
+      // for receivers written against that contract.
       if (previousSecret) {
         headers['X-StellarEduPay-Signature-V2-Previous'] = `sha256=${generateSignatureV2(timestamp, deliveryId, rawBody, previousSecret)}`;
       }
@@ -431,7 +479,7 @@ async function _sendToUrl({
       });
     }
 
-    return { success: true, statusCode: response.status, deliveryId };
+    return { success: true, statusCode: response.status, deliveryId, durationMs };
 
   } catch (err) {
     const durationMs = Date.now() - startTime;
@@ -477,7 +525,7 @@ async function _sendToUrl({
       });
     }
 
-    return { success: false, statusCode, error: errorMessage, deliveryId };
+    return { success: false, statusCode, error: errorMessage, deliveryId, durationMs };
   }
 }
 
@@ -569,9 +617,8 @@ async function fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields
 }
 
 /**
- * Legacy single-URL fireWebhook — used by the retry queue and direct callers
- * that still pass a URL+secret explicitly (e.g. paymentSavedSubscribers
- * legacy path, DLQ replay).
+ * Single-URL delivery — used by direct callers that pass a URL explicitly
+ * (delivery replay, DLQ replay). School events go through dispatchToSchool().
  *
  * #866: send-time re-validation is applied inside _sendToUrl.
  *
@@ -634,6 +681,79 @@ async function fireWebhook(url, event, payload, secret = null, deliveryId = null
   }
 
   return result;
+}
+
+// ── Test delivery — Issue #1639 ──────────────────────────────────────────────
+/**
+ * Sample data carried by a webhook.test delivery. Shaped like a
+ * payment.confirmed payload so integrators can exercise their parser, but
+ * flagged `test: true` and using obviously fake identifiers.
+ */
+function _buildTestPayload(schoolId) {
+  return {
+    test: true,
+    message: 'This is a test webhook event from StellarEduPay.',
+    schoolId,
+    txHash: '0'.repeat(64),
+    transactionHash: '0'.repeat(64),
+    amount: '100.0000000',
+    asset: 'XLM',
+    assetCode: 'XLM',
+    status: 'SUCCESS',
+    referenceCode: 'TEST-0000',
+    ts: new Date().toISOString(),
+  };
+}
+
+/**
+ * Send a signed `webhook.test` event to one endpoint through the normal
+ * signing/delivery path (send-time SSRF checks, endpoint signature versions,
+ * rotation dual-signing, delivery log) and report the receiver's response.
+ *
+ * Unlike real events a failed test is NOT queued for retry — the caller sees
+ * the result immediately and fixes the receiver.
+ *
+ * @param {object} endpoint  WebhookEndpoint loaded with +secret +previousSecret
+ * @returns {Promise<{success: boolean, statusCode: number|null, durationMs: number,
+ *   error: string|null, deliveryId: string, event: string}>}
+ */
+async function sendTestDelivery(endpoint) {
+  const deliveryId = uuidv4();
+  const schoolId = endpoint.schoolId;
+  const payload = _buildTestPayload(schoolId);
+
+  const urlCheck = await validateWebhookUrl(endpoint.url);
+  if (!urlCheck.valid) {
+    await _writeDeliveryLog({
+      endpointId: endpoint._id, schoolId, deliveryId, event: TEST_EVENT,
+      payload, statusCode: null, responseBody: null, success: false,
+      attemptCount: 1, durationMs: 0, error: 'URL_VALIDATION_FAILED',
+    });
+    return { success: false, statusCode: null, durationMs: 0, error: 'URL_VALIDATION_FAILED', deliveryId, event: TEST_EVENT };
+  }
+
+  const result = await _sendToUrl({
+    url: endpoint.url,
+    event: TEST_EVENT,
+    filteredPayload: payload,
+    rawPayload: payload,
+    secret: endpoint.secret,
+    previousSecret: _activePreviousSecret(endpoint),
+    signatureVersions: endpoint.signatureVersions || null,
+    deliveryId,
+    endpointId: endpoint._id,
+    schoolId,
+    attemptCount: 1,
+  });
+
+  return {
+    success: result.success,
+    statusCode: result.statusCode ?? null,
+    durationMs: result.durationMs ?? 0,
+    error: result.error || null,
+    deliveryId,
+    event: TEST_EVENT,
+  };
 }
 
 // ── Retry queue ───────────────────────────────────────────────────────────────
@@ -810,136 +930,38 @@ async function retryWebhook(retry) {
   }
 }
 
-// ── Public notify helpers ─────────────────────────────────────────────────────
-// Each helper fires to all active WebhookEndpoint subscriptions for the school
-// (#865). The rawPayload is PII-filtered per school config inside
-// fireWebhookToEndpoints (#867).
-// Falls back to the legacy single-URL path when no endpoints exist, to ensure
-// backward-compatibility with schools that still have only webhookUrl on the
-// School document.
+// ── School event dispatch — Issue #1640 ─────────────────────────────────────
+// WebhookEndpoint is the only outbound webhook configuration model. Every
+// school event is delivered to the school's active endpoints subscribed to it;
+// the former School.webhookUrl fallback has been removed (schools that used it
+// were converted to endpoints by migration 036).
 
-async function _dispatchToSchool(schoolId, event, rawPayload, school) {
-  // Try multi-endpoint path first
-  const allowedFields = school?.webhookPayloadConfig?.allowedFields || null;
-  const results = await fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields);
-
-  // Fallback: legacy single-URL on the School document
-  if (results.length === 0 && school?.webhookUrl) {
-    const filteredPayload = buildWebhookPayload(rawPayload, allowedFields);
-    return fireWebhook(school.webhookUrl, event, filteredPayload, school.webhookSecret || null);
-  }
-
-  return results;
-}
-
-async function notifyPaymentConfirmed(webhookUrl, payment, student, secret = null) {
-  // Legacy direct-URL callers (e.g. paymentSavedSubscribers before migration)
-  if (webhookUrl) {
-    return fireWebhook(webhookUrl, 'payment.confirmed', {
-      transactionHash: payment.transactionHash || payment.txHash,
-      txHash: payment.txHash || payment.transactionHash,
-      correlationId: payment.correlationId,
-      studentId: payment.studentId,
-      amount: payment.amount,
-      assetCode: payment.assetCode || 'XLM',
-      asset: payment.assetCode || 'XLM',
-      finalFee: payment.finalFee,
-      feeValidationStatus: payment.feeValidationStatus,
-      confirmedAt: payment.confirmedAt,
-      referenceCode: payment.referenceCode,
-      schoolId: payment.schoolId,
-      senderAddress: payment.senderAddress,
-      status: payment.status,
-      ts: new Date().toISOString(),
-    }, secret);
-  }
-  return null;
-}
-
-async function notifyPaymentPending(webhookUrl, payment, secret = null) {
-  if (webhookUrl) {
-    return fireWebhook(webhookUrl, 'payment.pending', {
-      transactionHash: payment.transactionHash || payment.txHash,
-      txHash: payment.txHash || payment.transactionHash,
-      correlationId: payment.correlationId,
-      studentId: payment.studentId,
-      amount: payment.amount,
-      assetCode: payment.assetCode || 'XLM',
-      asset: payment.assetCode || 'XLM',
-      ledgerSequence: payment.ledgerSequence,
-      status: 'pending_confirmation',
-      ts: new Date().toISOString(),
-    }, secret);
-  }
-  return null;
-}
-
-async function notifyPaymentFailed(webhookUrl, payment, reason, secret = null) {
-  if (webhookUrl) {
-    return fireWebhook(webhookUrl, 'payment.failed', {
-      transactionHash: payment.transactionHash || payment.txHash,
-      txHash: payment.txHash || payment.transactionHash,
-      correlationId: payment.correlationId,
-      studentId: payment.studentId,
-      amount: payment.amount || 0,
-      reason,
-      status: 'FAILED',
-      ts: new Date().toISOString(),
-    }, secret);
-  }
-  return null;
-}
-
-async function notifyPaymentRefunded(webhookUrl, refundEvent, student, secret = null) {
-  if (webhookUrl) {
-    return fireWebhook(webhookUrl, 'payment.refunded', {
-      originalTxHash: refundEvent.originalTxHash,
-      refundTxHash: refundEvent.refundTxHash || null,
-      studentId: refundEvent.studentId,
-      amount: refundEvent.amount,
-      reason: refundEvent.reason,
-      status: refundEvent.newStatus,
-      refundedAt: new Date().toISOString(),
-      ts: new Date().toISOString(),
-    }, secret);
-  }
-  return null;
-}
-
-async function notifyPaymentSuspicious(webhookUrl, payment, reason, secret = null) {
-  if (webhookUrl) {
-    return fireWebhook(webhookUrl, 'payment.suspicious', {
-      transactionHash: payment.transactionHash || payment.txHash,
-      txHash: payment.txHash || payment.transactionHash,
-      correlationId: payment.correlationId,
-      studentId: payment.studentId,
-      amount: payment.amount,
-      reason,
-      isSuspicious: true,
-      status: payment.status,
-      ts: new Date().toISOString(),
-    }, secret);
-  }
-  return null;
-}
-
-/** Legacy fire-and-forget helper used by concurrentPaymentProcessor. */
-function sendPaymentWebhook(url, data, secret = null) {
-  return fireWebhook(url, 'payment.confirmed', data, secret);
+/**
+ * Deliver a school event to every active endpoint subscribed to it, with the
+ * payload PII-filtered by the school's webhookPayloadConfig (#867).
+ *
+ * @param {string} schoolId
+ * @param {string} event
+ * @param {object} rawPayload
+ * @param {object} [school]  Pre-loaded School document (avoids a lookup)
+ * @returns {Promise<Array<{endpointId, success, statusCode?, error?, deliveryId}>>}
+ */
+async function dispatchToSchool(schoolId, event, rawPayload, school = undefined) {
+  if (!schoolId) return [];
+  const doc = school !== undefined
+    ? school
+    : await School.findOne({ schoolId }).select('webhookPayloadConfig').lean();
+  const allowedFields = doc?.webhookPayloadConfig?.allowedFields || null;
+  return fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields);
 }
 
 /**
- * Notify external system that a dispute has been opened for a payment.
- * Fires the 'dispute.created' event through both the unified per-endpoint
- * webhook system (#865) and the legacy single-URL mechanism.
+ * Notify the school's endpoints that a dispute has been opened.
  *
- * @param {string} webhookUrl - Registered webhook URL (legacy path)
- * @param {object} dispute - Dispute document from MongoDB
- * @param {string|null} [secret] - Per-school HMAC secret
- * @param {string|null} [schoolId] - For routing to unified per-endpoint system
+ * @param {object} dispute  Dispute document
  */
-async function notifyDisputeCreated(webhookUrl, dispute, secret = null, schoolId = null) {
-  const payload = {
+async function notifyDisputeCreated(dispute) {
+  return dispatchToSchool(dispute.schoolId, 'dispute.created', {
     disputeId:  dispute._id.toString(),
     schoolId:   dispute.schoolId,
     txHash:     dispute.txHash,
@@ -948,38 +970,19 @@ async function notifyDisputeCreated(webhookUrl, dispute, secret = null, schoolId
     reason:     dispute.reason,
     status:     dispute.status,
     holdSet:    true,
+    slaDeadline: dispute.slaDeadline || null,
     createdAt:  dispute.createdAt,
-  };
-
-  // #1478: route through unified per-endpoint webhook system first
-  const school = schoolId ? await School.findOne({ schoolId }) : null;
-  const allowedFields = school?.webhookPayloadConfig?.allowedFields || null;
-  if (schoolId) {
-    const results = await fireWebhookToEndpoints(schoolId, 'dispute.created', payload, allowedFields);
-    // If endpoints exist, don't fall back to legacy path
-    if (results.length > 0) return results;
-  }
-
-  // Fallback: legacy single-URL on the School document (backward compat)
-  if (webhookUrl) {
-    return fireWebhook(webhookUrl, 'dispute.created', payload, secret);
-  }
-
-  return null;
+  });
 }
 
 /**
- * Notify external system that a dispute has been resolved or rejected.
- * Fires the 'dispute.resolved' event through both the unified per-endpoint
- * webhook system (#865) and the legacy single-URL mechanism.
+ * Notify the school's endpoints that a dispute has been resolved or rejected
+ * (`status` carries the outcome).
  *
- * @param {string} webhookUrl - Registered webhook URL (legacy path)
- * @param {object} dispute - Updated Dispute document from MongoDB
- * @param {string|null} [secret] - Per-school HMAC secret
- * @param {string|null} [schoolId] - For routing to unified per-endpoint system
+ * @param {object} dispute  Updated Dispute document
  */
-async function notifyDisputeResolved(webhookUrl, dispute, secret = null, schoolId = null) {
-  const payload = {
+async function notifyDisputeResolved(dispute) {
+  return dispatchToSchool(dispute.schoolId, 'dispute.resolved', {
     disputeId:      dispute._id.toString(),
     schoolId:       dispute.schoolId,
     txHash:         dispute.txHash,
@@ -989,23 +992,7 @@ async function notifyDisputeResolved(webhookUrl, dispute, secret = null, schoolI
     resolutionNote: dispute.resolutionNote,
     resolvedAt:     dispute.resolvedAt,
     holdLifted:     dispute.holdLifted ?? true,
-  };
-
-  // #1478: route through unified per-endpoint webhook system first
-  const school = schoolId ? await School.findOne({ schoolId }) : null;
-  const allowedFields = school?.webhookPayloadConfig?.allowedFields || null;
-  if (schoolId) {
-    const results = await fireWebhookToEndpoints(schoolId, 'dispute.resolved', payload, allowedFields);
-    // If endpoints exist, don't fall back to legacy path
-    if (results.length > 0) return results;
-  }
-
-  // Fallback: legacy single-URL on the School document (backward compat)
-  if (webhookUrl) {
-    return fireWebhook(webhookUrl, 'dispute.resolved', payload, secret);
-  }
-
-  return null;
+  });
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
@@ -1013,13 +1000,9 @@ module.exports = {
   // Core dispatch
   fireWebhook,
   fireWebhookToEndpoints,
-  sendPaymentWebhook,
+  dispatchToSchool,
+  sendTestDelivery,
   // Event helpers
-  notifyPaymentConfirmed,
-  notifyPaymentPending,
-  notifyPaymentFailed,
-  notifyPaymentRefunded,
-  notifyPaymentSuspicious,
   notifyDisputeCreated,
   notifyDisputeResolved,
   // HMAC
@@ -1027,14 +1010,14 @@ module.exports = {
   verifySignature,
   generateSignatureV2,
   verifySignatureV2,
+  buildSignatureV2Header,
+  verifySignatureV2Header,
   // Retry
   queueWebhookRetry,
   processPendingRetries,
   retryWebhook,
   recoverStuckLeases,
   getBackoffDelay,
-  // Internal dispatch helper (exported for testing)
-  _dispatchToSchool,
   // Testing internals
   _resetNonces,
   _writeDeliveryLog,

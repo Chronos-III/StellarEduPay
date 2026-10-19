@@ -69,6 +69,7 @@ const { startWebhookRetryScheduler, stopWebhookRetryScheduler } = require('./ser
 const { startOutboxDispatcher, stopOutboxDispatcher } = require('./services/outboxDispatcher');
 const { startReconciliationReportScheduler, stopReconciliationReportScheduler } = require('./services/reconciliationReportScheduler');
 const { startJobRecoveryScheduler, stopJobRecoveryScheduler } = require('./services/jobRecoveryScheduler');
+const { startDisputeSlaScheduler, stopDisputeSlaScheduler } = require('./services/disputeNotificationService');
 const { startWorker: startReportQueueWorker, stopWorker: stopReportQueueWorker } = require('./services/reportQueueService');
 const { closeQueue } = require('./queue/transactionQueue');
 const { closeRedisClients } = require('./config/redisClient');
@@ -377,6 +378,7 @@ connectDatabase().then(async () => {
     startReconciliationReportScheduler();
     startMetricsRollupScheduler();
     startJobRecoveryScheduler();
+    startDisputeSlaScheduler();
   };
 
   const stopLeaderSchedulers = () => {
@@ -392,6 +394,7 @@ connectDatabase().then(async () => {
     stopReconciliationReportScheduler();
     stopMetricsRollupScheduler();
     stopJobRecoveryScheduler();
+    stopDisputeSlaScheduler();
   };
 
   leaderElection.register(startLeaderSchedulers, stopLeaderSchedulers);
