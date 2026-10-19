@@ -372,7 +372,7 @@ School
 StellarEduPay's concurrency primitive for financial operations is **Redis-backed distributed locking**, not MongoDB multi-document transactions.
 
 - **Lock service**: `backend/src/services/distributedLock.js` provides Redis-backed locks with `studentBalanceLockKey`.
-- **Call sites**: `stellarService.js`, `paymentController.js`, `underpaidReconciliationService.js` use distributed locks to serialize access to shared resources (e.g. a student's balance during concurrent payments).
+- **Call sites**: `stellarService.js`, `paymentController.js` use distributed locks to serialize access to shared resources (e.g. a student's balance during concurrent payments).
 
 **Rationale:** Distributed locks are simpler to reason about than MongoDB transactions, are not affected by replica set configuration, and work across both MongoDB and external state (Stellar blockchain). They scale better under contention because lock holders are individually bounded and timeouts prevent indefinite hangs.
 

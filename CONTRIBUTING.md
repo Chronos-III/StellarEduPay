@@ -878,12 +878,6 @@ Before your PR can be merged:
 - All Horizon API calls go here
 - Transaction parsing and validation
 - Memo extraction and decryption
-- Use `stellarRateLimitedClient.js` for rate-limited calls
-
-**Payment Service (`paymentService.js`)**
-- Payment creation and verification
-- Student balance updates
-- Payment status management
 
 **Transaction Service (`transactionService.js`)**
 - Transaction polling and syncing
@@ -902,7 +896,7 @@ Before your PR can be merged:
 
 - Follow RESTful conventions
 - Use proper HTTP status codes
-- Return consistent response format (see `utils/responseHelper.js`)
+- Return consistent response format
 - Version APIs when making breaking changes
 - Document all endpoints in `docs/api-spec.md`
 

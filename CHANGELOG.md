@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Dead service code cleanup (#1747)**: Deleted seven unreferenced modules from `backend/src/` that were never imported by any production code path — only by tests, which gave false coverage confidence:
+  - `services/stellarRateLimitedClient.js` (894 lines) — token-bucket rate limiter for Horizon; live traffic goes through `horizonPollBudget.js` and `horizonFailoverClient.js` without this limiter.
+  - `services/stellarTransactionManager.js` (316 lines) — outgoing transaction building; never wired into any signing or submission path.
+  - `services/underpaidReconciliationService.js` (467 lines) — plan-aware underpayment evaluation and partial credit; never called from the crediting path.
+  - `services/paymentService.js` (159 lines) — path-payment crediting helper; `stellarService.js` only checks `op.type === "payment"`, so path payments were never credited.
+  - `services/reportCacheInvalidator.js` (71 lines) — report cache invalidation on payment writes; never subscribed to the `payment.saved` event.
+  - `services/reminderScheduler.js` (43 lines) — per-school reminder interval helper; `reminderService.js` has its own `startReminderScheduler`/`stopReminderScheduler` used by `app.js`.
+  - `utils/responseHelper.js` (23 lines) — standard response envelope; no controller imported it.
+  - Deleted tests that exclusively exercised deleted modules: `tests/stellarTransactionManager.test.js`, `tests/underpaidReconciliationService.test.js`, `tests/underpaidReconciliationPaymentPlans.test.js`, `tests/issue669-paymentReceiptHook.test.js` (tested a nonexistent post-save hook and mocked the deleted `reportCacheInvalidator`). Removed the `reportCacheInvalidator` require from `tests/redisClientSharing.test.js`.
+  - Updated docs (`docs/horizon-rate-limits.md`, `docs/stellar-integration.md`, `docs/architecture.md`, `docs/payment-plans-underpaid-reconciliation.md`), `README.md`, `CONTRIBUTING.md`, and `backend/.env.example` to describe only behaviour the running code actually has.
+
 ### Security
 
 - **Per-endpoint webhook secrets encrypted at rest (#1538)**: `WebhookEndpoint.secret` is now encrypted with `webhookSecretEncryption` (AES-256-GCM, `WEBHOOK_SECRET_ENCRYPTION_KEY`) via the same `pre('save')`/`post('init')` pattern as `School.webhookSecret`, and is `select: false` so list queries never load it. Caller-supplied secrets must be ≥ 32 characters with enough estimated entropy (`400 WEAK_WEBHOOK_SECRET` otherwise); omitted secrets are generated server-side. New `POST /api/webhook-endpoints/:id/rotate-secret` returns a new server-generated secret once and dual-signs deliveries (`X-StellarEduPay-Signature-V2-Previous`) for a configurable overlap (`WEBHOOK_SECRET_ROTATION_OVERLAP_S`, default 24h). `scripts/rotate-webhook-encryption-key.js` now re-encrypts endpoint secrets too. Webhook retries now resolve the signing secret at send time instead of relying on a field that is never persisted.

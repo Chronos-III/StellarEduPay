@@ -148,7 +148,6 @@ Assets are configured per school and can be extended in [`backend/src/config/ste
 - Durable transaction queue (BullMQ/Redis or MongoDB fallback)
 - Automatic retry for failed verifications with exponential backoff
 - Circuit breaker on the Stellar Horizon client
-- Rate-limited Stellar client (Bottleneck) to respect Horizon quotas
 - Concurrent request handling with configurable queue and circuit breaker
 - Graceful shutdown (SIGTERM/SIGINT) with in-flight request drain
 - Stuck-payment reconciliation on startup
@@ -229,7 +228,6 @@ StellarEduPay is a three-tier application:
 | Webhook Service | `backend/src/services/webhookService.js` | HMAC-signed outbound webhooks |
 | Audit Service | `backend/src/services/auditService.js` | Immutable audit log writes |
 | Report Service | `backend/src/services/reportService.js` | CSV/JSON report generation |
-| Rate-Limited Client | `backend/src/services/stellarRateLimitedClient.js` | Horizon API with Bottleneck + circuit breaker |
 
 ---
 
