@@ -304,6 +304,7 @@ const schoolSchema = new mongoose.Schema(
 
 schoolSchema.index({ slug: 1 }, { unique: true });
 schoolSchema.index({ slug: 1, isActive: 1 });
+schoolSchema.index({ isActive: 1, name: 1 });
 
 // toJSON transform to exclude sensitive fields
 schoolSchema.set('toJSON', {
