@@ -45,6 +45,32 @@ const schoolSchema = new mongoose.Schema(
         message: 'previousStellarAddress must be a valid Stellar public key (Ed25519)',
       },
     },
+    /**
+     * Every wallet address this school has rotated away from (#1799). Each
+     * retired address keeps being polled until `drainUntil`, with its own
+     * cursor, so payments sent to an old address (e.g. copied from a reminder
+     * email) are still credited during the drain window.
+     */
+    walletHistory: {
+      type: [{
+        _id: false,
+        address: {
+          type: String,
+          required: true,
+          validate: {
+            validator: (value) => StellarSdk.StrKey.isValidEd25519PublicKey(value),
+            message: 'walletHistory.address must be a valid Stellar public key (Ed25519)',
+          },
+        },
+        activeFrom: { type: Date, default: null },
+        activeUntil: { type: Date, required: true },
+        drainUntil: { type: Date, required: true },
+        cursor: { type: String, default: null },
+      }],
+      default: [],
+    },
+    // When stellarAddress became the active payment address (#1799).
+    walletActiveFrom: { type: Date, default: null },
     isActive:       { type: Boolean, default: true, index: true },
     /**
      * Horizon paging cursor for the transaction poller (#839).

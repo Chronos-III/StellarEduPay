@@ -216,6 +216,9 @@ const paymentSchema = new mongoose.Schema(
     memo: { type: String },
     senderAddress: { type: String, default: null },
     isSuspicious: { type: Boolean, default: false },
+    // #1799 — true when the payment arrived at a wallet address this school
+    // has rotated away from but is still draining. The school is notified.
+    receivedOnRetiredAddress: { type: Boolean, default: false },
     suspicionReason: { type: String, default: null },
     // Review workflow for flagged payments (issue #852). A flag starts as
     // 'flagged'; an admin clears it (false positive → 'cleared', restoring the
