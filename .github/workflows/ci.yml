@@ -11,14 +11,14 @@ env:
 
 jobs:
   version-drift:
-    name: Check dependency version drift
+    name: Check dependency & Node runtime version drift
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version-file: '.nvmrc'
-      - name: Detect major-version mismatches
+      - name: Detect dependency and Dockerfile↔.nvmrc major-version mismatches
         run: node scripts/check-version-drift.js
 
   audit:

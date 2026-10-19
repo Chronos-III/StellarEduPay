@@ -4,7 +4,7 @@ A production-grade, multi-tenant school fee payment system built on the Stellar 
 
 [![CI](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml/badge.svg)](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen)](https://nodejs.org/)
 
 ---
 
@@ -196,7 +196,7 @@ StellarEduPay is a three-tier application:
                             │ REST API / SSE
                             ▼
 ┌────────────────────────────────────────────────────────────────┐
-│             Express.js Backend (Node.js 20+)                   │
+│             Express.js Backend (Node.js 24+)                   │
 │  Auth · Payments · Students · Schools · Reports · Webhooks     │
 │  Fee Adjustments · Disputes · Receipts · Audit Logs            │
 └──────────┬─────────────────────────────────┬───────────────────┘
@@ -238,7 +238,7 @@ StellarEduPay is a three-tier application:
 | Layer | Technology |
 |-------|-----------|
 | Blockchain | Stellar Network + Stellar SDK v12 |
-| Backend | Node.js 20+ · Express 4 |
+| Backend | Node.js 24+ · Express 4 |
 | Database | MongoDB 7 (Replica Set) · Mongoose 8 |
 | Queue | BullMQ 5 · Redis 7 |
 | Frontend | Next.js (React) |
@@ -253,7 +253,7 @@ StellarEduPay is a three-tier application:
 
 ### Prerequisites
 
-- **Node.js** ≥ 20 ([download](https://nodejs.org/))
+- **Node.js** ≥ 24 ([download](https://nodejs.org/))
 - **MongoDB 7** running as a **replica set** (required for multi-document transactions)
 - **Redis 7** (required for BullMQ; the service degrades gracefully without it but Redis is recommended for production)
 - **Git**
