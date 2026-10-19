@@ -31,6 +31,7 @@ const {
 } = require("./paymentConfirmationStateMachine");
 const logger = require("../utils/logger").child("StellarService");
 const { getEngineForSchool } = require("./feeAdjustmentEngine");
+const { updateStudentBalance } = require("../utils/studentBalanceUpdater");
 
 // TTL for the per-student balance lock (#1026), shared with paymentController's
 // verifyPayment. Guards the read-aggregate-then-write sequence that computes
@@ -840,8 +841,11 @@ async function syncPaymentsForSchool(school) {
       }
       const studentLockToken = studentLockInfo.token;
 
+      // Per-payment cumulative totals for the payment record's UI fields only.
+      // Student balance is written by updateStudentBalance inside the session
+      // below — NOT by this aggregation (fix #1751).
       const previousPayments = await Payment.aggregate([
-        { $match: { schoolId, studentId, deletedAt: null } },
+        { $match: { schoolId, studentId, status: 'SUCCESS', isSuspicious: false, deletedAt: null } },
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ]);
       const previousTotal = previousPayments.length
@@ -893,48 +897,10 @@ async function syncPaymentsForSchool(school) {
             studentDeleted,
           }, { session });
 
+          // Fix #1751: delegate all student balance writes to the canonical
+          // updateStudentBalance function so sync never diverges from verify/poller.
           if (isConfirmed && !isSuspicious && !studentDeleted) {
-            const updateData = {
-              totalPaid: cumulativeTotal,
-              remainingBalance: parseFloat(Math.max(0, student.feeAmount - cumulativeTotal).toFixed(7)),
-              feePaid: cumulativeTotal >= student.feeAmount,
-            };
-
-            if (feeCategory && student.fees && student.fees.length > 0) {
-              const feeIndex = student.fees.findIndex(f => f.category === feeCategory);
-              if (feeIndex !== -1) {
-                const categoryPayments = await Payment.aggregate([
-                  {
-                    $match: {
-                      schoolId,
-                      studentId,
-                      feeCategory,
-                      confirmationStatus: "confirmed",
-                      isSuspicious: false,
-                      deletedAt: null,
-                    },
-                  },
-                  { $group: { _id: null, total: { $sum: "$amount" } } },
-                ]).session(session);
-                const categoryTotalPaid = categoryPayments.length
-                  ? parseFloat(categoryPayments[0].total.toFixed(7))
-                  : 0;
-
-                student.fees[feeIndex].totalPaid = categoryTotalPaid;
-                student.fees[feeIndex].remainingBalance = Math.max(
-                  0,
-                  student.fees[feeIndex].amount - categoryTotalPaid
-                );
-                student.fees[feeIndex].paid = categoryTotalPaid >= student.fees[feeIndex].amount;
-                updateData.fees = student.fees;
-              }
-            }
-
-            await Student.findOneAndUpdate(
-              { schoolId, studentId },
-              updateData,
-              { session }
-            );
+            await updateStudentBalance(schoolId, studentId, { session });
           }
 
           if (intent) {
@@ -1038,66 +1004,12 @@ async function finalizeConfirmedPayments(schoolId) {
     });
     if (!student) continue;
 
-    const agg = await Payment.aggregate([
-      {
-        $match: {
-          schoolId,
-          studentId: payment.studentId,
-          confirmationStatus: "confirmed",
-          isSuspicious: false,
-          deletedAt: null,
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-    const totalPaid = agg.length ? parseFloat(agg[0].total.toFixed(7)) : 0;
-    const remainingBalance = parseFloat(
-      Math.max(0, student.feeAmount - totalPaid).toFixed(7),
-    );
-
-    const updateData = { totalPaid, remainingBalance, feePaid: totalPaid >= student.feeAmount };
-
-    // Update fee categories if they exist
-    if (student.fees && student.fees.length > 0) {
-      const categoryPayments = await Payment.aggregate([
-        {
-          $match: {
-            schoolId,
-            studentId: payment.studentId,
-            feeCategory: { $ne: null },
-            confirmationStatus: "confirmed",
-            isSuspicious: false,
-            deletedAt: null,
-          },
-        },
-        {
-          $group: {
-            _id: "$feeCategory",
-            totalPaid: { $sum: "$amount" },
-          },
-        },
-      ]);
-
-      const categoryPaymentMap = {};
-      categoryPayments.forEach(cp => {
-        categoryPaymentMap[cp._id] = parseFloat(cp.totalPaid.toFixed(7));
-      });
-
-      // Update each fee category
-      student.fees.forEach(fee => {
-        const paid = categoryPaymentMap[fee.category] || 0;
-        fee.totalPaid = paid;
-        fee.remainingBalance = Math.max(0, fee.amount - paid);
-        fee.paid = paid >= fee.amount;
-      });
-
-      updateData.fees = student.fees;
-    }
-
-    await Student.findOneAndUpdate(
-      { schoolId, studentId: payment.studentId },
-      updateData,
-    );
+    // Fix #1751: delegate the balance write to the single canonical function.
+    // The old inline aggregation used confirmationStatus:'confirmed' which
+    // diverges from updateStudentBalance's status:'SUCCESS' filter — and it
+    // omitted creditAdjustments.  Calling updateStudentBalance here makes
+    // finalizeConfirmedPayments consistent with every other pipeline.
+    await updateStudentBalance(schoolId, payment.studentId, {});
   }
 }
 
