@@ -2,9 +2,9 @@
 
 A production-grade, multi-tenant school fee payment system built on the Stellar blockchain. StellarEduPay delivers transparent, immutable, and verifiable fee payments — eliminating manual reconciliation, reducing fraud, and providing instant proof of payment for schools and parents alike.
 
-[![CI](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml/badge.svg)](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml)
+[![CI](https://github.com/StellarEdu/StellarEduPay/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarEdu/StellarEduPay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D24.11.0-brightgreen)](https://nodejs.org/)
 
 ---
 
@@ -127,6 +127,8 @@ Assets are configured per school and can be extended in [`backend/src/config/ste
 ---
 
 ## Key Features
+
+> **Status:** the features below are not yet verified end-to-end on `main`: automatic intent-memo payment detection, path payments, SMS reminders, Horizon rate limiting, audit trail completeness, and the SEP-24 anchor flow. They are tracked in [#1802](https://github.com/StellarEdu/StellarEduPay/issues/1802) and should be read as beta until that work lands.
 
 **Blockchain & Payments**
 - Blockchain-based payments with automatic on-chain reconciliation
@@ -393,15 +395,19 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 | Variable | Description |
 |----------|-------------|
 | `MONGO_URI` | MongoDB connection string (must include replica set) |
-| `SCHOOL_WALLET_ADDRESS` | School's Stellar public key (`G...`) |
 | `STELLAR_NETWORK` | `testnet` or `mainnet` |
 | `JWT_SECRET` | Secret for signing JWTs (min 32 chars, keep private) |
+| `RECEIPT_SIGNATURE_SECRET` | Secret used to sign payment receipts |
+
+> `SCHOOL_WALLET_ADDRESS` is optional. Each school's wallet is stored on its school record; the variable is only read by the legacy default-school backfill migration.
 
 ### Stellar
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STELLAR_HORIZON_URL` | Auto from network | Override Horizon API URL |
+| `STELLAR_HORIZON_URL` | Auto from network | Override Horizon API URL (alias: `HORIZON_URL`) |
+| `STELLAR_HORIZON_URLS` | — | Comma-separated, priority-ordered Horizon URLs for failover. Falls back to `STELLAR_HORIZON_URL`. |
+| `STELLAR_TIMEOUT_MS` | `10000` | Timeout for a single Horizon request |
 | `USDC_ISSUER` | Auto from network | USDC issuer address |
 
 ### Payments
@@ -410,6 +416,9 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 |----------|---------|-------------|
 | `MIN_PAYMENT_AMOUNT` | `0.01` | Minimum payment in XLM/USDC |
 | `MAX_PAYMENT_AMOUNT` | `100000` | Maximum payment in XLM/USDC |
+| `ACCEPTED_ASSET` | `XLM` | Asset accepted for fee payments: `XLM` or `USDC` |
+| `CONFIRMATION_THRESHOLD` | `2` | Confirmations required before a payment is treated as confirmed |
+| `FINALIZATION_THRESHOLD` | — | Confirmations required before a payment is finalized |
 
 ### Background Jobs
 
@@ -418,6 +427,14 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 | `POLL_INTERVAL_MS` | `30000` | Blockchain sync interval |
 | `RETRY_INTERVAL_MS` | `60000` | Failed-verification retry interval |
 | `RETRY_MAX_ATTEMPTS` | `10` | Max retry attempts before giving up |
+| `SYNC_INTERVAL_MS` | — | Override for the transaction sync interval |
+| `SYNC_LOCK_TTL_MS` | `60000` | Lifetime of a per-school sync lock |
+| `MAX_QUEUE_DEPTH` | `1000` | Queue depth limit; polling backs off as the queue approaches it |
+| `QUEUE_BACKPRESSURE_HIGH_WATER` | — | Queue depth at which polling pauses |
+| `QUEUE_BACKPRESSURE_LOW_WATER` | — | Queue depth at which polling resumes |
+| `REMINDER_INTERVAL_MS` | `3600000` | How often the fee-reminder scheduler runs |
+| `REMINDER_COOLDOWN_HOURS` | `48` | Minimum hours between reminders to the same parent |
+| `REMINDER_MAX_COUNT` | `5` | Maximum reminders sent per student |
 
 ### Redis / BullMQ
 
@@ -439,6 +456,11 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 | `VERIFY_RATE_LIMIT` | `10` | Max verify requests per minute |
 | `ALLOWED_ORIGINS` | — | Comma-separated CORS origins |
 | `APP_URL` | — | Base URL of the application (required in production) |
+| `JWT_ACCESS_TOKEN_TTL` | `8h` | Access-token lifetime: a number with an optional `s`, `m`, `h` or `d` suffix (e.g. `15m`). Invalid values fall back to the default. |
+| `JWT_REFRESH_TOKEN_TTL` | `30d` | Refresh-token lifetime, same format as `JWT_ACCESS_TOKEN_TTL` |
+| `STUDENT_PII_ENCRYPTION_KEY` | — | Hex key from which the student PII encryption key is derived |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | — | Key from which stored webhook secrets are encrypted. Rotate with `WEBHOOK_SECRET_ENCRYPTION_KEY_OLD` / `_PREVIOUS`. |
+| `AUDIT_HMAC_KEY` | `JWT_SECRET` | HMAC key for audit-log integrity. Set it to keep the audit secret separate from the JWT secret. |
 
 ### Server
 
@@ -449,6 +471,24 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 | `SHUTDOWN_TIMEOUT_MS` | `30000` | Graceful shutdown deadline |
 | `LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` |
 | `MAX_BODY_SIZE` | `1mb` | Request body size limit |
+| `REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout |
+
+### Data & Compliance
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STUDENT_PII_RETENTION_DAYS` | `90` | Days after a student is soft-deleted before their PII is cleared |
+
+### SMTP (email)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SMTP_HOST` | — | SMTP server hostname |
+| `SMTP_PORT` | `587` | SMTP server port |
+| `SMTP_SECURE` | `false` | Use TLS from the first byte (`true` for port 465) |
+| `SMTP_USER` | — | SMTP username |
+| `SMTP_PASS` | — | SMTP password |
+| `SMTP_FROM` | — | Sender address on outgoing email |
 
 ### Docker Compose Tuning
 
