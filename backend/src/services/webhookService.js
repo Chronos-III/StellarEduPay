@@ -17,6 +17,7 @@ const WebhookDelivery = require('../models/webhookDeliveryModel');
 const { validateWebhookUrl, validateResolvedIp } = require('../utils/validateWebhookUrl');
 const { resolveDnsWithCache } = require('../utils/dnsCache');
 const { buildWebhookPayload } = require('../utils/buildWebhookPayload');
+const { buildEventBody } = require('../utils/webhookEnvelope');
 const {
   resolveSignatureVersions,
   signatureVersionLabel,
@@ -434,7 +435,7 @@ async function _resolveSigningContext({ endpointId = null, schoolId = null, secr
 async function _sendToUrl({
   url, event, filteredPayload, rawPayload, secret, deliveryId,
   endpointId = null, schoolId = null, attemptCount = 1,
-  previousSecret = null, signatureVersions = null,
+  previousSecret = null, signatureVersions = null, sequence = null,
 }) {
   const correlationId = rawPayload?.correlationId || null;
 
@@ -455,11 +456,12 @@ async function _sendToUrl({
   }
 
   const timestamp = Math.floor(Date.now() / 1000);
-  const body = {
+  const body = buildEventBody({
     event,
     timestamp: new Date(timestamp * 1000).toISOString(),
     data: filteredPayload,
-  };
+    sequence,
+  });
 
   // Serialize exactly once so the bytes we sign are the bytes we transmit.
   const rawBody = JSON.stringify(body);
@@ -603,6 +605,20 @@ async function _sendToUrl({
  * @param {string[]|null} allowedFields  From school.webhookPayloadConfig.allowedFields
  * @returns {Promise<Array<{endpointId, success, statusCode?, error?, deliveryId}>>}
  */
+/**
+ * Atomically allocates the next per-endpoint event sequence (#1815).
+ * The counter is incremented in the database, so concurrent workers never
+ * hand out the same number.
+ */
+async function _nextEndpointSequence(endpointId) {
+  const updated = await WebhookEndpoint.findByIdAndUpdate(
+    endpointId,
+    { $inc: { eventSequence: 1 } },
+    { new: true, projection: { eventSequence: 1 } },
+  ).lean();
+  return updated ? updated.eventSequence : null;
+}
+
 async function fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields = null) {
   // #867: build the PII-filtered payload once for all endpoints of this school
   const filteredPayload = buildWebhookPayload(rawPayload, allowedFields);
@@ -646,6 +662,10 @@ async function fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields
       continue;
     }
 
+    // #1815: allocate the endpoint's next sequence number once per delivery;
+    // retries of this delivery reuse it.
+    const sequence = await _nextEndpointSequence(ep._id);
+
     const result = await _sendToUrl({
       url: ep.url,
       event,
@@ -658,12 +678,13 @@ async function fireWebhookToEndpoints(schoolId, event, rawPayload, allowedFields
       endpointId: ep._id,
       schoolId,
       attemptCount: 1,
+      sequence,
     });
 
     // Queue for retry on failure
     if (!result.success) {
       try {
-        await queueWebhookRetry(ep.url, event, rawPayload, result.error, ep.secret, deliveryId, ep._id, schoolId);
+        await queueWebhookRetry(ep.url, event, rawPayload, result.error, ep.secret, deliveryId, ep._id, schoolId, sequence);
       } catch (qErr) {
         logger.error('Failed to queue webhook retry', { endpointId: ep._id, error: qErr.message });
       }
@@ -816,7 +837,7 @@ async function sendTestDelivery(endpoint) {
 }
 
 // ── Retry queue ───────────────────────────────────────────────────────────────
-async function queueWebhookRetry(url, event, payload, error, secret = null, deliveryId = null, endpointId = null, schoolId = null) {
+async function queueWebhookRetry(url, event, payload, error, secret = null, deliveryId = null, endpointId = null, schoolId = null, sequence = null) {
   const nextRetryAt = new Date(Date.now() + getBackoffDelay(0));
   const id = deliveryId || uuidv4();
 
@@ -829,6 +850,7 @@ async function queueWebhookRetry(url, event, payload, error, secret = null, deli
     correlationId: payload?.correlationId || null,
     endpointId: endpointId || null,
     schoolId: schoolId || null,
+    sequence: sequence ?? null,
     status: 'pending',
     attemptCount: 0,
     maxAttempts: WEBHOOK_MAX_ATTEMPTS,
@@ -935,6 +957,7 @@ async function retryWebhook(retry) {
     event: retry.event,
     filteredPayload: retry.payload,
     rawPayload: retry.payload,
+    sequence: retry.sequence ?? null,
     secret: signingCtx.secret,
     previousSecret: signingCtx.previousSecret,
     signatureVersions: signingCtx.signatureVersions,

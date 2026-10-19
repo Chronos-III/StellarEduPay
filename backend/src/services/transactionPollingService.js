@@ -18,6 +18,7 @@ const logger = require('../utils/logger').child('TransactionPollingService');
 const { deriveCorrelationId } = require('../utils/correlationId');
 const { captureFiatSnapshot } = require('./currencyConversionService');
 const { HorizonPollBudget, orderSchoolsByPriority } = require('./horizonPollBudget');
+const { isBeforeIngestStart } = require('../utils/ingestWindow');
 
 // Metrics — imported lazily inside helpers to survive jest module resets.
 function _incFunnel(stage, schoolId) {
@@ -428,6 +429,11 @@ async function pollSchoolTransactions(school, budget = null) {
       if (records.length === 0) break;
 
       for (const tx of records) {
+        if (isBeforeIngestStart(tx, school)) {
+          skippedCount++;
+          if (tx.paging_token) cursor = tx.paging_token;
+          continue;
+        }
         const result = await processTransaction(tx, school, fencingToken);
         if (result.processed) {
           processedCount++;
@@ -821,6 +827,7 @@ module.exports = {
   pollAllSchools,
   pollSchoolTransactions,
   processTransaction,
+  isBeforeIngestStart,
   // Exposed for testing
   _getBackoffState: () => ({ consecutiveErrors, currentIntervalMs }),
   getHorizonUnreachableSince: () => horizonUnreachableSince,

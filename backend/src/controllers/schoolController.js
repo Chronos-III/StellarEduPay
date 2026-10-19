@@ -80,6 +80,8 @@ async function createSchool(req, res, next) {
       network: network || 'testnet',
       adminEmail: adminEmail || null,
       address: address || null,
+      // A new wallet's pre-existing history is not ingested (#1818).
+      ingestStartsAt: new Date(),
       ...(localCurrency !== undefined && { localCurrency: localCurrency.toUpperCase() }),
       ...(timezone !== undefined && { timezone }),
       ...(suspiciousPaymentMultiplier !== undefined && { suspiciousPaymentMultiplier }),
@@ -429,6 +431,8 @@ async function rotateStellarAddress(req, res, next) {
     // for draining the old address and confirming no in-flight payments are
     // missed across the cutover.
     school.syncCursor = null;
+    // The new wallet's pre-existing history must not be credited as fees (#1818).
+    school.ingestStartsAt = new Date();
     await school.save();
 
     schoolCache.invalidate(school);

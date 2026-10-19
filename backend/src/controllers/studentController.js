@@ -556,6 +556,20 @@ const CSV_MAX_ROWS = parseInt(process.env.CSV_MAX_ROWS, 10) || 10000;
 const CSV_MAX_COLUMNS = parseInt(process.env.CSV_MAX_COLUMNS, 10) || 20;
 const BULK_IMPORT_MAX_FAILURES = parseInt(process.env.BULK_IMPORT_MAX_FAILURES, 10) || 100;
 
+// Column names accepted by the bulk import (#1816). The template endpoint emits
+// exactly these headers so bursars do not have to guess the mapping.
+const BULK_IMPORT_TEMPLATE_HEADERS = ['studentId', 'name', 'class', 'feeAmount', 'parentEmail', 'parentPhone'];
+
+function buildBulkImportTemplateCsv(classNames = []) {
+  const example = ['STU001', 'Jane Doe', classNames[0] || 'Grade 1', '', 'parent@example.com', '+15555550100'];
+  const lines = [BULK_IMPORT_TEMPLATE_HEADERS.join(','), example.join(',')];
+  if (classNames.length > 0) {
+    lines.push('');
+    lines.push(`# Known classes: ${classNames.join(', ')}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
 function parseCsvBuffer(buffer) {
   return new Promise((resolve, reject) => {
     const rows = [];
@@ -738,6 +752,37 @@ async function bulkImportStudents(req, res, next) {
         parentPhone: encryptStudentPii(rawParentPhone),
         parentEmailHash: hashParentEmail(rawParentEmail),
       });
+    }
+
+    // Dry run (#1816): report what would be created without writing anything.
+    if (req.query && req.query.dryRun === 'true') {
+      const candidateIds = validatedRows.map(r => r.studentId);
+      const existing = candidateIds.length > 0
+        ? await Student.find({ schoolId, studentId: { $in: candidateIds }, deletedAt: null })
+            .select('studentId')
+            .lean()
+        : [];
+      const existingIds = new Set(existing.map(s => s.studentId));
+      const preview = { total: rows.length, wouldCreate: 0, failed: results.failed, details: results.details };
+      for (const row of validatedRows) {
+        if (existingIds.has(row.studentId)) {
+          preview.failed++;
+          if (preview.details.length < BULK_IMPORT_MAX_FAILURES) {
+            preview.details.push({
+              row: row.index + 2,
+              studentId: row.studentId,
+              error: 'Student ID already exists in this school',
+              code: 'DUPLICATE_STUDENT_ID',
+            });
+          }
+        } else {
+          preview.wouldCreate++;
+          if (preview.details.length < BULK_IMPORT_MAX_FAILURES) {
+            preview.details.push({ row: row.index + 2, studentId: row.studentId, status: 'valid' });
+          }
+        }
+      }
+      return res.status(200).json({ dryRun: true, ...preview });
     }
 
     // Process validated rows in chunks using insertMany with ordered: false
@@ -1226,4 +1271,18 @@ async function adjustStudentCredit(req, res, next) {
   }
 }
 
-module.exports = { registerStudent, getAllStudents, getStudent, getPublicStudentInfo, updateStudent, deleteStudent, restoreStudent, getDeletedStudentPayments, getPaymentSummary, bulkImportStudents, getOverdueStudents, resetPayment, reconcileStudent, parseCsvBuffer, exportStudents, getFeeHistory, FEE_HISTORY_MAX_LIMIT, adjustStudentCredit };
+// GET /api/students/bulk/template.csv (#1816)
+async function getBulkImportTemplate(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const feeStructures = await FeeStructure.find({ schoolId, isActive: true }).select('className').lean();
+    const classNames = [...new Set(feeStructures.map(fs => fs.className))].sort();
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="student-import-template.csv"');
+    return res.status(200).send(buildBulkImportTemplateCsv(classNames));
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { registerStudent, getAllStudents, getStudent, getPublicStudentInfo, updateStudent, deleteStudent, restoreStudent, getDeletedStudentPayments, getPaymentSummary, bulkImportStudents, getBulkImportTemplate, buildBulkImportTemplateCsv, BULK_IMPORT_TEMPLATE_HEADERS, getOverdueStudents, resetPayment, reconcileStudent, parseCsvBuffer, exportStudents, getFeeHistory, FEE_HISTORY_MAX_LIMIT, adjustStudentCredit };

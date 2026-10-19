@@ -54,6 +54,13 @@ const schoolSchema = new mongoose.Schema(
      * transaction on first run.
      */
     syncCursor:     { type: String, default: null },
+    /**
+     * Earliest transaction time the poller and verifier will ingest for this
+     * school's wallet (#1818). Transactions dated before it are skipped, so an
+     * existing, busy wallet does not replay its history. Null = no lower bound
+     * (legacy behaviour). New schools and rotated wallets set it to "now".
+     */
+    ingestStartsAt: { type: Date, default: null },
     adminEmail:     { type: String, default: null },
     address:        { type: String, default: null },
     /**
