@@ -175,19 +175,30 @@ async function getAllSchools(req, res, next) {
   }
 }
 
+// Allow-list for the anonymous single-school endpoint. Anything not listed
+// here (emails, webhook config, fraud thresholds, MFA, settings) stays private,
+// including fields added to the schema in future.
+const PUBLIC_SCHOOL_FIELDS = {
+  schoolId: 1,
+  name: 1,
+  slug: 1,
+  stellarAddress: 1,
+  localCurrency: 1,
+  timezone: 1,
+  logoUrl: 1,
+  primaryColor: 1,
+  supportContact: 1,
+  classOptions: 1,
+  emailLocale: 1,
+};
+
 // GET /api/schools/:schoolId
 async function getSchool(req, res, next) {
   try {
     const school = await School.findOne({
       schoolId: req.params.schoolId,
       isActive: true,
-    }, {
-      jwtSecret: 0,
-      webhookSecret: 0,
-      internalNotes: 0,
-      mfaSecret: 0,
-      mfaBackupCodes: 0,
-    }).lean();
+    }, PUBLIC_SCHOOL_FIELDS).lean();
     if (!school) {
       const e = new Error('School not found');
       e.code = 'NOT_FOUND';
