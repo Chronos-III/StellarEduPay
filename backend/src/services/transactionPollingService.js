@@ -9,6 +9,7 @@ const { extractValidPayment, detectMemoCollision, detectCrossSchoolMemoCollision
 const { CONFIRMATION_STATES, isConfirmedOrAbove } = require('./paymentConfirmationStateMachine');
 const { validatePaymentAmount } = require('../utils/paymentLimits');
 const { compareAmounts, toStroops, stroopsToNumber, normalizeToNumber } = require('../utils/stellarAmount');
+const { classifyFeePayment } = require('../utils/money');
 const { generateReferenceCode } = require('../utils/generateReferenceCode');
 const { emit: sseEmit } = require('./sseService');
 const lock = require('./distributedLock');
@@ -192,15 +193,18 @@ async function processTransaction(tx, school, fencingToken) {
   const cumulativeTotal = stroopsToNumber(toStroops(previousTotal) + toStroops(paymentAmount));
   const remaining = stroopsToNumber(toStroops(student.feeAmount) - toStroops(cumulativeTotal));
 
-  const cumulativeVsFee = compareAmounts(cumulativeTotal, student.feeAmount);
-  let cumulativeStatus;
-  if (cumulativeVsFee < 0) cumulativeStatus = 'underpaid';
-  else if (cumulativeVsFee > 0) cumulativeStatus = 'overpaid';
-  else cumulativeStatus = 'valid';
-
-  const excessAmount = cumulativeStatus === 'overpaid'
-    ? stroopsToNumber(toStroops(cumulativeTotal) - toStroops(student.feeAmount))
-    : 0;
+  // Route classification through the single canonical helper (#1766) so the
+  // poller/stream path uses the same vocabulary as verify and sync: 'partial'
+  // for a cumulative total below the fee, 'underpaid' only when an installment
+  // is short of its expected amount.
+  const classification = classifyFeePayment({
+    cumulativeTotal,
+    feeAmount: student.feeAmount,
+    installmentAmount: student.expectedInstallmentAmount,
+    hasPlan: Boolean(student.paymentPlanId),
+  });
+  const cumulativeStatus = classification.status;
+  const excessAmount = classification.excessAmount;
 
   // Extract network fee
   const networkFee = parseFloat(tx.fee_paid || '0') / 10000000;

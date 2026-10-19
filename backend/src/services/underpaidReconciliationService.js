@@ -411,6 +411,9 @@ async function getUnderpaidReconciliationSummary(schoolId) {
     {
       $match: {
         schoolId,
+        // #1766: 'partial' and 'underpaid' are the same economic event written
+        // by different code paths; both are counted here so reconciliation
+        // never undercounts part-payments.
         feeValidationStatus: { $in: ['partial', 'underpaid'] },
         status: 'SUCCESS',
         deletedAt: null,
@@ -432,11 +435,17 @@ async function getUnderpaidReconciliationSummary(schoolId) {
             $group: {
               _id: null,
               totalUnderpaid: { $sum: 1 },
+              partialCount: {
+                $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'partial'] }, 1, 0] },
+              },
+              underpaidCount: {
+                $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'underpaid'] }, 1, 0] },
+              },
               totalAmount: { $sum: '$amount' },
               avgShortfall: {
                 $avg: {
                   $cond: [
-                    { $eq: ['$feeValidationStatus', 'partial'] },
+                    { $in: ['$feeValidationStatus', ['partial', 'underpaid']] },
                     { $subtract: ['$feeAmount', '$amount'] },
                     0,
                   ],
