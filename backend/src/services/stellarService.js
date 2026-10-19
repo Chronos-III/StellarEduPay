@@ -938,8 +938,8 @@ async function syncPaymentsForSchool(school) {
           }
 
           if (intent) {
-            await PaymentIntent.findByIdAndUpdate(
-              intent._id,
+            await PaymentIntent.findOneAndUpdate(
+              { _id: intent._id, schoolId },
               { status: "completed" },
               { session }
             );
@@ -952,7 +952,7 @@ async function syncPaymentsForSchool(school) {
           summary.new--;
           summary.alreadyProcessed++;
           if (intent) {
-            await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'completed' });
+            await PaymentIntent.findOneAndUpdate({ _id: intent._id, schoolId }, { status: 'completed' });
           }
           continue;
         }
@@ -1024,7 +1024,7 @@ async function finalizeConfirmedPayments(schoolId) {
     if (!changed) continue;
 
     if (typeof Payment.findByIdAndUpdate === "function") {
-      await Payment.findByIdAndUpdate(payment._id, {
+      await Payment.findOneAndUpdate({ _id: payment._id, schoolId }, {
         confirmationState: nextState,
         confirmationStatus: deriveLegacyConfirmationStatus(nextState),
       });

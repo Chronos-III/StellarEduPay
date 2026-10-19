@@ -210,7 +210,7 @@ async function submitTransaction(req, res, next) {
     // When paymentIntentId is not provided, fall back to matching by memo (backward compatibility).
     let paymentRecord;
     if (paymentIntentId) {
-      const intent = await PaymentIntent.findById(paymentIntentId);
+      const intent = await PaymentIntent.findOne({ _id: paymentIntentId, schoolId: req.schoolId });
       if (!intent) {
         return res.status(404).json({ error: 'Payment intent not found', code: 'INTENT_NOT_FOUND' });
       }
@@ -408,7 +408,7 @@ async function verifyPayment(req, res, next) {
       // Mark it expired for bookkeeping but continue to record the payment.
       const intent = await PaymentIntent.findOne({ memo: result.memo, schoolId });
       if (intent?.expiresAt && intent.expiresAt < new Date()) {
-        await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'expired' });
+        await PaymentIntent.findOneAndUpdate({ _id: intent._id, schoolId }, { status: 'expired' });
       }
 
       // Issue #1026 — the tx-hash lock above only prevents two calls for the SAME

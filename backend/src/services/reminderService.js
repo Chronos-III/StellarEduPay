@@ -358,7 +358,7 @@ async function processReminders() {
             $inc: { reminderCount: 1 },
           };
           await Promise.all([
-            Student.findByIdAndUpdate(student._id, updateFields),
+            Student.findOneAndUpdate({ _id: student._id, schoolId: school.schoolId }, updateFields),
             ReminderLog.updateOne(
               { schoolId: school.schoolId, studentId: student.studentId, windowStart },
               { $set: { status: 'sent', sentAt: new Date(), escalationLevel, channels: sentChannels } }
