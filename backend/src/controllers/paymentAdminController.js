@@ -699,7 +699,7 @@ async function approvePaymentRefund(req, res, next) {
       return res.status(403).json({ error: principalErr.message, code: principalErr.code });
     }
 
-    const refund = await approveRefund(refundId, principal);
+    const refund = await approveRefund(refundId, principal, schoolId);
 
     await logAudit({
       schoolId,
@@ -753,7 +753,7 @@ async function rejectPaymentRefund(req, res, next) {
       return res.status(403).json({ error: principalErr.message, code: principalErr.code });
     }
 
-    const refund = await rejectRefund(refundId, principal, reason);
+    const refund = await rejectRefund(refundId, principal, reason, schoolId);
 
     await logAudit({
       schoolId,
@@ -811,7 +811,7 @@ async function completePaymentRefund(req, res, next) {
       return res.status(403).json({ error: principalErr.message, code: principalErr.code });
     }
 
-    const refund = await completeRefund(refundId, refundTxHash, principal);
+    const refund = await completeRefund(refundId, refundTxHash, principal, schoolId);
 
     await logAudit({
       schoolId,
@@ -871,7 +871,7 @@ async function verifyReceipt(req, res, next) {
   try {
     const { receiptId } = req.params;
 
-    const receipt = await Receipt.findById(receiptId).lean();
+    const receipt = await Receipt.findOne({ _id: receiptId, schoolId: req.schoolId }).lean();
     if (!receipt) return res.status(404).json({ error: 'Receipt not found', code: 'NOT_FOUND' });
 
     try {

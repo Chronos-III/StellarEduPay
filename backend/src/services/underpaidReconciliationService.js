@@ -109,7 +109,7 @@ async function applyPartialCredit(paymentId, creditAmount, creditAppliedBy, scho
   // Stellar txHash) to findById throws a CastError synchronously, bypassing
   // the intended txHash fallback entirely.
   let payment = mongoose.Types.ObjectId.isValid(paymentId)
-    ? await Payment.findById(paymentId)
+    ? await Payment.findOne({ _id: paymentId, schoolId })
     : null;
   if (!payment) {
     payment = await Payment.findOne({ txHash: paymentId, schoolId });
@@ -255,7 +255,7 @@ async function applyPartialCredit(paymentId, creditAmount, creditAppliedBy, scho
 async function initiateRefund(paymentId, refundInitiatedBy, schoolId, refundNote = null) {
   // Find payment by ID or txHash (same isValid() guard as applyPartialCredit)
   let payment = mongoose.Types.ObjectId.isValid(paymentId)
-    ? await Payment.findById(paymentId)
+    ? await Payment.findOne({ _id: paymentId, schoolId })
     : null;
   if (!payment) {
     payment = await Payment.findOne({ txHash: paymentId, schoolId });
