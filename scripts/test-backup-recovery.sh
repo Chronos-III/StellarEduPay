@@ -19,10 +19,12 @@
 
 set -euo pipefail
 
+# shellcheck source=lib/backup-common.sh
+source "$(dirname "$0")/lib/backup-common.sh"
+
 MONGO_URI="${MONGO_URI:?MONGO_URI is required}"
 DB_NAME="${DB_NAME:-stellaredupay}"
 TEST_BACKUP_DIR="$(mktemp -d)"
-BACKUP_FILE="${TEST_BACKUP_DIR}/test-backup.gz"
 BACKEND_INTERNAL_URL="${BACKEND_INTERNAL_URL:-http://localhost:5000}"
 BACKUP_NOTIFY_TOKEN="${BACKUP_NOTIFY_TOKEN:-}"
 
@@ -76,18 +78,25 @@ echo "    Indexes:     $(wc -l < "${TEST_BACKUP_DIR}/indexes-before.txt")"
 echo "    Content sha: ${BEFORE_CONTENT}"
 
 echo "=== [2/4] Running backup ==="
+# This is a local round-trip smoke test, so encryption / off-site upload are
+# exercised only when their keys/targets are supplied (#1630). Provide
+# BACKUP_AGE_RECIPIENT + BACKUP_AGE_IDENTITY_FILE to cover the encrypted path.
 MONGO_URI="${MONGO_URI}" BACKUP_DIR="${TEST_BACKUP_DIR}" \
+BACKUP_REQUIRE_ENCRYPTION="${BACKUP_REQUIRE_ENCRYPTION:-false}" \
+BACKUP_REQUIRE_OFFSITE="${BACKUP_REQUIRE_OFFSITE:-false}" \
   bash "$(dirname "$0")/backup.sh"
 
-if [[ ! -f "${BACKUP_FILE}" ]]; then
-  # backup.sh names the file with a timestamp — find it
-  BACKUP_FILE=$(ls -t "${TEST_BACKUP_DIR}"/*.gz | head -1)
+# backup.sh names the archive with a timestamp and encryption suffix — find it
+BACKUP_FILE="$(latest_local_archive "${TEST_BACKUP_DIR}")"
+if [[ -z "${BACKUP_FILE}" ]]; then
+  echo "❌  backup.sh did not produce an archive in ${TEST_BACKUP_DIR}" >&2
+  exit 1
 fi
 echo "    Archive: ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -f1))"
 
 echo "=== [3/4] Running restore (drop + reimport) ==="
 MONGO_URI="${MONGO_URI}" BACKUP_FILE="${BACKUP_FILE}" DROP="true" \
-  bash "$(dirname "$0")/restore.sh"
+  bash "$(dirname "$0")/restore.sh" --yes
 
 echo "=== [4/4] Verifying restored database against pre-backup fingerprint ==="
 AFTER_COUNT="$(count_documents)"

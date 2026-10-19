@@ -477,7 +477,7 @@ By default, webhook payloads are **minimal — no PII**. The fields `studentId` 
 
 ### Opt-in to PII fields
 
-Update the school's `webhookPayloadConfig` via `PUT /api/schools/:id`:
+Update the school's `webhookPayloadConfig` via `PATCH /api/schools/:schoolId`:
 
 ```json
 {

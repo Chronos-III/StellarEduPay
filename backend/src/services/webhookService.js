@@ -3,6 +3,8 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const dns = require('dns').promises;
+const http = require('http');
+const https = require('https');
 const net = require('net');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
@@ -214,8 +216,13 @@ function getBackoffDelay(attemptNumber) {
  * a post-registration DNS rebinding attack (where DNS record changes to point
  * to a private IP) is caught at delivery time.
  *
+ * #1497: the validated addresses are returned so the outgoing connection can
+ * be pinned to them (see _buildPinnedLookup). Without pinning, Node's HTTP
+ * stack would perform a second, independent DNS lookup at connect time and a
+ * short-TTL rebinding attacker could serve a private IP to that lookup.
+ *
  * @param {string} url
- * @returns {Promise<{ ok: boolean, reason?: string }>}
+ * @returns {Promise<{ ok: boolean, reason?: string, addresses?: string[] }>}
  */
 async function _validateAtSendTime(url) {
   let parsed;
@@ -228,7 +235,7 @@ async function _validateAtSendTime(url) {
   if (net.isIPv4(hostname) || net.isIPv6(rawIPv6)) {
     const ip = net.isIPv6(rawIPv6) ? rawIPv6 : hostname;
     const check = validateResolvedIp(ip);
-    return check.blocked ? { ok: false, reason: check.reason } : { ok: true };
+    return check.blocked ? { ok: false, reason: check.reason } : { ok: true, addresses: [ip] };
   }
 
   // DNS re-resolution with TTL-aware caching (cache expires when TTL expires)
@@ -239,11 +246,49 @@ async function _validateAtSendTime(url) {
     return { ok: false, reason: 'DNS_RESOLUTION_FAILED' };
   }
 
+  if (!Array.isArray(all) || all.length === 0) {
+    return { ok: false, reason: 'DNS_RESOLUTION_FAILED' };
+  }
   for (const addr of all) {
     const check = validateResolvedIp(addr);
     if (check.blocked) return { ok: false, reason: check.reason };
   }
-  return { ok: true };
+  return { ok: true, addresses: [...all] };
+}
+
+// ── Connection pinning — Issue #1497 ──────────────────────────────────────────
+/**
+ * Build a `lookup` function for http(s).Agent that never touches DNS and only
+ * ever returns the addresses already validated by _validateAtSendTime. The
+ * hostname is still used for the Host header and TLS SNI / certificate
+ * verification, so HTTPS endpoints keep working unchanged.
+ *
+ * @param {string[]} addresses  Validated IPv4/IPv6 literals
+ * @returns {Function} lookup(hostname, options, callback)
+ */
+function _buildPinnedLookup(addresses) {
+  const entries = addresses
+    .map((address) => ({ address, family: net.isIPv6(address) ? 6 : 4 }))
+    .filter((e) => net.isIP(e.address));
+
+  return function pinnedLookup(hostname, options, callback) {
+    if (typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
+    const opts = typeof options === 'number' ? { family: options } : (options || {});
+    const wanted = opts.family === 4 || opts.family === 6
+      ? entries.filter((e) => e.family === opts.family)
+      : entries;
+
+    if (wanted.length === 0) {
+      const err = new Error(`No validated address for ${hostname}`);
+      err.code = 'ENOTFOUND';
+      return process.nextTick(callback, err);
+    }
+    if (opts.all) return process.nextTick(callback, null, wanted);
+    return process.nextTick(callback, null, wanted[0].address, wanted[0].family);
+  };
 }
 
 // ── Axios instance with SSRF-safe defaults ────────────────────────────────────
@@ -252,14 +297,27 @@ async function _validateAtSendTime(url) {
  * - maxRedirects: 0 disables redirect following entirely.
  * - maxContentLength caps response body at 64 KB.
  * - timeout of 10 s matches WEBHOOK_TIMEOUT_MS.
+ * - #1497: when `addresses` is given, the http/https agents resolve the
+ *   hostname only to those pre-validated IPs, closing the DNS-rebinding
+ *   window between validation and connect. Agents are per-request (no
+ *   keep-alive) so a pooled socket can never outlive its validation.
+ *
+ * @param {string[]} [addresses]
  */
-function _buildAxiosInstance() {
-  return axios.create({
+function _buildAxiosInstance(addresses) {
+  const config = {
     timeout: WEBHOOK_TIMEOUT_MS,
     maxRedirects: 0,
     maxContentLength: MAX_RESPONSE_BYTES,
     maxBodyLength: Infinity,
-  });
+    proxy: false,
+  };
+  if (Array.isArray(addresses) && addresses.length > 0) {
+    const lookup = _buildPinnedLookup(addresses);
+    config.httpAgent = new http.Agent({ keepAlive: false, lookup });
+    config.httpsAgent = new https.Agent({ keepAlive: false, lookup });
+  }
+  return axios.create(config);
 }
 
 // ── Delivery log writer ───────────────────────────────────────────────────────
@@ -447,11 +505,12 @@ async function _sendToUrl({
   // headers are already set above.
   if (correlationId) headers['X-Correlation-ID'] = correlationId;
 
-  const http = _buildAxiosInstance();
+  // #1497: pin the connection to the addresses validated above.
+  const client = _buildAxiosInstance(sendCheck.addresses);
   const startTime = Date.now();
 
   try {
-    const response = await http.post(url, rawBody, {
+    const response = await client.post(url, rawBody, {
       headers,
       validateStatus: (s) => s >= 200 && s < 300,
     });
@@ -1021,4 +1080,7 @@ module.exports = {
   // Testing internals
   _resetNonces,
   _writeDeliveryLog,
+  _validateAtSendTime,
+  _buildPinnedLookup,
+  _buildAxiosInstance,
 };

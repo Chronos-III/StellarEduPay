@@ -84,6 +84,13 @@ jobs:
       - uses: actions/checkout@v7
       - run: node scripts/check-orphan-dirs.js
 
+  openapi-contract:
+    name: OpenAPI contract (routes, frontend calls, docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: node scripts/openapi/check-contract.js
+
   error-response-shape:
     name: Check 401/403 response shape
     runs-on: ubuntu-latest
