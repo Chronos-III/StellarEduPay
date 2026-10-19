@@ -9,6 +9,15 @@ const { csvEscape } = require('../utils/csv');
 const { normaliseName, nameError, NAME_MAX_LENGTH, CLASS_MAX_LENGTH } = require('../middleware/validate');
 const { logAudit } = require('../services/auditService');
 const { encryptStudentPii, decryptStudentPii, hashParentEmail } = require('../services/studentPiiEncryption');
+const { withStudentQuota, studentQuotaError } = require('../services/studentQuota');
+
+// Creates one student only if the school still has a free seat (#1801).
+function createStudentWithinQuota(schoolId, maxStudents, data) {
+  return withStudentQuota(schoolId, maxStudents, ({ remaining }) => {
+    if (remaining < 1) throw studentQuotaError(maxStudents);
+    return Student.create({ schoolId, ...data });
+  });
+}
 
 async function registerStudent(req, res, next) {
   // Declared in the function scope (not inside try) so the 11000 duplicate-key
@@ -32,19 +41,6 @@ async function registerStudent(req, res, next) {
       const err = new Error(`A student with ID "${studentId}" already exists`);
       err.code = 'DUPLICATE_STUDENT';
       return next(err);
-    }
-
-    // Check student quota (reuse the school already resolved by resolveSchool
-    // instead of a second lookup).
-    const school = req.school;
-    if (school && school.maxStudents) {
-      const studentCount = await Student.countDocuments({ schoolId, deletedAt: null });
-      if (studentCount >= school.maxStudents) {
-        const err = new Error(`School has reached maximum student quota of ${school.maxStudents}`);
-        err.code = 'STUDENT_QUOTA_EXCEEDED';
-        err.status = 403;
-        return next(err);
-      }
     }
 
     // Check if student was previously soft-deleted
@@ -89,7 +85,7 @@ async function registerStudent(req, res, next) {
       return next(err);
     }
 
-    const student = await Student.create({ schoolId, studentId, name, class: className, feeAmount: assignedFee, paymentDeadline: assignedDeadline, parentEmail: parentEmail || null, parentPhone: parentPhone || null });
+    const student = await createStudentWithinQuota(schoolId, req.school?.maxStudents, { studentId, name, class: className, feeAmount: assignedFee, paymentDeadline: assignedDeadline, parentEmail: parentEmail || null, parentPhone: parentPhone || null });
 
     del(KEYS.studentsAll(), KEYS.student(schoolId, studentId), KEYS.publicStudent(schoolId, studentId));
 
@@ -123,7 +119,7 @@ async function registerStudent(req, res, next) {
         const { generateStudentId } = require('../utils/generateStudentId');
         try {
           studentId = await generateStudentId(MAX_ID_RETRIES, schoolId);
-          const student = await Student.create({ schoolId, studentId, name, class: className, feeAmount: assignedFee, paymentDeadline: assignedDeadline, parentEmail: parentEmail || null, parentPhone: parentPhone || null });
+          const student = await createStudentWithinQuota(schoolId, req.school?.maxStudents, { studentId, name, class: className, feeAmount: assignedFee, paymentDeadline: assignedDeadline, parentEmail: parentEmail || null, parentPhone: parentPhone || null });
           const response = student.toObject ? student.toObject() : { ...student };
           return res.status(201).json(response);
         } catch (retryErr) {
@@ -285,8 +281,12 @@ async function restoreStudent(req, res, next) {
 
     const previousDeletedAt = student.deletedAt;
 
-    // Restore the student — clears deletedAt via the softDelete utility
-    await student.restore();
+    // Restore the student — clears deletedAt via the softDelete utility.
+    // Restoring adds an active student, so it must also fit the quota (#1801).
+    await withStudentQuota(req.schoolId, req.school?.maxStudents, ({ remaining, maxStudents }) => {
+      if (remaining < 1) throw studentQuotaError(maxStudents);
+      return student.restore();
+    });
 
     // Reinstate payments so they appear in reports again
     const Payment = require('../models/paymentModel');
@@ -623,6 +623,64 @@ function validateStudentRow(row) {
 }
 
 // POST /api/students/bulk
+// Inserts validated bulk-import rows in chunks, recording per-row outcomes in
+// `results`. Must be called while holding the school's quota lock.
+async function insertValidatedRows(validatedRows, results) {
+  // Process validated rows in chunks using insertMany with ordered: false
+  const CHUNK_SIZE = 500;
+  for (let i = 0; i < validatedRows.length; i += CHUNK_SIZE) {
+    const chunk = validatedRows.slice(i, i + CHUNK_SIZE);
+    try {
+      const inserted = await Student.insertMany(chunk, { ordered: false });
+      results.created += inserted.length;
+      inserted.forEach(student => {
+        if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
+          const originalRow = chunk.find(r => r.studentId === student.studentId);
+          results.details.push({
+            row: originalRow.index + 2,
+            studentId: student.studentId,
+            status: 'created',
+            _id: student._id,
+          });
+        }
+      });
+    } catch (err) {
+      // insertMany with ordered: false throws a BulkWriteError with insertedDocs and writeErrors
+      if (err.insertedDocs) {
+        results.created += err.insertedDocs.length;
+        err.insertedDocs.forEach(student => {
+          if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
+            const originalRow = chunk.find(r => r.studentId === student.studentId);
+            results.details.push({
+              row: originalRow.index + 2,
+              studentId: student.studentId,
+              status: 'created',
+              _id: student._id,
+            });
+          }
+        });
+      }
+      if (err.writeErrors) {
+        err.writeErrors.forEach(writeErr => {
+          if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
+            const failedRow = chunk[writeErr.index];
+            results.failed++;
+            const message = writeErr.err.code === 11000
+              ? 'Student ID already exists in this school'
+              : writeErr.err.message;
+            results.details.push({
+              row: failedRow.index + 2,
+              studentId: failedRow.studentId,
+              error: message,
+              code: writeErr.err.code === 11000 ? 'DUPLICATE_STUDENT_ID' : 'INSERT_ERROR',
+            });
+          }
+        });
+      }
+    }
+  }
+}
+
 async function bulkImportStudents(req, res, next) {
   try {
     const { schoolId } = req;
@@ -645,12 +703,6 @@ async function bulkImportStudents(req, res, next) {
 
     const results = { total: rows.length, created: 0, failed: 0, details: [] };
 
-    // Check student quota (reuse the school already resolved by resolveSchool
-    // instead of a second lookup).
-    const school = req.school;
-    const currentStudentCount = await Student.countDocuments({ schoolId, deletedAt: null });
-    const quotaRemaining = school && school.maxStudents ? school.maxStudents - currentStudentCount : Infinity;
-
     // Pre-fetch fee structures for all unique class names (one query per unique class, not per row)
     const uniqueClasses = [...new Set(rows.map(r => r.class?.trim()).filter(Boolean))];
     const feeStructureMap = {};
@@ -667,7 +719,6 @@ async function bulkImportStudents(req, res, next) {
 
     // Validate all rows first
     const validatedRows = [];
-    let quotaExceededAt = -1;
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       const { errors: validationErrors, fieldErrors } = validateStudentRow(row);
@@ -681,24 +732,6 @@ async function bulkImportStudents(req, res, next) {
             error: validationErrors[0],
             field: fieldErrors[0]?.field || null,
             code: 'VALIDATION_ERROR',
-          });
-        }
-        continue;
-      }
-
-      // Check quota before adding to validatedRows
-      if (quotaExceededAt === -1 && validatedRows.length >= quotaRemaining) {
-        quotaExceededAt = i;
-      }
-
-      if (quotaExceededAt !== -1 && i >= quotaExceededAt) {
-        results.failed++;
-        if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
-          results.details.push({
-            row: i + 2,
-            studentId: row.studentId,
-            error: `School has reached maximum student quota of ${school.maxStudents}`,
-            code: 'STUDENT_QUOTA_EXCEEDED',
           });
         }
         continue;
@@ -740,59 +773,24 @@ async function bulkImportStudents(req, res, next) {
       });
     }
 
-    // Process validated rows in chunks using insertMany with ordered: false
-    const CHUNK_SIZE = 500;
-    for (let i = 0; i < validatedRows.length; i += CHUNK_SIZE) {
-      const chunk = validatedRows.slice(i, i + CHUNK_SIZE);
-      try {
-        const inserted = await Student.insertMany(chunk, { ordered: false });
-        results.created += inserted.length;
-        inserted.forEach(student => {
-          if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
-            const originalRow = chunk.find(r => r.studentId === student.studentId);
-            results.details.push({
-              row: originalRow.index + 2,
-              studentId: student.studentId,
-              status: 'created',
-              _id: student._id,
-            });
-          }
-        });
-      } catch (err) {
-        // insertMany with ordered: false throws a BulkWriteError with insertedDocs and writeErrors
-        if (err.insertedDocs) {
-          results.created += err.insertedDocs.length;
-          err.insertedDocs.forEach(student => {
-            if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
-              const originalRow = chunk.find(r => r.studentId === student.studentId);
-              results.details.push({
-                row: originalRow.index + 2,
-                studentId: student.studentId,
-                status: 'created',
-                _id: student._id,
-              });
-            }
+    // The quota is read and the rows are written under the school's quota lock,
+    // so a concurrent registration cannot take a seat between the check and the
+    // insert (#1801). Rows beyond the free seats are reported as quota failures.
+    await withStudentQuota(schoolId, req.school?.maxStudents, async ({ remaining, maxStudents }) => {
+      const overQuotaRows = validatedRows.splice(remaining);
+      overQuotaRows.forEach(row => {
+        results.failed++;
+        if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
+          results.details.push({
+            row: row.index + 2,
+            studentId: row.studentId,
+            error: `School has reached maximum student quota of ${maxStudents}`,
+            code: 'STUDENT_QUOTA_EXCEEDED',
           });
         }
-        if (err.writeErrors) {
-          err.writeErrors.forEach(writeErr => {
-            if (results.details.length < BULK_IMPORT_MAX_FAILURES) {
-              const failedRow = chunk[writeErr.index];
-              results.failed++;
-              const message = writeErr.err.code === 11000
-                ? 'Student ID already exists in this school'
-                : writeErr.err.message;
-              results.details.push({
-                row: failedRow.index + 2,
-                studentId: failedRow.studentId,
-                error: message,
-                code: writeErr.err.code === 11000 ? 'DUPLICATE_STUDENT_ID' : 'INSERT_ERROR',
-              });
-            }
-          });
-        }
-      }
-    }
+      });
+      await insertValidatedRows(validatedRows, results);
+    });
 
     del(KEYS.studentsAll());
 
