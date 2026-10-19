@@ -6,6 +6,17 @@
  * Used by verifyPayment, submitTransaction, and syncPaymentsForSchool to ensure
  * consistent balance computation across all payment recording paths.
  * Issue #1034: Consolidates three divergent implementations into one.
+ * Issue #1751: This module is the single source of truth for the canonical
+ * paid/remaining/feePaid rule. Every pipeline (poller, manual sync, finalizer,
+ * verify, reminders) must record the payment and then call
+ * `updateStudentBalance` (or read via `computeStudentBalance`) instead of
+ * running its own inline aggregation.
+ *
+ * Canonical rule (see docs/payment-plans-underpaid-reconciliation.md):
+ *   Paid = Σ amount of payments where status === 'SUCCESS'
+ *          and not suspicious and not deleted
+ *          + creditAdjustments
+ *          − completed refunds
  */
 
 const Student = require('../models/studentModel');
@@ -41,8 +52,84 @@ function feeValidationStatusFromClassification(classification) {
 }
 
 /**
+ * Canonical `$match` filter for payments that count toward a student's paid
+ * total (Issue #1751). FAILED, PENDING, REFUNDED, DISPUTED and suspicious
+ * payments are excluded so every pipeline agrees on what "paid" means.
+ *
+ * @param {string} schoolId
+ * @param {string} studentId
+ * @param {string} [feeCategory] - Optional fee category to scope the sum
+ * @returns {Object} MongoDB match stage
+ */
+function canonicalPaidMatch(schoolId, studentId, feeCategory) {
+  const match = {
+    schoolId,
+    studentId,
+    deletedAt: null,
+    status: 'SUCCESS',
+    isSuspicious: false,
+  };
+  if (feeCategory !== undefined) {
+    match.feeCategory = feeCategory;
+  }
+  return match;
+}
+
+/**
+ * Sum the canonical paid amount for a student (or a single fee category) in
+ * exact Decimal128 space. This is the shared reader used by reminders and any
+ * other consumer that must not recompute with a divergent filter.
+ *
+ * @param {string} schoolId
+ * @param {string} studentId
+ * @param {Object} [options]
+ * @param {Object} [options.session]
+ * @param {string} [options.feeCategory]
+ * @returns {Promise<Object>} Decimal total of qualifying payments
+ */
+async function sumCanonicalPayments(schoolId, studentId, options = {}) {
+  const { session = null, feeCategory } = options;
+  const agg = await Payment.aggregate([
+    { $match: canonicalPaidMatch(schoolId, studentId, feeCategory) },
+    { $group: { _id: null, total: { $sum: { $toDecimal: '$amount' } } } },
+  ]).session(session);
+  return agg.length ? decimalFromMongo(agg[0].total) : toMoney(0);
+}
+
+/**
+ * Compute the canonical balance fields for a student without persisting them.
+ * Used by reminders and other read-only consumers so they never diverge from
+ * the stored balance written by `updateStudentBalance`.
+ *
+ * @param {string} schoolId
+ * @param {string} studentId
+ * @param {Object} [options]
+ * @param {Object} [options.session]
+ * @returns {Promise<Object|null>} { totalPaid, remainingBalance, feePaid } or null
+ */
+async function computeStudentBalance(schoolId, studentId, options = {}) {
+  const { session = null } = options;
+  const student = await Student.findOne({ schoolId, studentId }).session(session);
+  if (!student) {
+    return null;
+  }
+
+  const paymentTotal = await sumCanonicalPayments(schoolId, studentId, { session });
+  const creditAdjustments = toMoney(student.creditAdjustments || 0);
+  const cumulativeTotal = toMoney(paymentTotal.plus(creditAdjustments));
+  const classification = classifyFeePayment(cumulativeTotal, student.feeAmount);
+
+  return {
+    totalPaid: classification.cumulativeTotal,
+    remainingBalance: classification.remainingBalance,
+    feePaid: classification.feePaid,
+  };
+}
+
+/**
  * Update a student's balance fields (totalPaid, remainingBalance, feePaid) after
- * a successful payment is recorded.
+ * a successful payment is recorded. This is the ONLY writer of those fields
+ * (Issue #1751).
  *
  * @param {string} schoolId - School ID
  * @param {string} studentId - Student ID
@@ -64,20 +151,7 @@ async function updateStudentBalance(schoolId, studentId, options = {}) {
   // Summed via $toDecimal (#1123 money-representation fix) so MongoDB adds
   // the amounts in exact Decimal128 space instead of accumulating float
   // error across every installment for the life of the account.
-  const paymentAgg = await Payment.aggregate([
-    {
-      $match: {
-        schoolId,
-        studentId,
-        deletedAt: null,
-        status: 'SUCCESS',
-        isSuspicious: false,
-      },
-    },
-    { $group: { _id: null, total: { $sum: { $toDecimal: '$amount' } } } },
-  ]).session(session);
-
-  const paymentTotal = paymentAgg.length ? decimalFromMongo(paymentAgg[0].total) : toMoney(0);
+  const paymentTotal = await sumCanonicalPayments(schoolId, studentId, { session });
 
   // Include creditAdjustments in the cumulative total (Issue #1473).
   // creditAdjustments represent manual partial-credit overrides applied by admins
@@ -101,23 +175,10 @@ async function updateStudentBalance(schoolId, studentId, options = {}) {
     for (let i = 0; i < feesUpdated.length; i++) {
       const category = feesUpdated[i].category;
 
-      const categoryPayments = await Payment.aggregate([
-        {
-          $match: {
-            schoolId,
-            studentId,
-            feeCategory: category,
-            deletedAt: null,
-            status: 'SUCCESS',
-            isSuspicious: false,
-          },
-        },
-        { $group: { _id: null, total: { $sum: { $toDecimal: '$amount' } } } },
-      ]).session(session);
-
-      const categoryTotalDecimal = categoryPayments.length
-        ? decimalFromMongo(categoryPayments[0].total)
-        : toMoney(0);
+      const categoryTotalDecimal = await sumCanonicalPayments(schoolId, studentId, {
+        session,
+        feeCategory: category,
+      });
       const categoryClassification = classifyFeePayment(categoryTotalDecimal, feesUpdated[i].amount);
 
       feesUpdated[i].totalPaid = categoryClassification.cumulativeTotal;
@@ -140,5 +201,8 @@ async function updateStudentBalance(schoolId, studentId, options = {}) {
 
 module.exports = {
   updateStudentBalance,
+  computeStudentBalance,
+  sumCanonicalPayments,
+  canonicalPaidMatch,
   feeValidationStatusFromClassification,
 };
