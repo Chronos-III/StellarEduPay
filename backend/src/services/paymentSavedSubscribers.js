@@ -15,6 +15,7 @@
 const paymentEvents = require('../events/paymentEvents');
 const { createReceipt } = require('./receiptService');
 const { incrementPaymentMetrics } = require('./metricsRollupService');
+const { invalidateReportCache } = require('./reportCacheInvalidator');
 const School = require('../models/schoolModel');
 const Student = require('../models/studentModel');
 const logger = require('../utils/logger').child('PaymentSavedSubscribers');
@@ -174,6 +175,8 @@ function registerPaymentSavedSubscribers() {
   paymentEvents.on('payment.saved', onPaymentSavedReceipt);
   paymentEvents.on('payment.saved', onPaymentSavedCancelReminder);
   paymentEvents.on('payment.saved', onPaymentSavedRecordDuration);
+  // #1747 — invalidate school-scoped report cache entries on each new payment
+  paymentEvents.on('payment.saved', (payment) => { invalidateReportCache(payment); });
   // #881 — increment pre-aggregated rollups on every confirmed payment
   paymentEvents.on('payment.saved', async (payment) => {
     try { await incrementPaymentMetrics(payment); }
@@ -190,4 +193,5 @@ module.exports = {
   onPaymentSavedCancelReminder,
   onPaymentSavedRecordDuration,
   onRefundStatusChanged,
+  invalidateReportCache,
 };

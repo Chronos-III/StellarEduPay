@@ -123,6 +123,25 @@ jobs:
       - name: Run ESLint (backend)
         run: cd backend && npx eslint src/ --max-warnings=0
 
+  dead-code-backend:
+    name: Detect dead/orphan backend modules (knip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@v6
+        with:
+          path: backend/node_modules
+          key: ${{ runner.os }}-backend-node-${{ hashFiles('backend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-backend-node-
+      - name: Install backend dependencies
+        run: cd backend && npm ci
+      - name: Run knip (unused files/exports)
+        run: cd backend && npx knip --reporter compact
+
   lint-frontend:
     name: Lint frontend
     runs-on: ubuntu-latest

@@ -132,11 +132,24 @@ async function extractValidPayment(tx, walletAddress) {
     label: "extractValidPayment.operations",
     context: `Transaction ${tx.hash} operations`,
   });
-  // #840 — only a successful `payment` operation landing on the school wallet
-  // is creditable. detectAsset then enforces the asset/issuer (#841): a
-  // wrong-asset or fake-issuer operation yields null and is rejected here.
+  // #840 — only a successful payment-like operation landing on the school
+  // wallet is creditable. detectAsset then enforces the asset/issuer (#841):
+  // a wrong-asset or fake-issuer operation yields null and is rejected here.
+  //
+  // #1557 — also accept path_payment_strict_send and
+  // path_payment_strict_receive. For both path-payment types Horizon populates
+  // `to`, `asset_type`, `asset_code`, `asset_issuer`, and `amount` with the
+  // destination wallet and the asset/amount RECEIVED by the destination — the
+  // same fields a plain `payment` operation uses. The source asset/amount
+  // (spent by the sender) is in `source_asset_*` / `source_amount` and is
+  // irrelevant for crediting. detectAsset works unchanged on path-payment ops.
+  const CREDITABLE_OP_TYPES = new Set([
+    "payment",
+    "path_payment_strict_send",
+    "path_payment_strict_receive",
+  ]);
   const payOp = ops.records.find(
-    (op) => op.type === "payment" && op.to === walletAddress,
+    (op) => CREDITABLE_OP_TYPES.has(op.type) && op.to === walletAddress,
   );
   if (!payOp) return null;
 
@@ -537,8 +550,18 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
     label: "verifyTransaction.operations",
     context: `Transaction ${txHash} operations`,
   });
+  // #1557 — accept path_payment_strict_send and path_payment_strict_receive in
+  // addition to plain `payment`. For all three types Horizon exposes the
+  // destination wallet and received asset/amount on the same `to`, `asset_*`,
+  // and `amount` fields, so detectAsset and downstream fee validation work
+  // without further changes.
+  const CREDITABLE_OP_TYPES = new Set([
+    "payment",
+    "path_payment_strict_send",
+    "path_payment_strict_receive",
+  ]);
   const payOp = ops.records.find(
-    (op) => op.type === "payment" && op.to === walletAddress,
+    (op) => CREDITABLE_OP_TYPES.has(op.type) && op.to === walletAddress,
   );
   if (!payOp) {
     const err = new Error(
@@ -709,8 +732,13 @@ async function syncPaymentsForSchool(school) {
             () => tx.operations(),
             { label: 'syncPaymentsForSchool.destinationCheck' }
           ).catch(() => ({ records: [] }));
+          const CREDITABLE_OP_TYPES = new Set([
+            'payment',
+            'path_payment_strict_send',
+            'path_payment_strict_receive',
+          ]);
           const wrongDest = ops.records.find(
-            op => op.type === 'payment' && op.to && op.to !== stellarAddress
+            op => CREDITABLE_OP_TYPES.has(op.type) && op.to && op.to !== stellarAddress
           );
           if (wrongDest) {
             logger.warn('Transaction skipped — destination does not match school wallet', {

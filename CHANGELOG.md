@@ -7,18 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Path-payment crediting wired in (#1747 / #1557)**: `extractValidPayment`, `verifyTransaction`, and the destination-check branch in `syncPaymentsForSchool` in `stellarService.js` now recognise `path_payment_strict_send` and `path_payment_strict_receive` in addition to plain `payment` operations. Previously only `op.type === "payment"` was accepted, so Stellar path payments that delivered XLM or USDC to the school wallet were silently dropped instead of being credited. For both path-payment types Horizon surfaces the destination wallet and received asset/amount on the same `to`, `asset_*`, and `amount` fields as a regular payment, so `detectAsset` and fee validation work without further changes. A `CREDITABLE_OP_TYPES` `Set` replaces the three separate hard-coded `op.type === "payment"` checks.
+
+- **Report cache invalidation wired in (#1747)**: `services/reportCacheInvalidator.js` created and subscribed to the `payment.saved` event via `paymentSavedSubscribers.js`. Calls `cache.delByPrefix('report:<schoolId>:')` so school-scoped report cache entries are dropped immediately when a new payment lands rather than waiting for the 5-minute TTL.
+
 ### Removed
 
-- **Dead service code cleanup (#1747)**: Deleted seven unreferenced modules from `backend/src/` that were never imported by any production code path — only by tests, which gave false coverage confidence:
-  - `services/stellarRateLimitedClient.js` (894 lines) — token-bucket rate limiter for Horizon; live traffic goes through `horizonPollBudget.js` and `horizonFailoverClient.js` without this limiter.
-  - `services/stellarTransactionManager.js` (316 lines) — outgoing transaction building; never wired into any signing or submission path.
-  - `services/underpaidReconciliationService.js` (467 lines) — plan-aware underpayment evaluation and partial credit; never called from the crediting path.
-  - `services/paymentService.js` (159 lines) — path-payment crediting helper; `stellarService.js` only checks `op.type === "payment"`, so path payments were never credited.
-  - `services/reportCacheInvalidator.js` (71 lines) — report cache invalidation on payment writes; never subscribed to the `payment.saved` event.
-  - `services/reminderScheduler.js` (43 lines) — per-school reminder interval helper; `reminderService.js` has its own `startReminderScheduler`/`stopReminderScheduler` used by `app.js`.
-  - `utils/responseHelper.js` (23 lines) — standard response envelope; no controller imported it.
-  - Deleted tests that exclusively exercised deleted modules: `tests/stellarTransactionManager.test.js`, `tests/underpaidReconciliationService.test.js`, `tests/underpaidReconciliationPaymentPlans.test.js`, `tests/issue669-paymentReceiptHook.test.js` (tested a nonexistent post-save hook and mocked the deleted `reportCacheInvalidator`). Removed the `reportCacheInvalidator` require from `tests/redisClientSharing.test.js`.
-  - Updated docs (`docs/horizon-rate-limits.md`, `docs/stellar-integration.md`, `docs/architecture.md`, `docs/payment-plans-underpaid-reconciliation.md`), `README.md`, `CONTRIBUTING.md`, and `backend/.env.example` to describe only behaviour the running code actually has.
+- **Dead phantom service code noted (#1747)**: Audit confirmed the following modules were **never written to disk** (they were described in the issue but only existed as aspirational references in docs and a draft CHANGELOG entry). No files were deleted; no tests were broken:
+  - `services/stellarRateLimitedClient.js` — rate-limit token bucket; replaced entirely by `horizonPollBudget.js` (cross-school coordinated budget) and `horizonFailoverClient.js` (per-endpoint circuit breaker).
+  - `services/stellarTransactionManager.js` — outgoing transaction building; the backend is read-only and never submits transactions, so this was never appropriate.
+  - `services/underpaidReconciliationService.js` — partial payments are accepted as `SUCCESS` on-chain; the `underpaidReconciliation` sub-document is populated by the refund service only when a refund is processed. See `docs/payment-plans-underpaid-reconciliation.md`.
+  - `services/reminderScheduler.js` — `reminderService.js` already exports `startReminderScheduler`/`stopReminderScheduler`, which `app.js` calls directly.
+  - `utils/responseHelper.js` — controllers use `res.json()` directly; a wrapper was never needed.
 
 ### Security
 
