@@ -30,6 +30,9 @@ let mockAcademicPeriodFindOne;
 let mockAcademicPeriodUpdateOne;
 let mockStudentPeriodFeeFindOne;
 let mockStudentPeriodFeeUpdateOne;
+let mockStudentPeriodFeeFind;
+let mockStudentPeriodFeeBulkWrite;
+let mockStudentBulkWrite;
 let mockFeeStructureFind;
 let periodFeeStore;
 
@@ -41,6 +44,7 @@ jest.mock('../src/models/studentModel', () => ({
   findOneAndUpdate: (...args) => mockStudentFindOneAndUpdate(...args),
   find: (...args) => mockStudentFind(...args),
   updateOne: (...args) => mockStudentUpdateOne(...args),
+  bulkWrite: (...args) => mockStudentBulkWrite(...args),
 }));
 jest.mock('../src/models/academicPeriodModel', () => ({
   findOne: (...args) => mockAcademicPeriodFindOne(...args),
@@ -49,6 +53,8 @@ jest.mock('../src/models/academicPeriodModel', () => ({
 jest.mock('../src/models/studentPeriodFeeModel', () => ({
   findOne: (...args) => mockStudentPeriodFeeFindOne(...args),
   updateOne: (...args) => mockStudentPeriodFeeUpdateOne(...args),
+  find: (...args) => mockStudentPeriodFeeFind(...args),
+  bulkWrite: (...args) => mockStudentPeriodFeeBulkWrite(...args),
 }));
 jest.mock('../src/models/feeStructureModel', () => ({
   find: (...args) => mockFeeStructureFind(...args),
@@ -119,8 +125,11 @@ beforeEach(() => {
     if (String(filter._id) === PERIOD2_ID) return query(nextPeriod);
     return query(null);
   });
-  mockStudentFind = jest.fn(() => ({ lean: () => Promise.resolve([student]) }));
-  mockFeeStructureFind = jest.fn(() => ({ lean: () => Promise.resolve([{ className: 'JSS1', feeAmount: 100 }]) }));
+  mockStudentFind = jest.fn(() => query([student]));
+  mockFeeStructureFind = jest.fn(() => query([{ className: 'JSS1', feeAmount: 100 }]));
+  mockStudentPeriodFeeFind = jest.fn(() => query([{ ...periodFeeStore }]));
+  mockStudentPeriodFeeBulkWrite = jest.fn().mockResolvedValue({});
+  mockStudentBulkWrite = jest.fn().mockResolvedValue({});
 });
 
 describe('Issue #1785 — period totalPaid sync', () => {
@@ -177,10 +186,8 @@ describe('Issue #1785 — period totalPaid sync', () => {
     });
 
     expect(result.totalArrears).toBe(0);
-    const newFeeWrite = mockStudentPeriodFeeUpdateOne.mock.calls
-      .map(([, update]) => update)
-      .find((update) => update.$set && update.$set.periodName === nextPeriod.name);
-    expect(newFeeWrite.$set).toMatchObject({ carriedArrears: 0, remainingBalance: 100, feePaid: false });
+    const newFeeWrite = mockStudentPeriodFeeBulkWrite.mock.calls[0][0][0].updateOne.update;
+    expect(newFeeWrite.$set).toMatchObject({ periodName: nextPeriod.name, carriedArrears: 0, remainingBalance: 100, feePaid: false });
   });
 
   test('rollover after a partial payment carries only the unpaid balance', async () => {
