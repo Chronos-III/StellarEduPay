@@ -913,3 +913,8 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 **Built with Stellar blockchain technology**
+
+## Handsoff notes
+
+<!-- handsoff-issue-1752 -->
+- #1752: Manual credit adjustments are wiped the next time the poller, manual sync or finalizer touches the student
