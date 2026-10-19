@@ -2,6 +2,8 @@
 
 const Student = require('../models/studentModel');
 const FeeStructure = require('../models/feeStructureModel');
+const StudentFeeHistory = require('../models/studentFeeHistoryModel');
+const { updateStudentBalance } = require('../utils/studentBalanceUpdater');
 const { get, set, del, KEYS, TTL } = require('../cache');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
@@ -406,14 +408,36 @@ async function updateStudent(req, res, next) {
         update.feeAmount = feeStructure.feeAmount;
       }
     }
-    if (feeAmount !== undefined) update.feeAmount = feeAmount;
+    if (feeAmount !== undefined) {
+      const amount = Number(feeAmount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'feeAmount must be a positive number', code: 'VALIDATION_ERROR' });
+      }
+      update.feeAmount = amount;
+    }
     if (reminderOptOut !== undefined) update.reminderOptOut = Boolean(reminderOptOut);
 
-    const student = await Student.findOneAndUpdate(
+    let student = await Student.findOneAndUpdate(
       { schoolId: req.schoolId, studentId },
       update,
       { new: true, runValidators: true },
     );
+
+    // A fee change alters remainingBalance and feePaid, so recompute them from
+    // the canonical formula and record the change in fee history (#1786).
+    const feeChanged = update.feeAmount !== undefined && update.feeAmount !== original.feeAmount;
+    if (feeChanged) {
+      student = await updateStudentBalance(req.schoolId, studentId) || student;
+      await StudentFeeHistory.create({
+        schoolId: req.schoolId,
+        studentId,
+        category: student.class,
+        amount: student.feeAmount,
+        paid: student.feePaid,
+        totalPaid: student.totalPaid,
+        remainingBalance: student.remainingBalance,
+      });
+    }
 
     del(KEYS.student(req.schoolId, studentId), KEYS.publicStudent(req.schoolId, studentId));
 
