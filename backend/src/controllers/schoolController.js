@@ -519,46 +519,12 @@ async function rotateWebhookSecret(req, res, next) {
   }
 }
 
-// DELETE /api/schools/:schoolId  (soft-delete)
-async function deactivateSchool(req, res, next) {
-  try {
-    const school = await School.findOneAndUpdate(
-      { schoolId: req.params.schoolId },
-      { isActive: false },
-      { new: true }
-    );
-    if (!school) {
-      const e = new Error('School not found');
-      e.code = 'NOT_FOUND';
-      return next(e);
-    }
-
-    // Drop the cached copy everywhere so deactivation blocks requests at once.
-    schoolCache.invalidate(school);
-
-    // Audit log
-    if (req.auditContext) {
-      await logAudit({
-        schoolId: school.schoolId,
-        action: 'school_deactivate',
-        performedBy: req.auditContext.performedBy,
-        targetId: school.schoolId,
-        targetType: 'school',
-        details: { name: school.name, slug: school.slug },
-        result: 'success',
-        ipAddress: req.auditContext.ipAddress,
-        userAgent: req.auditContext.userAgent,
-      });
-    }
-
-    res.json({ message: `School "${school.name}" deactivated` });
-  } catch (err) {
-    next(err);
-  }
-}
-
 // PATCH /api/schools/:schoolId/deactivate
-async function deactivateSchoolEndpoint(req, res, next) {
+// Single code path for soft-deactivating a school. Side effects:
+//   - sets isActive=false
+//   - writes a school_deactivate audit log entry
+//   - invalidates the school cache so requests for it are blocked at once
+async function deactivateSchool(req, res, next) {
   try {
     const school = await School.findOneAndUpdate(
       { schoolId: req.params.schoolId },
@@ -590,6 +556,13 @@ async function deactivateSchoolEndpoint(req, res, next) {
   } catch (err) {
     next(err);
   }
+}
+
+// DELETE /api/schools/:schoolId — deprecated alias for PATCH /:schoolId/deactivate
+function deprecatedDeleteSchool(req, res, next) {
+  res.set('Deprecation', 'true');
+  res.set('Link', `</api/schools/${req.params.schoolId}/deactivate>; rel="successor-version"`);
+  return deactivateSchool(req, res, next);
 }
 
 // PATCH /api/schools/:schoolId/activate
@@ -758,4 +731,4 @@ async function clearSchoolSetting(req, res, next) {
   }
 }
 
-module.exports = { createSchool, getAllSchools, getSchool, updateSchool, rotateStellarAddress, rotateWebhookSecret, deactivateSchool, deactivateSchoolEndpoint, activateSchool, registerWebhook, getSchoolSettings, updateSchoolSettings, clearSchoolSetting };
+module.exports = { createSchool, getAllSchools, getSchool, updateSchool, rotateStellarAddress, rotateWebhookSecret, deactivateSchool, deprecatedDeleteSchool, activateSchool, registerWebhook, getSchoolSettings, updateSchoolSettings, clearSchoolSetting };
