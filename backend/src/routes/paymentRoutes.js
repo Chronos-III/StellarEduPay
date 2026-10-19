@@ -251,6 +251,17 @@ router.get(
 );
 router.get("/receipt/:txHash", generateReceipt);
 router.get("/queue/:txHash", requireSchoolAuth(['owner', 'staff', 'read_only']), getQueueJobStatus);
+
+// Placeholder correction must be registered before the catch-all "/:studentId"
+// GET and before any "/:paymentId" routes so the txHash path is not shadowed.
+router.patch(
+  "/:txHash/correct-placeholder",
+  validateTxHashParam,
+  requireSchoolAuth(['owner', 'staff']),
+  auditContext,
+  correctPlaceholderPayment,
+);
+
 router.get("/:studentId", validateStudentIdParam, requireSchoolAuth(['owner', 'staff', 'read_only']), getStudentPayments);
 
 router.post("/:paymentId/lock", requireSchoolAuth(['owner', 'staff']), auditContext, lockPaymentForUpdate);

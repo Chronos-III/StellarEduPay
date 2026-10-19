@@ -269,6 +269,8 @@ function requireSchoolAuth(allowedRoles = []) {
       });
     }
 
+    // req.user is the authoritative identity for downstream handlers:
+    // userId, schoolId, roles, mfaEnabled, mfaSetupPending, exp.
     req.user = decoded;
     req.admin = decoded; // alias so downstream code works regardless of which middleware ran
     next();

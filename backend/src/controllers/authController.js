@@ -585,21 +585,41 @@ async function handleLogout(req, res) {
 }
 
 // ── Me ────────────────────────────────────────────────────────────────────────
+// #1769 — /auth/me must work for every authenticated user (school owners,
+// staff, read_only), not just the env super-admin. The frontend derives
+// userId / schoolId / roles from this response, so gating it behind
+// requireAdminAuth made the whole admin UI unreachable for school users.
+
+function isSuperAdmin(principal) {
+  if (!principal) return false;
+  if (principal.userId === 'super_admin') return true;
+  if (principal.role === 'admin') return true;
+  return Array.isArray(principal.roles) && principal.roles.includes('super_admin');
+}
 
 function handleMe(req, res) {
-  const p = req.admin;
+  // req.user is populated by requireSchoolAuth; fall back to req.admin for
+  // any route still using the legacy guard.
+  const p = req.user || req.admin || {};
+  const roles = Array.isArray(p.roles) ? p.roles : (p.role ? [p.role] : []);
   return res.json({
-    userId:   p.userId   || p.sub || null,
-    schoolId: p.schoolId || null,
-    roles:    Array.isArray(p.roles) ? p.roles : (p.role ? [p.role] : []),
-    exp:      p.exp      || null,
+    userId:          p.userId || p.sub || null,
+    email:           p.email || p.username || null,
+    schoolId:        p.schoolId || null,
+    roles,
+    mfaEnabled:      Boolean(p.mfaEnabled),
+    mfaSetupPending: Boolean(p.mfaSetupPending),
+    exp:             p.exp || null,
   });
 }
 
-// ── Session management (admin) ────────────────────────────────────────────────
+// ── Session management ────────────────────────────────────────────────────────
+// #1769 — Sessions are scoped to the caller. Super-admins may list/revoke any
+// session; everyone else only sees and revokes their own.
 
 async function handleListSessions(req, res) {
-  const userId = req.admin?.userId || 'super_admin';
+  const principal = req.user || req.admin || {};
+  const userId = principal.userId || 'super_admin';
   try {
     const sessions = await getStore().listUserSessions(userId);
     return res.json({ sessions });
@@ -611,10 +631,19 @@ async function handleListSessions(req, res) {
 
 async function handleRevokeSession(req, res) {
   const { sessionId } = req.params;
+  const principal = req.user || req.admin || {};
   const store = getStore();
   const sess = await store.getSession(sessionId).catch(() => null);
   if (!sess) {
     return res.status(404).json({ error: 'Session not found.', code: 'SESSION_NOT_FOUND' });
+  }
+  // #1769 — Ownership check: a caller may only revoke their own sessions
+  // unless they are a super-admin.
+  if (!isSuperAdmin(principal) && sess.userId !== principal.userId) {
+    return res.status(403).json({
+      error: 'You may only revoke your own sessions.',
+      code: 'FORBIDDEN',
+    });
   }
   if (sess.familyId) {
     const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
@@ -622,7 +651,7 @@ async function handleRevokeSession(req, res) {
   }
   await store.delSession(sessionId).catch(() => logger.debug('[AuthController] delSession in handleRevokeSession missed'));
   await logAudit({
-    schoolId: req.admin?.schoolId || 'system',
+    schoolId: principal.schoolId || 'system',
     action: 'SESSION_REVOKED',
     performedBy: req.auditContext?.performedBy,
     ipAddress: req.auditContext?.ipAddress,
@@ -746,4 +775,5 @@ module.exports = {
   handleRevokeSession,
   handleChangePassword,
   _resetStore,
+  isSuperAdmin,
 };
