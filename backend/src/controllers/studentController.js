@@ -9,6 +9,7 @@ const { csvEscape } = require('../utils/csv');
 const { normaliseName, nameError, NAME_MAX_LENGTH, CLASS_MAX_LENGTH } = require('../middleware/validate');
 const { logAudit } = require('../services/auditService');
 const { encryptStudentPii, decryptStudentPii, hashParentEmail } = require('../services/studentPiiEncryption');
+const { maskEmail, maskPhone } = require('../utils/piiRedaction');
 
 async function registerStudent(req, res, next) {
   // Declared in the function scope (not inside try) so the 11000 duplicate-key
@@ -377,15 +378,35 @@ async function getDeletedStudentPayments(req, res, next) {
   }
 }
 
+const PARENT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Audit the parent contact fields with masked values only (#1787): the audit
+// trail must never hold a plaintext address or phone number.
+function parentContactAudit(previous, current) {
+  const changed = previous.parentEmail !== current.parentEmail || previous.parentPhone !== current.parentPhone;
+  if (!changed) return { before: {}, after: {} };
+  return {
+    before: { parentEmail: maskEmail(previous.parentEmail), parentPhone: maskPhone(previous.parentPhone) },
+    after: { parentEmail: maskEmail(current.parentEmail), parentPhone: maskPhone(current.parentPhone) },
+  };
+}
+
 async function updateStudent(req, res, next) {
   try {
     const { studentId } = req.params;
-    const { name, class: className, feeAmount, reminderOptOut } = req.body;
+    const { name, class: className, feeAmount, reminderOptOut, parentEmail, parentPhone } = req.body;
 
     const original = await Student.findOne({ schoolId: req.schoolId, studentId }).lean();
     if (!original) {
       const err = new Error('Student not found');
       err.code = 'NOT_FOUND';
+      return next(err);
+    }
+
+    if (parentEmail !== undefined && parentEmail !== null && parentEmail !== '' && !PARENT_EMAIL_RE.test(String(parentEmail).trim())) {
+      const err = new Error('parentEmail must be a valid email address');
+      err.code = 'VALIDATION_ERROR';
+      err.status = 400;
       return next(err);
     }
 
@@ -409,11 +430,37 @@ async function updateStudent(req, res, next) {
     if (feeAmount !== undefined) update.feeAmount = feeAmount;
     if (reminderOptOut !== undefined) update.reminderOptOut = Boolean(reminderOptOut);
 
-    const student = await Student.findOneAndUpdate(
-      { schoolId: req.schoolId, studentId },
-      update,
-      { new: true, runValidators: true },
-    );
+    // Parent contact changes go through a document save, not findOneAndUpdate:
+    // the encryption and blind-index hooks in studentModel.js only run on save.
+    const doc = await Student.findOne({ schoolId: req.schoolId, studentId });
+    if (!doc) {
+      const err = new Error('Student not found');
+      err.code = 'NOT_FOUND';
+      return next(err);
+    }
+    doc.set(update);
+
+    // doc.parentEmail/parentPhone are decrypted by the post('init') hook; `original` is lean and is not.
+    const previousContact = { parentEmail: doc.parentEmail, parentPhone: doc.parentPhone };
+    const newEmail = parentEmail === undefined ? undefined : (parentEmail ? String(parentEmail).trim().toLowerCase() : null);
+    const newPhone = parentPhone === undefined ? undefined : (parentPhone ? String(parentPhone).trim() : null);
+    if (newEmail !== undefined && newEmail !== previousContact.parentEmail) {
+      doc.parentEmail = newEmail;
+      // A new address starts with a clean reminder history and is no longer suppressed.
+      doc.parentEmailSuppressed = false;
+      doc.parentEmailSuppressionReason = null;
+      doc.parentEmailSuppressedAt = null;
+      doc.reminderCount = 0;
+      doc.lastReminderSentAt = null;
+    }
+    if (newPhone !== undefined && newPhone !== previousContact.parentPhone) {
+      doc.parentPhone = newPhone;
+      doc.reminderCount = 0;
+      doc.lastReminderSentAt = null;
+    }
+
+    const student = await doc.save();
+    const contactAudit = parentContactAudit(previousContact, student);
 
     del(KEYS.student(req.schoolId, studentId), KEYS.publicStudent(req.schoolId, studentId));
 
@@ -426,8 +473,8 @@ async function updateStudent(req, res, next) {
         targetId: studentId,
         targetType: 'student',
         details: {
-          before: { name: original.name, class: original.class, feeAmount: original.feeAmount },
-          after: { name: student.name, class: student.class, feeAmount: student.feeAmount },
+          before: { name: original.name, class: original.class, feeAmount: original.feeAmount, ...contactAudit.before },
+          after: { name: student.name, class: student.class, feeAmount: student.feeAmount, ...contactAudit.after },
         },
         result: 'success',
         ipAddress: req.auditContext.ipAddress,
