@@ -520,6 +520,31 @@ function recordBackupRestoreTestSuccess(timestampSeconds = Math.floor(Date.now()
   _lastBackupRestoreTestSuccessAt = timestampSeconds;
 }
 
+// outbox_lag_seconds — age of the oldest pending/processing outbox event on
+// this scrape.  A rising value means the dispatcher is falling behind (slow
+// downstream, replica saturation, or dispatcher stopped).
+// Issue #1646: the metric is queried live from MongoDB on each scrape so it
+// reflects reality across restarts and is not reset by process recycling.
+// 0 is reported when no unprocessed events exist (healthy empty-queue state).
+new client.Gauge({
+  name: 'outbox_lag_seconds',
+  help: 'Age in seconds of the oldest outbox event not yet fully delivered (0 when queue is empty)',
+  registers: [registry],
+  async collect() {
+    try {
+      const Outbox = require('../models/outboxModel');
+      const oldest = await Outbox.findOne(
+        { status: { $in: ['pending', 'processing'] } },
+        { createdAt: 1 },
+        { sort: { createdAt: 1 }, lean: true }
+      );
+      this.set(oldest ? (Date.now() - oldest.createdAt.getTime()) / 1000 : 0);
+    } catch (_) {
+      // DB may not be ready yet — scrape still succeeds with stale/zero values
+    }
+  },
+});
+
 module.exports = {
   registry,
   mongoConnectionState,
