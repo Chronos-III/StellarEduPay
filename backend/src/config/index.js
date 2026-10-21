@@ -1,25 +1,28 @@
-"use strict";
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 
-/**
- * Unified configuration loader.
- *
- * Multi-school note: SCHOOL_WALLET_ADDRESS is no longer required at startup.
- * Each school's Stellar address is stored in the school document in MongoDB.
- * The variable is still read here (optional) for the legacy default-school
- * backfill migration in backend/migrations/033_backfill_default_school.js.
- */
+const Joi = require('joi');
 
-const Joi = require("joi");
+const REQUIRED_VARS = ['MONGO_URI', 'JWT_SECRET', 'RECEIPT_SIGNATURE_SECRET'];
 
-// ── Schema ────────────────────────────────────────────────────────────────────
-// Every variable this module owns is declared here with its type, default,
-// allowed range and whether it is a secret. `process.env` is read only inside
-// this module; consumers import the validated values from `config`.
+function validateEnv() {
+  const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables: ${missing.join(', ')}. ` +
+        'Please set them in your environment or .env file.'
+    );
+  }
+
+  if (process.env.JWT_SECRET.length < 32) {
+    throw new Error('JWT_SECRET must be at least 32 characters long.');
+  }
+}
+
+validateEnv();
+
 const schema = Joi.object({
-  NODE_ENV: Joi.string()
-    .valid("development", "test", "production")
-    .default("development"),
-
   // ── Required ────────────────────────────────────────────────────────────────
   MONGO_URI: Joi.string().required(),
   JWT_SECRET: Joi.string().min(32).required().secret(),
@@ -160,12 +163,12 @@ if (error) {
   );
 }
 
-// ── Derived values ────────────────────────────────────────────────────────────
 const PORT = env.PORT;
 const MONGO_URI = env.MONGO_URI;
 const RECEIPT_SIGNATURE_SECRET = env.RECEIPT_SIGNATURE_SECRET;
+
 const STELLAR_NETWORK = env.STELLAR_NETWORK;
-const IS_TESTNET = STELLAR_NETWORK !== "mainnet";
+const IS_TESTNET = STELLAR_NETWORK === "testnet";
 
 const HORIZON_URL =
   env.STELLAR_HORIZON_URL ||
@@ -371,7 +374,18 @@ const SMTP_USER = env.SMTP_USER;
 const SMTP_PASS = env.SMTP_PASS;
 const SMTP_FROM = env.SMTP_FROM;
 
-module.exports = {
+const config = {
+  env: process.env.NODE_ENV || 'development',
+  port: PORT,
+  mongoUri: MONGO_URI,
+  jwtSecret: JWT_SECRET,
+  jwtExpiresIn: JWT_EXPIRES_IN,
+  receiptSignatureSecret: RECEIPT_SIGNATURE_SECRET,
+  logLevel: process.env.LOG_LEVEL || 'info',
+  corsOrigin: process.env.CORS_ORIGIN || '*',
+  rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 15 * 60 * 1000,
+  rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX, 10) || 100,
+
   PORT,
   MONGO_URI,
   RECEIPT_SIGNATURE_SECRET,
@@ -425,3 +439,5 @@ module.exports = {
   SMTP_PASS,
   SMTP_FROM,
 };
+
+module.exports = config;

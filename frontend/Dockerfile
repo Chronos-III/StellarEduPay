@@ -1,5 +1,8 @@
 # ── Stage 1: build ────────────────────────────────────────────
-FROM node:20-alpine AS builder
+# Node major version — keep in sync with the root .nvmrc.
+# Override at build time: docker build --build-arg NODE_VERSION=24 ...
+ARG NODE_VERSION=24
+FROM node:${NODE_VERSION}-alpine AS builder
 
 WORKDIR /app
 
@@ -24,7 +27,9 @@ COPY . .
 RUN npm run build
 
 # ── Stage 2: run ──────────────────────────────────────────────
-FROM node:20-alpine AS runner
+# Re-declare ARG so the runner stage resolves the same image as the builder.
+ARG NODE_VERSION=24
+FROM node:${NODE_VERSION}-alpine AS runner
 
 # Non-root user for security
 RUN addgroup -S -g 1001 appgroup && adduser -S -u 1001 -G appgroup appuser

@@ -170,8 +170,11 @@ async function buildHealthReport() {
     statusCode = 200; // Still return 200 since DB is up and cached data can be served
   }
 
-  // concurrentPaymentProcessor was removed (#1036) — mirror the same fallback
-  // transactionPollingService.js uses when stats are unavailable.
+  // concurrentPaymentProcessor was removed (#1036) and its removal completed in
+  // #1275: no module emits payment-processor queue stats any more, so there is
+  // nothing to read here. This explicit zero fallback mirrors the one in
+  // transactionPollingService.js#getQueueBackpressureState() so the health
+  // payload and the polling backpressure path always agree.
   const queueDepth = 0;
   const maxQueueDepth = config.MAX_QUEUE_DEPTH;
 
