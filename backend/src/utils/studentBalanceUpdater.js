@@ -15,6 +15,34 @@ const StudentPeriodFee = require('../models/studentPeriodFeeModel');
 const { toMoney, decimalFromMongo, classifyFeePayment } = require('./money');
 
 /**
+ * Canonical feeValidationStatus vocabulary (Issue #1766).
+ *
+ * `classifyFeePayment` is the single source of truth for classifying a
+ * cumulative total against the fee. This helper maps its result onto the
+ * `Payment.feeValidationStatus` enum so every writer (verify, sync, poller)
+ * records the same value for the same economic event:
+ *   - 'valid'      cumulative total equals the fee
+ *   - 'partial'    cumulative total below the fee (accepted installment)
+ *   - 'overpaid'   cumulative total above the fee
+ *   - 'unknown'    fee amount not available / not classifiable
+ *
+ * @param {Object} classification - Result of classifyFeePayment
+ * @returns {'valid'|'partial'|'overpaid'|'unknown'}
+ */
+function feeValidationStatusFromClassification(classification) {
+  if (!classification || classification.feeAmount === null || classification.feeAmount === undefined) {
+    return 'unknown';
+  }
+  if (classification.feePaid) {
+    return 'valid';
+  }
+  if (classification.remainingBalance && classification.remainingBalance.greaterThan(0)) {
+    return 'partial';
+  }
+  return 'overpaid';
+}
+
+/**
  * Update a student's balance fields (totalPaid, remainingBalance, feePaid) after
  * a successful payment is recorded.
  *
@@ -162,4 +190,5 @@ async function syncCurrentPeriodFee(schoolId, studentId, session) {
 
 module.exports = {
   updateStudentBalance,
+  feeValidationStatusFromClassification,
 };

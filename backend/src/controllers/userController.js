@@ -6,6 +6,7 @@ const User = require('../models/userModel');
 const logger = require('../utils/logger').child('UserController');
 const { logAudit } = require('../services/auditService');
 const { sendEmail } = require('../services/emailService');
+const { revokeAllUserSessions } = require('../services/sessionStore');
 
 // ── Password policy ────────────────────────────────────────────────────────────
 const MIN_PASSWORD_LENGTH = 12;
@@ -167,6 +168,11 @@ async function updateUser(req, res) {
 
   await User.findByIdAndUpdate(userId, { $set: updates });
 
+  // Deactivating a user must invalidate every existing session and refresh token.
+  if (isActive === false) {
+    await revokeAllUserSessions(userId);
+  }
+
   await logAudit({
     schoolId: user.schoolId || 'system',
     action: 'user_updated',
@@ -191,6 +197,9 @@ async function deleteUser(req, res) {
   }
 
   await User.findByIdAndDelete(userId);
+
+  // Deleting a user must invalidate every existing session and refresh token.
+  await revokeAllUserSessions(userId);
 
   await logAudit({
     schoolId: user.schoolId || 'system',
@@ -379,6 +388,11 @@ async function updateSchoolUser(req, res) {
 
   await User.findByIdAndUpdate(userId, { $set: updates });
 
+  // Deactivating a user must invalidate every existing session and refresh token.
+  if (isActive === false) {
+    await revokeAllUserSessions(userId);
+  }
+
   await logAudit({
     schoolId,
     action: 'user_updated',
@@ -541,24 +555,9 @@ async function resetPassword(req, res) {
     $unset: { resetToken: '', resetExpires: '' },
   });
 
-  // Revoke all existing sessions (already implemented in authController.handleChangePassword logic)
-  const { getStore } = require('./authController');
-  const { parseTTL } = require('./authController');
-  const store = getStore?.() || null;
-  if (store) {
-    const refreshTTL = parseTTL?.('JWT_REFRESH_TOKEN_TTL', 30 * 86400) || 30 * 86400;
-    try {
-      const sessions = await store.listUserSessions(user._id.toString());
-      await Promise.all(
-        sessions.map(async ({ sessionId, familyId }) => {
-          if (familyId) await store.revokeFamily(familyId, refreshTTL).catch(() => {});
-          await store.delSession(sessionId).catch(() => {});
-        })
-      );
-    } catch (err) {
-      logger.warn('[UserController] Failed to revoke sessions after password reset', { error: err.message });
-    }
-  }
+  // A password reset is typically performed because the account is compromised:
+  // every pre-existing session and refresh token must be revoked.
+  await revokeAllUserSessions(user._id.toString());
 
   await logAudit({
     schoolId: user.schoolId || 'system',
