@@ -34,6 +34,8 @@ images:
     newTag: sha-PLACEHOLDER
   - name: stellaredupay/frontend
     newTag: sha-PLACEHOLDER
+  - name: stellaredupay/backup-tools
+    newTag: sha-PLACEHOLDER
 
 # Uncomment for private registries:
 # imagePullSecrets:
