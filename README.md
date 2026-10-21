@@ -913,3 +913,8 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 **Built with Stellar blockchain technology**
+
+## Handsoff notes
+
+<!-- handsoff-issue-1755 -->
+- #1755: The poller records suspicious payments as status FAILED — real, received funds become indistinguishable from failed transactions and drop out of review queues and refunds
