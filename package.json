@@ -7,6 +7,7 @@
     "test": "jest --testPathPattern=tests/ --forceExit",
     "coverage": "jest --testPathPattern=tests/ --forceExit --coverage",
     "coverage:frontend": "cd frontend && npm run coverage",
+    "coverage:ratchet": "node scripts/coverage-ratchet.js",
     "test:e2e": "jest tests/e2e/ --forceExit --runInBand --testPathIgnorePatterns=/node_modules/",
     "test:integration": "cross-env RUN_INTEGRATION_TESTS=true jest tests/stellar.integration.test.js --forceExit",
     "test:loadsim": "jest --testPathPattern=tests/loadsim/ --testPathIgnorePatterns=/node_modules/ --forceExit",

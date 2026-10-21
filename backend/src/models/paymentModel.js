@@ -14,12 +14,6 @@ const {
   isTransitionAllowed,
 } = require('../constants/paymentStatus');
 const logger = require('../utils/logger');
-// Student/emailService/reportCacheInvalidator are required lazily inside the
-// post('save') hook below, not hoisted here: emailService pulls in
-// services/email -> config, which throws at require time if MONGO_URI isn't
-// set. paymentModel.js is required by ~30 unrelated modules (and by tests
-// that never touch email), so eagerly loading that chain would make the
-// model unrequireable outside a fully-configured environment.
 
 // ---------------------------------------------------------------------------
 // #1560 — Single authoritative payment lifecycle.

@@ -27,6 +27,8 @@
  * place; it is scoped per school and does not block multi-op transactions.
  */
 
+const VERSION = '035_add_payment_op_index';
+
 const PLACEHOLDER_FILTER = {
   studentId: 'unknown',
   amount: 0,
@@ -34,6 +36,8 @@ const PLACEHOLDER_FILTER = {
 };
 
 module.exports = {
+  version: VERSION,
+
   async up(db) {
     const payments = db.collection('payments');
 
