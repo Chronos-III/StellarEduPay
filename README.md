@@ -4,7 +4,7 @@ A production-grade, multi-tenant school fee payment system built on the Stellar 
 
 [![CI](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml/badge.svg)](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen)](https://nodejs.org/)
 
 ---
 
@@ -196,7 +196,7 @@ StellarEduPay is a three-tier application:
                             │ REST API / SSE
                             ▼
 ┌────────────────────────────────────────────────────────────────┐
-│             Express.js Backend (Node.js 20+)                   │
+│             Express.js Backend (Node.js 24+)                   │
 │  Auth · Payments · Students · Schools · Reports · Webhooks     │
 │  Fee Adjustments · Disputes · Receipts · Audit Logs            │
 └──────────┬─────────────────────────────────┬───────────────────┘
@@ -238,7 +238,7 @@ StellarEduPay is a three-tier application:
 | Layer | Technology |
 |-------|-----------|
 | Blockchain | Stellar Network + Stellar SDK v12 |
-| Backend | Node.js 20+ · Express 4 |
+| Backend | Node.js 24+ · Express 4 |
 | Database | MongoDB 7 (Replica Set) · Mongoose 8 |
 | Queue | BullMQ 5 · Redis 7 |
 | Frontend | Next.js (React) |
@@ -253,7 +253,7 @@ StellarEduPay is a three-tier application:
 
 ### Prerequisites
 
-- **Node.js** ≥ 20 ([download](https://nodejs.org/))
+- **Node.js** ≥ 24 ([download](https://nodejs.org/))
 - **MongoDB 7** running as a **replica set** (required for multi-document transactions)
 - **Redis 7** (required for BullMQ; the service degrades gracefully without it but Redis is recommended for production)
 - **Git**
@@ -467,12 +467,11 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 
 ## API Reference
 
-Full OpenAPI specification is available at `GET /api/docs.json` (or `/api/docs` in development). In production (unless `SWAGGER_ENABLED=true`) `/api/docs.json` requires admin authentication. A static reference is in [`docs/api-spec.md`](docs/api-spec.md).
+The HTTP contract lives in [`backend/openapi.json`](backend/openapi.json), generated from the routers by `node scripts/openapi/generate.js` and enforced in CI (`node scripts/openapi/check-contract.js`). It is served at `GET /api/docs.json` (or `/api/docs` in development). In production (unless `SWAGGER_ENABLED=true`) `/api/docs.json` requires admin authentication. [`docs/api-spec.md`](docs/api-spec.md) has the full endpoint index plus request/response examples; the list below is a summary.
 
 ### Authentication
 
 ```
-POST /api/auth/register    Register a new admin account
 POST /api/auth/login       Login (returns JWT in HttpOnly cookie + response body)
 POST /api/auth/refresh     Refresh access token
 POST /api/auth/logout      Invalidate session
@@ -486,8 +485,8 @@ POST /api/auth/mfa/verify  Verify TOTP code
 POST   /api/schools            Create a school
 GET    /api/schools            List schools
 GET    /api/schools/:id        Get school details
-PUT    /api/schools/:id        Update school
-DELETE /api/schools/:id        Deactivate school
+PATCH  /api/schools/:id        Update school
+DELETE /api/schools/:id        Delete school
 ```
 
 ### Students
@@ -496,7 +495,7 @@ DELETE /api/schools/:id        Deactivate school
 POST   /api/students           Register a student (auto-assigns fee from class)
 GET    /api/students           List students (paginated)
 GET    /api/students/:id       Get student
-PUT    /api/students/:id       Update student
+PATCH  /api/students/:id       Update student
 DELETE /api/students/:id       Soft-delete student
 POST   /api/students/bulk      Bulk import via CSV (respects school quota)
 ```
@@ -520,8 +519,8 @@ GET    /api/payments/pending                   List pending verifications (pagin
 POST   /api/fees               Create a fee structure
 GET    /api/fees               List fee structures
 GET    /api/fees/:className    Get fee for a class
-PUT    /api/fees/:id           Update fee structure
-DELETE /api/fees/:id           Soft-delete fee structure
+PUT    /api/fees/:className    Update fee structure
+DELETE /api/fees/:className    Soft-delete fee structure
 ```
 
 ### Fee Adjustments
@@ -536,9 +535,10 @@ DELETE /api/fee-adjustments/:id        Delete rule
 ### Payment Plans
 
 ```
-POST   /api/payment-plans              Create installment plan
-GET    /api/payment-plans/:studentId   Get plan for student
-PUT    /api/payment-plans/:id          Update plan
+POST   /api/payment-plans/:studentId                              Create installment plan
+GET    /api/payment-plans/:studentId                              Get plan for student
+PATCH  /api/payment-plans/:studentId/installment/:installmentIndex Update an installment
+DELETE /api/payment-plans/:studentId                              Cancel plan
 ```
 
 ### Disputes
@@ -546,7 +546,7 @@ PUT    /api/payment-plans/:id          Update plan
 ```
 POST   /api/disputes           Open a dispute
 GET    /api/disputes           List disputes
-PUT    /api/disputes/:id       Update dispute status
+PATCH  /api/disputes/:id/resolve  Resolve a dispute
 ```
 
 ### Reports
@@ -570,14 +570,14 @@ GET    /api/audit              Paginated audit log with date/actor filters
 ### Reminders
 
 ```
-POST   /api/reminders/send     Trigger payment reminder emails
-GET    /api/reminders          List reminder history
+POST   /api/reminders/trigger  Trigger payment reminder emails
+GET    /api/reminders/preview  Preview who would be reminded
 ```
 
 ### Admin
 
 ```
-GET    /api/admin/retry-queue       Retry queue depth and status
+GET    /api/admin/retry-queue/stats Retry queue depth and status
 POST   /api/admin/log-level         Change log level at runtime
 GET    /api/consistency             Run data consistency check
 ```
@@ -913,3 +913,8 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 **Built with Stellar blockchain technology**
+
+## Handsoff notes
+
+<!-- handsoff-issue-1755 -->
+- #1755: The poller records suspicious payments as status FAILED — real, received funds become indistinguishable from failed transactions and drop out of review queues and refunds

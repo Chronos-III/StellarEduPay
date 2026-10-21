@@ -9,6 +9,7 @@ const logger = require('../utils/logger').child('UserController');
 const { logAudit } = require('../services/auditService');
 const { sendEmail } = require('../services/emailService');
 const { renderEmailTemplate } = require('../services/emailTemplateService');
+const { revokeAllUserSessions } = require('../services/sessionStore');
 
 // ── Password policy ────────────────────────────────────────────────────────────
 const MIN_PASSWORD_LENGTH = 12;
@@ -238,6 +239,11 @@ async function updateUser(req, res) {
     await revokeUserSessions(userId);
   }
 
+  // Deactivating a user must invalidate every existing session and refresh token.
+  if (isActive === false) {
+    await revokeAllUserSessions(userId);
+  }
+
   await logAudit({
     schoolId: user.schoolId || 'system',
     action: 'user_updated',
@@ -265,6 +271,9 @@ async function deleteUser(req, res) {
   await revokeUserSessions(userId);
 
   await User.findByIdAndDelete(userId);
+
+  // Deleting a user must invalidate every existing session and refresh token.
+  await revokeAllUserSessions(userId);
 
   await logAudit({
     schoolId: user.schoolId || 'system',
@@ -498,6 +507,11 @@ async function updateSchoolUser(req, res) {
     await revokeUserSessions(userId);
   }
 
+  // Deactivating a user must invalidate every existing session and refresh token.
+  if (isActive === false) {
+    await revokeAllUserSessions(userId);
+  }
+
   await logAudit({
     schoolId,
     action: 'user_updated',
@@ -668,6 +682,10 @@ async function resetPassword(req, res) {
 
   // Revoke all existing sessions after a password reset.
   await revokeUserSessions(user._id);
+
+  // A password reset is typically performed because the account is compromised:
+  // every pre-existing session and refresh token must be revoked.
+  await revokeAllUserSessions(user._id.toString());
 
   await logAudit({
     schoolId: user.schoolId || 'system',
