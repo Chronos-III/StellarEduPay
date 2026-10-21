@@ -17,7 +17,9 @@ const Student = require('../models/studentModel');
 const School  = require('../models/schoolModel');
 const Payment = require('../models/paymentModel');
 const ReminderLog = require('../models/reminderLogModel');
-const { sendFeeReminder, verifySmtp } = require('./notificationService');
+const { sendFeeReminder, sendSmsReminder, sendWhatsAppReminder, verifySmtp } = require('./notificationService');
+const { isTwilioConfigured } = require('./smsService');
+const emailProvider = require('./email/emailProvider');
 const config = require('../config');
 const logger = require('../utils/logger').child('ReminderService');
 
@@ -31,6 +33,7 @@ let _timer  = null;
 let _running = false;
 let _lastRunAt = null;
 let _lastRunSummary = null;
+let _channelStatus = null;
 
 // Circuit breaker state
 const CIRCUIT_FAILURE_THRESHOLD = 5;
@@ -40,10 +43,22 @@ let _consecutiveFailures = 0;
 let _circuitOpenedAt = null;
 
 /**
- * Check if SMTP is properly configured
+ * Which reminder channels have a configured provider (#1788).
+ *
+ * Email is enabled for any real provider (smtp, ses, sendgrid). The console
+ * provider only logs, so it does not count as a channel that reaches parents.
+ * SMS and WhatsApp are enabled when Twilio is configured.
  */
-function isSmtpConfigured() {
-  return !!(config.SMTP_HOST && config.SMTP_USER && config.SMTP_PASS);
+function getReminderChannelStatus() {
+  const email = emailProvider.resolveProviderName() !== 'console';
+  const sms = isTwilioConfigured();
+  if (email || sms) return { enabled: true, email, sms, reason: null };
+  return {
+    enabled: false,
+    email,
+    sms,
+    reason: 'No email provider (SMTP, SES or SendGrid) or SMS provider (Twilio) is configured',
+  };
 }
 
 /**
@@ -99,15 +114,21 @@ function computeEscalationLevel(student) {
  * Determine whether a student is eligible for a reminder right now.
  * Respects the per-fee-period cap so a perpetually-unpaid fee does not
  * generate endless reminders across academic years.
+ *
+ * A student is eligible if they have at least one contact channel configured
+ * (email or phone) and are not opted out.
  */
 function isEligible(student, school) {
   if (student.feePaid)          return false;
-  if (!student.parentEmail)           return false;
-  if (student.reminderOptOut)         return false;
-  if (student.parentEmailSuppressed)  return false;
+  if (student.reminderOptOut)   return false;
   // Pause all automated reminders while a dispute is active on this student's payment.
-  if (student.disputeHold)            return false;
+  if (student.disputeHold)      return false;
   if (student.reminderCount >= REMINDER_MAX_COUNT) return false;
+
+  // Must have at least one contact channel
+  const hasEmail = student.parentEmail && !student.parentEmailSuppressed;
+  const hasPhone = student.parentPhone && isTwilioConfigured();
+  if (!hasEmail && !hasPhone) return false;
 
   // Scope reminder count to the current fee period.
   // Reset tracking when period changes so each term/year starts fresh.
@@ -139,21 +160,82 @@ function computeWindowStart(timezone) {
 }
 
 /**
+ * Determine which reminder channels to use for this student and school.
+ * Returns an object with { email: boolean, sms: boolean, whatsapp: boolean }
+ *
+ * Respects school-level settings:
+ *   - school.settings.reminderChannels.default — 'email', 'sms', 'whatsapp', or 'both'
+ *     (default: 'email')
+ *
+ * Always checks channel availability (email configured, phone set, Twilio configured).
+ */
+function determineReminderChannels(student, school) {
+  const defaults = { email: true, sms: false, whatsapp: false };
+
+  const hasEmail = student.parentEmail && !student.parentEmailSuppressed;
+  const hasPhone = student.parentPhone && isTwilioConfigured();
+
+  // Get school preference
+  const channelPref = (school.settings && school.settings.reminderChannels?.default) || 'email';
+
+  const channels = { ...defaults };
+
+  switch (channelPref) {
+    case 'email':
+      channels.email = hasEmail;
+      channels.sms = false;
+      channels.whatsapp = false;
+      break;
+    case 'sms':
+      channels.email = false;
+      channels.sms = hasPhone;
+      channels.whatsapp = false;
+      break;
+    case 'whatsapp':
+      channels.email = false;
+      channels.sms = false;
+      channels.whatsapp = hasPhone;
+      break;
+    case 'email-sms':
+    case 'both':
+      channels.email = hasEmail;
+      channels.sms = hasPhone;
+      channels.whatsapp = false;
+      break;
+    default:
+      channels.email = hasEmail;
+  }
+
+  // Phone-only parents (#1788): when the preferred channel cannot reach them, fall
+  // back to SMS so they are not silently skipped.
+  if (!channels.email && !channels.sms && !channels.whatsapp && hasPhone) {
+    channels.sms = true;
+  }
+
+  return channels;
+}
+
+/**
  * Process all active schools and send reminders for eligible students.
  * Returns a summary object for logging / API response.
  */
 async function processReminders() {
-  // Skip if SMTP is not configured
-  if (!isSmtpConfigured()) {
-    logger.warn('SMTP not configured — skipping reminder run');
-    return { schools: 0, eligible: 0, sent: 0, failed: 0, skipped: 0, smtpNotConfigured: true };
+  // Skip when no channel can reach a parent. Surfaced on /health via getReminderStatus().
+  const channelStatus = getReminderChannelStatus();
+  _channelStatus = channelStatus;
+  if (!channelStatus.enabled) {
+    logger.warn('No reminder channel configured — skipping reminder run', { reason: channelStatus.reason });
+    return { schools: 0, eligible: 0, sent: 0, failed: 0, skipped: 0, channelsNotConfigured: true, reason: channelStatus.reason };
   }
 
-  // Verify SMTP connectivity before processing any students
-  const smtpCheck = await verifySmtp();
-  if (!smtpCheck.ok) {
-    logger.error('SMTP verification failed — aborting reminder run to prevent quota consumption', { error: smtpCheck.error });
-    return { schools: 0, eligible: 0, sent: 0, failed: 0, skipped: 0, smtpVerifyFailed: true, smtpError: smtpCheck.error };
+  // Verify the email provider's connectivity before processing any students.
+  // Only needed when email is a channel; SMS-only schools skip it.
+  if (channelStatus.email) {
+    const emailCheck = await verifySmtp();
+    if (!emailCheck.ok) {
+      logger.error('Email provider verification failed — aborting reminder run to prevent quota consumption', { error: emailCheck.error });
+      return { schools: 0, eligible: 0, sent: 0, failed: 0, skipped: 0, smtpVerifyFailed: true, smtpError: emailCheck.error };
+    }
   }
 
   const summary = { schools: 0, eligible: 0, sent: 0, failed: 0, skipped: 0 };
@@ -179,11 +261,15 @@ async function processReminders() {
       continue;
     }
 
-    // Fetch all unpaid students in this school that have a parent email
+    // Fetch unpaid students with at least one contact the enabled channels can reach.
+    // determineReminderChannels decides which channel is used per student.
+    const contactClauses = [];
+    if (channelStatus.email) contactClauses.push({ parentEmail: { $ne: null, $exists: true } });
+    if (channelStatus.sms) contactClauses.push({ parentPhone: { $ne: null, $exists: true } });
     const unpaidStudents = await Student.find({
       schoolId:    school.schoolId,
       feePaid:     false,
-      parentEmail: { $ne: null, $exists: true },
+      $or:         contactClauses,
       reminderOptOut: { $ne: true },
     });
 
@@ -245,9 +331,10 @@ async function processReminders() {
 
         const escalationLevel = computeEscalationLevel(student);
         const currentPeriod = school.settings?.currentFeePeriod || student.academicYear;
+        const channels = determineReminderChannels(student, school);
+        const reminderCount = (student.reminderCount || 0) + 1;
 
-        const result = await sendFeeReminder({
-          to:               student.parentEmail,
+        const commonOpts = {
           studentName:      student.name,
           studentId:        student.studentId,
           schoolId:         school.schoolId,
@@ -255,13 +342,43 @@ async function processReminders() {
           feeAmount:        student.feeAmount,
           remainingBalance,
           schoolName:       school.name,
-          reminderCount:    (student.reminderCount || 0) + 1,
+          reminderCount,
           escalationLevel,
           paymentDeadline:  student.paymentDeadline,
-        });
+        };
 
-        // Only update tracking fields if email was actually sent
-        if (result.sent) {
+        const sentChannels = [];
+        let anyChannelSent = false;
+
+        // Send email
+        if (channels.email) {
+          const result = await sendFeeReminder({ ...commonOpts, to: student.parentEmail });
+          if (result.sent) {
+            sentChannels.push('email');
+            anyChannelSent = true;
+          }
+        }
+
+        // Send SMS
+        if (channels.sms) {
+          const result = await sendSmsReminder({ ...commonOpts, to: student.parentPhone });
+          if (result.sent) {
+            sentChannels.push('sms');
+            anyChannelSent = true;
+          }
+        }
+
+        // Send WhatsApp
+        if (channels.whatsapp) {
+          const result = await sendWhatsAppReminder({ ...commonOpts, to: student.parentPhone });
+          if (result.sent) {
+            sentChannels.push('whatsapp');
+            anyChannelSent = true;
+          }
+        }
+
+        // Only update tracking fields if at least one channel sent successfully
+        if (anyChannelSent) {
           const updateFields = {
             $set: {
               lastReminderSentAt: new Date(),
@@ -270,25 +387,24 @@ async function processReminders() {
             $inc: { reminderCount: 1 },
           };
           await Promise.all([
-            Student.findByIdAndUpdate(student._id, updateFields),
+            Student.findOneAndUpdate({ _id: student._id, schoolId: school.schoolId }, updateFields),
             ReminderLog.updateOne(
               { schoolId: school.schoolId, studentId: student.studentId, windowStart },
-              { $set: { status: 'sent', sentAt: new Date(), escalationLevel } }
+              { $set: { status: 'sent', sentAt: new Date(), escalationLevel, channels: sentChannels } }
             ),
           ]);
           summary.sent++;
           // Successful send — reset circuit
           if (_circuitState !== 'closed') {
             _circuitState = 'closed';
-            logger.warn('Circuit closed — email provider recovered');
+            logger.warn('Circuit closed — provider recovered');
           }
           _consecutiveFailures = 0;
         } else {
-          // Email wasn't sent (dev mode / no SMTP) — keep the idempotency
-          // record so the same student isn't skipped on the next tick.
+          // No channel sent — keep the idempotency record so the same student isn't skipped on the next tick.
           await ReminderLog.updateOne(
             { schoolId: school.schoolId, studentId: student.studentId, windowStart },
-            { $set: { status: 'skipped' } }
+            { $set: { status: 'skipped', channels: [] } }
           );
           summary.skipped++;
         }
@@ -341,18 +457,31 @@ async function runReminders() {
     logger.error('Reminder run failed', { error: err.message });
   } finally {
     _running = false;
+    // Ping heartbeat after every tick (success or error) so liveness checks can
+    // confirm the scheduler loop is still alive.
+    try {
+      const { ping, WORKER_NAMES } = require('./workerHeartbeat');
+      ping(WORKER_NAMES.REMINDER_SCHEDULER);
+    } catch (_) { /* non-critical */ }
   }
 }
 
 function startReminderScheduler() {
   if (_timer) return;
   
-  if (!isSmtpConfigured()) {
-    logger.warn('SMTP not configured — reminder scheduler will not start. Set SMTP_HOST, SMTP_USER, SMTP_PASS to enable.');
+  const channelStatus = getReminderChannelStatus();
+  _channelStatus = channelStatus;
+  if (!channelStatus.enabled) {
+    logger.warn(`Reminder scheduler will not start — ${channelStatus.reason}.`);
     return;
   }
   
   logger.info(`Starting — interval: ${REMINDER_INTERVAL_MS}ms, cooldown: ${REMINDER_COOLDOWN_HOURS}h, maxCount: ${REMINDER_MAX_COUNT}`);
+
+  try {
+    const { markStarted, WORKER_NAMES } = require('./workerHeartbeat');
+    markStarted(WORKER_NAMES.REMINDER_SCHEDULER);
+  } catch (_) { /* non-critical */ }
 
   // Run once immediately so we don't wait a full interval on startup.
   // Each school's send window gate prevents blasting outside local hours.
@@ -366,12 +495,19 @@ function stopReminderScheduler() {
   if (_timer) {
     clearInterval(_timer);
     _timer = null;
+    try {
+      const { markStopped, WORKER_NAMES } = require('./workerHeartbeat');
+      markStopped(WORKER_NAMES.REMINDER_SCHEDULER);
+    } catch (_) { /* non-critical */ }
     logger.info('Stopped');
   }
 }
 
 function getReminderStatus() {
+  const channels = _channelStatus || getReminderChannelStatus();
   return {
+    enabled: channels.enabled,
+    reason: channels.reason,
     schedulerRunning: _timer !== null,
     lastRunAt: _lastRunAt,
     lastRunSummary: _lastRunSummary,
@@ -380,4 +516,4 @@ function getReminderStatus() {
   };
 }
 
-module.exports = { startReminderScheduler, stopReminderScheduler, processReminders, getReminderStatus };
+module.exports = { startReminderScheduler, stopReminderScheduler, processReminders, getReminderStatus, getReminderChannelStatus };

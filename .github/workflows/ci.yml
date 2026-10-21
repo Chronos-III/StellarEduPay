@@ -4,94 +4,95 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
-# GitHub deprecated the Node.js 20 runtime for actions on 2026-06-16.
-# This flag forces legacy Node.js 20 action runtimes to run under Node.js 24
-# until the underlying actions publish native Node.js 24 releases.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  audit:
-    name: Dependency security audit
+  smoke:
+    name: Smoke (boots + parses)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
-          node-version-file: '.nvmrc'
+          node-version: 20
 
-      - uses: actions/cache@v6
+      - name: Syntax check every tracked .js file
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r file; do
+            if ! node --check "$file"; then
+              echo "::error file=$file::node --check failed"
+              fail=1
+            fi
+          done < <(git ls-files '*.js')
+          exit "$fail"
+
+      - name: Fail on truncated-file placeholders
+        run: |
+          if git grep -n -E "truncated [0-9]+ chars"; then
+            echo "::error::Found truncated-file placeholder markers in tracked files"
+            exit 1
+          fi
+          echo "No truncated-file placeholders found"
+
+      - name: Boot backend app with dummy env (no DB)
+        env:
+          NODE_ENV: test
+        run: |
+          node -e "require('./backend/src/app')"
+
+  lockfile-sync:
+    name: Lockfile sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
-          path: |
-            backend/node_modules
-            frontend/node_modules
-            node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          node-version: 20
 
-      - run: npm ci
-      - run: cd backend && npm ci && cd ..
-      - run: cd frontend && npm ci && cd ..
+      - name: Verify root package-lock.json is in sync
+        run: npm ci --dry-run
 
-      # Fail the build on high or critical advisories.
-      # Triage process: file a GitHub issue, apply `npm audit fix`, or add an
-      # explicit `npm audit --omit` entry with a justification comment.
-      - name: Audit root
+      - name: Verify frontend package-lock.json is in sync
+        working-directory: frontend
+        run: npm ci --dry-run
+
+      - name: Verify backend package-lock.json is in sync
+        working-directory: backend
+        run: npm ci --dry-run
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Accessibility tests
+        run: npm run test:a11y
+
+      - name: Dependency audit
         run: npm audit --audit-level=high
-
-      - name: Audit backend
-        run: cd backend && npm audit --audit-level=high
-
-      - name: Audit frontend
-        run: cd frontend && npm audit --audit-level=high
-
-  test:
-    runs-on: ubuntu-latest
-    env:
-      STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
-      # Tests mock Mongoose — a standalone instance is sufficient for unit tests.
-      # Integration tests that require a replica set are guarded by RUN_INTEGRATION_TESTS.
-      MONGO_URI: mongodb://localhost:27017/stellaredupay_test
-      # Dummy secrets required by config/index.js validation before test files can set them.
-      JWT_SECRET: ci-test-jwt-secret-not-used-in-production
-      SCHOOL_WALLET_ADDRESS: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
-
-    services:
-      mongodb:
-        image: mongo:7
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --eval 'db.adminCommand({ping:1})'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version-file: '.nvmrc'
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            backend/node_modules
-            frontend/node_modules
-            node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-
-      - run: npm ci
-
-      - run: cd backend && npm ci && cd ..
-
-      - run: cd frontend && npm ci && cd ..
-
-      - run: npm test

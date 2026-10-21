@@ -1,19 +1,37 @@
 'use strict';
 
-const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const WebhookEndpoint = require('../models/webhookEndpointModel');
-const { WEBHOOK_EVENTS } = require('../models/webhookEndpointModel');
+const { WEBHOOK_EVENTS, SIGNATURE_VERSIONS, DEFAULT_SIGNATURE_VERSIONS } = require('../models/webhookEndpointModel');
+const { generateWebhookSecret, validateWebhookSecretStrength } = require('../utils/webhookSecretPolicy');
 const WebhookDelivery = require('../models/webhookDeliveryModel');
 const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 const { logAudit } = require('../services/auditService');
-const { fireWebhook } = require('../services/webhookService');
+const { fireWebhook, sendTestDelivery } = require('../services/webhookService');
+const { parseOverlapSeconds, applySecretRotation } = require('../services/webhookEndpointService');
 const logger = require('../utils/logger').child('WebhookEndpointsController');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function _generateSecret() {
-  return crypto.randomBytes(32).toString('hex');
+/**
+ * Validate a caller-supplied signatureVersions array (#1539).
+ * Must be a non-empty subset of SIGNATURE_VERSIONS and always include 'v2' —
+ * the deprecated V1 signature can only be received alongside V2.
+ *
+ * @returns {string|null} error message, or null when valid
+ */
+function _validateSignatureVersions(versions) {
+  if (!Array.isArray(versions) || versions.length === 0) {
+    return 'signatureVersions must be a non-empty array';
+  }
+  const invalid = versions.filter((v) => !SIGNATURE_VERSIONS.includes(v));
+  if (invalid.length > 0) {
+    return `Unknown signature versions: ${invalid.join(', ')}. Valid versions: ${SIGNATURE_VERSIONS.join(', ')}`;
+  }
+  if (!versions.includes('v2')) {
+    return "signatureVersions must include 'v2'";
+  }
+  return null;
 }
 
 function _callerSchoolId(req) {
@@ -31,7 +49,7 @@ async function createEndpoint(req, res, next) {
     const schoolId = _callerSchoolId(req);
     if (!schoolId) return res.status(400).json({ error: 'schoolId required', code: 'MISSING_SCHOOL_ID' });
 
-    const { url, secret, subscribedEvents, isActive = true, description } = req.body;
+    const { url, secret, subscribedEvents, isActive = true, description, signatureVersions } = req.body;
 
     if (!url) return res.status(400).json({ error: 'url is required', code: 'VALIDATION_ERROR' });
     if (!subscribedEvents || !Array.isArray(subscribedEvents) || subscribedEvents.length === 0) {
@@ -47,6 +65,20 @@ async function createEndpoint(req, res, next) {
       });
     }
 
+    // #1538: reject weak caller-supplied secrets; generate one otherwise.
+    if (secret !== undefined && secret !== null && secret !== '') {
+      const strength = validateWebhookSecretStrength(secret);
+      if (!strength.valid) {
+        return res.status(400).json({ error: strength.reason, code: 'WEAK_WEBHOOK_SECRET' });
+      }
+    }
+
+    // #1539: new endpoints receive only the V2 signature unless they ask otherwise.
+    if (signatureVersions !== undefined) {
+      const versionError = _validateSignatureVersions(signatureVersions);
+      if (versionError) return res.status(400).json({ error: versionError, code: 'VALIDATION_ERROR' });
+    }
+
     // SSRF validation
     const urlCheck = await validateWebhookUrl(url);
     if (!urlCheck.valid) {
@@ -56,12 +88,13 @@ async function createEndpoint(req, res, next) {
       });
     }
 
-    const endpointSecret = secret || _generateSecret();
+    const endpointSecret = secret || generateWebhookSecret();
 
     const endpoint = await WebhookEndpoint.create({
       schoolId,
       url,
       secret: endpointSecret,
+      signatureVersions: signatureVersions ? [...new Set(signatureVersions)] : [...DEFAULT_SIGNATURE_VERSIONS],
       subscribedEvents,
       isActive: Boolean(isActive),
       description: description || null,
@@ -74,7 +107,7 @@ async function createEndpoint(req, res, next) {
       performedBy: _performedBy(req),
       targetId: String(endpoint._id),
       targetType: 'school',
-      details: { url, subscribedEvents, isActive },
+      details: { url, subscribedEvents, isActive, signatureVersions: endpoint.signatureVersions },
     });
 
     // Return the secret once on creation; it is stripped from all subsequent reads.
@@ -103,11 +136,14 @@ async function listEndpoints(req, res, next) {
 async function getEndpoint(req, res, next) {
   try {
     const schoolId = _callerSchoolId(req);
-    const endpoint = await WebhookEndpoint.findById(req.params.id).lean();
+    // Scope the query to the caller's schoolId so cross-tenant IDs produce the
+    // same 404 as non-existent IDs — eliminating the existence side-channel
+    // that a prior 403 vs 404 divergence would reveal. (#1179)
+    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).lean();
     if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
-    if (endpoint.schoolId !== schoolId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
     // secret is stripped by toJSON transform; lean() bypasses that — strip manually
     delete endpoint.secret;
+    delete endpoint.previousSecret;
     return res.json(endpoint);
   } catch (err) {
     next(err);
@@ -118,11 +154,13 @@ async function getEndpoint(req, res, next) {
 async function updateEndpoint(req, res, next) {
   try {
     const schoolId = _callerSchoolId(req);
-    const endpoint = await WebhookEndpoint.findById(req.params.id);
+    // Scope the query to the caller's schoolId — cross-tenant IDs and missing
+    // IDs both return 404, removing the existence side-channel. (#1179)
+    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).select('+secret +previousSecret');
     if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
-    if (endpoint.schoolId !== schoolId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
 
-    const { url, secret, subscribedEvents, isActive, description } = req.body;
+    const { url, secret, subscribedEvents, isActive, description, signatureVersions, overlapSeconds } = req.body;
+    let secretOverlapSeconds = null;
 
     if (url !== undefined) {
       const urlCheck = await validateWebhookUrl(url);
@@ -131,7 +169,28 @@ async function updateEndpoint(req, res, next) {
       }
       endpoint.url = url;
     }
-    if (secret !== undefined) endpoint.secret = secret;
+    if (secret !== undefined) {
+      // #1538: same strength policy as on creation.
+      const strength = validateWebhookSecretStrength(secret);
+      if (!strength.valid) {
+        return res.status(400).json({ error: strength.reason, code: 'WEAK_WEBHOOK_SECRET' });
+      }
+      // #1639: a caller-supplied secret no longer switches instantly — the old
+      // secret keeps co-signing for the overlap window (default
+      // WEBHOOK_SECRET_ROTATION_OVERLAP_S; pass overlapSeconds: 0 to switch
+      // immediately). Prefer POST /:id/rotate-secret, which also generates a
+      // strong secret server-side.
+      const overlap = parseOverlapSeconds(overlapSeconds);
+      if (!overlap.ok) return res.status(400).json({ error: overlap.error, code: 'VALIDATION_ERROR' });
+      secretOverlapSeconds = overlap.value;
+      applySecretRotation(endpoint, secret, secretOverlapSeconds);
+    }
+    if (signatureVersions !== undefined) {
+      // #1539: lets integrators that have migrated to V2 drop V1 early.
+      const versionError = _validateSignatureVersions(signatureVersions);
+      if (versionError) return res.status(400).json({ error: versionError, code: 'VALIDATION_ERROR' });
+      endpoint.signatureVersions = [...new Set(signatureVersions)];
+    }
     if (subscribedEvents !== undefined) {
       if (!Array.isArray(subscribedEvents) || subscribedEvents.length === 0) {
         return res.status(400).json({ error: 'subscribedEvents must be a non-empty array', code: 'VALIDATION_ERROR' });
@@ -153,7 +212,17 @@ async function updateEndpoint(req, res, next) {
       performedBy: _performedBy(req),
       targetId: String(endpoint._id),
       targetType: 'school',
-      details: { url: endpoint.url, subscribedEvents: endpoint.subscribedEvents, isActive: endpoint.isActive },
+      details: {
+        url: endpoint.url,
+        subscribedEvents: endpoint.subscribedEvents,
+        isActive: endpoint.isActive,
+        signatureVersions: endpoint.signatureVersions,
+        secretChanged: secret !== undefined,
+        ...(secret !== undefined ? {
+          overlapSeconds: secretOverlapSeconds,
+          previousSecretExpiresAt: endpoint.previousSecretExpiresAt,
+        } : {}),
+      },
     });
 
     const obj = endpoint.toJSON(); // secret stripped
@@ -163,13 +232,61 @@ async function updateEndpoint(req, res, next) {
   }
 }
 
+// ── POST /api/webhook-endpoints/:id/rotate-secret ────────────────────────────
+/**
+ * Rotate an endpoint's signing secret (#1538, #1639).
+ *
+ * A new secret is always generated server-side and returned exactly once.
+ * For `overlapSeconds` (default WEBHOOK_SECRET_ROTATION_OVERLAP_S = 24h,
+ * max 7 days, 0 = no overlap) deliveries are signed with both secrets: the
+ * X-StellarEduPay-Signature-V2 header carries two comma-separated values
+ * (new first), and X-StellarEduPay-Signature-V2-Previous carries the old one.
+ * Receivers can therefore deploy the new secret without dropping events. The
+ * old secret is discarded once the window closes (webhookRetryScheduler).
+ */
+async function rotateSecret(req, res, next) {
+  try {
+    const schoolId = _callerSchoolId(req);
+    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).select('+secret +previousSecret');
+    if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
+
+    const overlap = parseOverlapSeconds(req.body ? req.body.overlapSeconds : undefined);
+    if (!overlap.ok) return res.status(400).json({ error: overlap.error, code: 'VALIDATION_ERROR' });
+    const overlapSeconds = overlap.value;
+
+    const newSecret = generateWebhookSecret();
+    applySecretRotation(endpoint, newSecret, overlapSeconds);
+    await endpoint.save();
+
+    await logAudit({
+      schoolId,
+      action: 'webhook_endpoint_secret_rotated',
+      performedBy: _performedBy(req),
+      targetId: String(endpoint._id),
+      targetType: 'school',
+      details: { overlapSeconds, previousSecretExpiresAt: endpoint.previousSecretExpiresAt },
+    });
+
+    // The new secret is returned once; it is stripped from all subsequent reads.
+    return res.json({
+      id: String(endpoint._id),
+      secret: newSecret,
+      secretRotatedAt: endpoint.secretRotatedAt,
+      previousSecretExpiresAt: endpoint.previousSecretExpiresAt,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ── DELETE /api/webhook-endpoints/:id ────────────────────────────────────────
 async function deleteEndpoint(req, res, next) {
   try {
     const schoolId = _callerSchoolId(req);
-    const endpoint = await WebhookEndpoint.findById(req.params.id);
+    // Scope the query to the caller's schoolId — cross-tenant IDs and missing
+    // IDs both return 404, removing the existence side-channel. (#1179)
+    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId });
     if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
-    if (endpoint.schoolId !== schoolId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
 
     await WebhookEndpoint.deleteOne({ _id: endpoint._id });
 
@@ -214,6 +331,50 @@ async function listDeliveries(req, res, next) {
   }
 }
 
+// ── POST /api/webhook-endpoints/:id/test ──────────────────────────────────────
+/**
+ * Send a signed `webhook.test` event with sample data to the endpoint through
+ * the normal signing/delivery path and return the receiver's status code and
+ * latency (#1639). Works for inactive endpoints too, so a receiver can be
+ * verified before the endpoint is switched on. A failed test is not retried.
+ */
+async function sendTestEvent(req, res, next) {
+  try {
+    const schoolId = _callerSchoolId(req);
+    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).select('+secret +previousSecret');
+    if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
+
+    const result = await sendTestDelivery(endpoint);
+
+    await logAudit({
+      schoolId,
+      action: 'webhook_test_sent',
+      performedBy: _performedBy(req),
+      targetId: String(endpoint._id),
+      targetType: 'school',
+      details: {
+        deliveryId: result.deliveryId,
+        event: result.event,
+        success: result.success,
+        statusCode: result.statusCode,
+        durationMs: result.durationMs,
+        error: result.error,
+      },
+    });
+
+    return res.json({
+      success: result.success,
+      event: result.event,
+      deliveryId: result.deliveryId,
+      statusCode: result.statusCode,
+      latencyMs: result.durationMs,
+      error: result.error,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ── POST /api/webhook-deliveries/:id/replay ───────────────────────────────────
 async function replayDelivery(req, res, next) {
   try {
@@ -223,7 +384,7 @@ async function replayDelivery(req, res, next) {
     if (delivery.schoolId !== schoolId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
 
     // Fetch the endpoint to get current URL + secret
-    const endpoint = await WebhookEndpoint.findById(delivery.endpointId);
+    const endpoint = await WebhookEndpoint.findOne({ _id: delivery.endpointId, schoolId }).select('+secret');
     if (!endpoint) return res.status(404).json({ error: 'Associated endpoint not found', code: 'NOT_FOUND' });
 
     const newDeliveryId = uuidv4();
@@ -259,6 +420,8 @@ module.exports = {
   getEndpoint,
   updateEndpoint,
   deleteEndpoint,
+  rotateSecret,
+  sendTestEvent,
   listDeliveries,
   replayDelivery,
 };

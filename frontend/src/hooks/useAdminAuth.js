@@ -1,36 +1,170 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/router';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+import { apiUrl } from '../config/apiBase';
+
+// Maximum number of /auth/me retry attempts after the initial failure.
+const AUTH_ME_MAX_RETRIES = 3;
+// Base delay in ms for exponential backoff (1 s, 2 s, 4 s).
+const AUTH_ME_RETRY_BASE_MS = 1000;
+
+/**
+ * Fetch /auth/me with automatic exponential-backoff retry.
+ *
+ * Resolves with the parsed JSON on success, or rejects after all attempts
+ * have been exhausted.  A 401 response is treated as a permanent auth
+ * failure and is not retried (retrying would be pointless without fresh
+ * credentials).  A 403 is *not* treated as unauthenticated: /auth/me is
+ * available to every authenticated role, so a 403 is a transient/backend
+ * condition and is retried like any other error.
+ *
+ * @param {number} [maxRetries]
+ * @returns {Promise<object>}
+ */
+async function fetchAuthMe(maxRetries = AUTH_ME_MAX_RETRIES) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      // Exponential backoff: 1 s, 2 s, 4 s, …
+      await new Promise((resolve) =>
+        setTimeout(resolve, AUTH_ME_RETRY_BASE_MS * Math.pow(2, attempt - 1))
+      );
+    }
+    try {
+      const r = await fetch(apiUrl('/auth/me'), { credentials: 'include' });
+      if (r.ok) return r.json();
+      // 401 → not authenticated; no point retrying.
+      if (r.status === 401) {
+        throw Object.assign(new Error('Not authenticated'), { permanent: true });
+      }
+      // 403 / 5xx / other errors — record and retry.
+      lastError = new Error(`/auth/me responded with ${r.status}`);
+    } catch (err) {
+      if (err.permanent) throw err;
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
 
 export function useAdminAuth() {
   const router = useRouter();
   const [isAdmin, setIsAdmin] = useState(false);
+  const [schoolId, setSchoolId] = useState(null);
+  const [userId, setUserId] = useState(null);
+  // #1581 — roles from /auth/me drive role-based UI permissions (utils/permissions.js).
+  const [roles, setRoles] = useState([]);
   const [checked, setChecked] = useState(false);
+  // #1218 — surfaces a recoverable auth-me failure so consuming pages can
+  // render a "Retry" affordance instead of silently breaking.
+  const [authMeError, setAuthMeError] = useState(false);
 
-  // Verify auth state by pinging a protected endpoint — the HttpOnly cookie is
-  // sent automatically by the browser; we never touch it from JS.
+  // Tracks whether the component is still mounted so async callbacks don't
+  // update state after unmount.
+  const mountedRef = useRef(true);
   useEffect(() => {
-    fetch(`${API_URL}/auth/me`, { credentials: 'include' })
-      .then((r) => setIsAdmin(r.ok))
-      .catch(() => setIsAdmin(false))
-      .finally(() => setChecked(true));
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
   }, []);
+
+  /**
+   * Apply a successful /auth/me response to state and localStorage.
+   */
+  const applyAuthData = useCallback((data) => {
+    if (!mountedRef.current) return;
+    setIsAdmin(true);
+    setSchoolId(data.schoolId || null);
+    setUserId(data.userId || null);
+    setRoles(Array.isArray(data.roles) ? data.roles : []);
+    setAuthMeError(false);
+    if (typeof window !== 'undefined') {
+      // Persist (or clear) the school context so the axios interceptor sends
+      // the correct X-School-ID header for school-scoped requests.
+      if (data.schoolId) localStorage.setItem('schoolId', data.schoolId);
+      else localStorage.removeItem('schoolId');
+      if (data.userId) localStorage.setItem('userId', data.userId);
+      else localStorage.removeItem('userId');
+    }
+  }, []);
+
+  // Fetch user context from /auth/me on mount — includes schoolId from authenticated session.
+  // The HttpOnly cookie is sent automatically by the browser; we never touch it from JS.
+  useEffect(() => {
+    fetchAuthMe()
+      .then((data) => {
+        applyAuthData(data);
+      })
+      .catch(() => {
+        if (!mountedRef.current) return;
+        setIsAdmin(false);
+        setSchoolId(null);
+        setUserId(null);
+        setRoles([]);
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('schoolId');
+          localStorage.removeItem('userId');
+        }
+      })
+      .finally(() => {
+        if (mountedRef.current) setChecked(true);
+      });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const login = useCallback(() => {
     // Called after a successful POST /auth/login — the cookie is already set.
-    setIsAdmin(true);
-  }, []);
+    // Fetch user context with retry so a transient network blip right after
+    // login doesn't permanently strand the admin with schoolId: null.
+    setAuthMeError(false);
+    fetchAuthMe()
+      .then((data) => {
+        applyAuthData(data);
+      })
+      .catch(() => {
+        if (!mountedRef.current) return;
+        // Mark admin as logged in (the login POST succeeded) but signal that
+        // /auth/me context could not be loaded so the UI can offer a retry.
+        setIsAdmin(true);
+        setSchoolId(null);
+        setUserId(null);
+        setRoles([]);
+        setAuthMeError(true);
+      });
+  }, [applyAuthData]);
+
+  /**
+   * Manual retry for /auth/me — call this from a "Retry" button in any page
+   * that renders an error state when schoolId is null after login.
+   */
+  const retryAuth = useCallback(() => {
+    setAuthMeError(false);
+    fetchAuthMe()
+      .then((data) => {
+        applyAuthData(data);
+      })
+      .catch(() => {
+        if (!mountedRef.current) return;
+        setAuthMeError(true);
+      });
+  }, [applyAuthData]);
 
   const logout = useCallback(async () => {
-    await fetch(`${API_URL}/auth/logout`, {
+    await fetch(apiUrl('/auth/logout'), {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
     }).catch(() => console.debug('[useAdminAuth] logout request failed'));
     setIsAdmin(false);
+    setSchoolId(null);
+    setUserId(null);
+    setRoles([]);
+    setAuthMeError(false);
+    // Clear school context from storage
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('schoolId');
+      localStorage.removeItem('userId');
+    }
     router.push('/login');
   }, [router]);
 
-  return { isAdmin, checked, login, logout };
+  return { isAdmin, checked, login, logout, schoolId, userId, roles, authMeError, retryAuth };
 }

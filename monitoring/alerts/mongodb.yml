@@ -1,0 +1,41 @@
+groups:
+  - name: mongodb
+    interval: 60s
+    rules:
+      # ── Critical: not connected to MongoDB ────────────────────────────────
+      # mongodb_connection_state mirrors mongoose.connection.readyState
+      # (1=connected) on every scrape. Every payment read/write depends on
+      # this connection, so any sustained non-connected state is a full
+      # outage of the payment-processing path, not a degradation.
+      - alert: MongoDBDisconnected
+        expr: mongodb_connection_state != 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoDB is not connected"
+          description: >
+            mongodb_connection_state has been away from "connected" (1) for
+            over a minute (current value: {{ $value }}; 0=disconnected,
+            2=connecting, 3=disconnecting). Payment reads and writes are
+            failing. Check MongoDB Atlas/replica-set health and network
+            connectivity from the backend.
+
+      # ── Warning: driver reporting connection errors ───────────────────────
+      # mongodb_connection_errors_total increments on every 'error' event from
+      # the driver (config/database.js). The driver retries transparently for
+      # many of these, so a low sustained rate is worth investigating before
+      # it escalates into MongoDBDisconnected.
+      - alert: MongoDBConnectionErrorsElevated
+        expr: rate(mongodb_connection_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MongoDB connection errors are occurring"
+          description: >
+            The MongoDB driver has reported connection errors for 5 minutes
+            ({{ $value | printf "%.3f" }}/s). The connection pool may be
+            unstable even though mongodb_connection_state still reads
+            "connected". Check application logs for "[MongoDB] Connection
+            error" entries.

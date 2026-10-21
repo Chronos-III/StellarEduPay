@@ -130,9 +130,49 @@ async function updateRule(req, res, next) {
   }
 }
 
+// GET /api/fee-adjustments/:id/affected-count
+// Number of currently active students matching the rule's cohort conditions,
+// shown in the deletion confirmation prompt so admins can see the blast radius.
+async function getAffectedCount(req, res, next) {
+  try {
+    const rule = await FeeAdjustmentRule.findOne({ _id: req.params.id, schoolId: req.schoolId }).lean();
+    if (!rule) {
+      const err = new Error('Fee adjustment rule not found');
+      err.code = 'NOT_FOUND';
+      err.status = 404;
+      return next(err);
+    }
+
+    const affectedCount = await countAffectedStudents(req.schoolId, rule);
+    res.json({ affectedCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function countAffectedStudents(schoolId, rule) {
+  const studentFilter = { schoolId, deletedAt: null };
+  const conditions = rule.conditions || {};
+  if (conditions.studentClass && conditions.studentClass.length > 0) {
+    studentFilter.class = { $in: conditions.studentClass };
+  }
+  if (conditions.academicYear) {
+    studentFilter.academicYear = conditions.academicYear;
+  }
+  return Student.countDocuments(studentFilter);
+}
+
 // DELETE /api/fee-adjustments/:id  — soft delete (deactivate)
 async function deleteRule(req, res, next) {
   try {
+    const reasonTrimmed = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+    if (!reasonTrimmed) {
+      const err = new Error('A reason is required to deactivate a fee adjustment rule');
+      err.code = 'VALIDATION_ERROR';
+      err.status = 400;
+      return next(err);
+    }
+
     const rule = await FeeAdjustmentRule.findOneAndUpdate(
       { _id: req.params.id, schoolId: req.schoolId },
       { isActive: false },
@@ -146,10 +186,12 @@ async function deleteRule(req, res, next) {
       return next(err);
     }
 
+    const affectedCount = await countAffectedStudents(req.schoolId, rule);
+
     await audit(req, 'fee_adjustment_rule_delete', String(rule._id), {
-      name: rule.name, type: rule.type, value: rule.value,
+      name: rule.name, type: rule.type, value: rule.value, reason: reasonTrimmed, affectedCount,
     });
-    res.json({ message: `Rule "${rule.name}" deactivated` });
+    res.json({ message: `Rule "${rule.name}" deactivated`, affectedCount });
   } catch (err) {
     next(err);
   }
@@ -214,6 +256,9 @@ async function dryRunRule(req, res, next) {
     let totalSurcharges = 0;
     let affectedCount = 0;
 
+    // Pre-fetch active rules ONCE for the school to avoid N+1 DB calls per student
+    const existingRules = await feeAdjustmentService.fetchSortedRules(req.schoolId);
+
     for (const student of students) {
       // Calculate fee without the new rule first (using existing active rules)
       const baseCtx = {
@@ -226,14 +271,15 @@ async function dryRunRule(req, res, next) {
 
       const feeStructure = { feeAmount: student.feeAmount };
 
-      // Simulate with existing rules only
-      const existingResult = await feeAdjustmentService.calculateAdjustedFee(feeStructure, baseCtx);
+      // Simulate with existing rules only (synchronous, using pre-fetched rules)
+      const existingResult = feeAdjustmentService.calculateAdjustedFeeWithRules(feeStructure, baseCtx, existingRules);
 
-      // Now inject the new rule into the simulation
-      const withNewResult = await feeAdjustmentService.simulateWithExtra(
+      // Now inject the new rule into the simulation (synchronous, using pre-fetched rules)
+      const withNewResult = feeAdjustmentService.simulateWithExtraWithRules(
         feeStructure,
         baseCtx,
-        syntheticRule
+        syntheticRule,
+        existingRules
       );
 
       const delta = withNewResult.finalFee - existingResult.finalFee;
@@ -332,6 +378,9 @@ async function applyRule(req, res, next) {
     const bulkOps = [];
     const results = { applied: 0, skipped: 0, overpayments: [], errors: [] };
 
+    // Pre-fetch active rules ONCE for the school to avoid N+1 DB calls per student
+    const activeRules = await feeAdjustmentService.fetchSortedRules(req.schoolId);
+
     for (const student of students) {
       try {
         const feeStructure = { feeAmount: student.feeAmount };
@@ -343,7 +392,7 @@ async function applyRule(req, res, next) {
           baseAmount: student.feeAmount,
         };
 
-        const adjusted = await feeAdjustmentService.calculateAdjustedFee(feeStructure, ctx);
+        const adjusted = feeAdjustmentService.calculateAdjustedFeeWithRules(feeStructure, ctx, activeRules);
         const newFee = adjusted.finalFee;
 
         if (newFee === student.feeAmount) {
@@ -389,10 +438,14 @@ async function applyRule(req, res, next) {
       }
     }
 
-    // Execute all updates inside a transaction for atomicity
+    // Execute updates in chunked batches inside a transaction for atomicity and bounded memory
     if (bulkOps.length > 0) {
+      const BATCH_SIZE = 1000;
       await session.withTransaction(async () => {
-        await Student.bulkWrite(bulkOps, { session });
+        for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+          const chunk = bulkOps.slice(i, i + BATCH_SIZE);
+          await Student.bulkWrite(chunk, { session });
+        }
       });
     }
 
@@ -425,4 +478,4 @@ async function applyRule(req, res, next) {
   }
 }
 
-module.exports = { createRule, listRules, updateRule, deleteRule, dryRunRule, applyRule };
+module.exports = { createRule, listRules, updateRule, deleteRule, getAffectedCount, dryRunRule, applyRule };

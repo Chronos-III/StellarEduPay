@@ -14,14 +14,23 @@ function generateReceiptSignature(receipt) {
     assetCode: receipt.assetCode,
     confirmedAt: receipt.confirmedAt.toISOString(),
   };
-  const secret = process.env.RECEIPT_SIGNATURE_SECRET || 'default-receipt-secret';
+  const secret = process.env.RECEIPT_SIGNATURE_SECRET;
+  if (!secret) {
+    throw new Error('RECEIPT_SIGNATURE_SECRET is not set. Cannot generate receipt signature.');
+  }
   return crypto.createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
 }
 
 function verifyReceiptSignature(receipt) {
   if (!receipt.signature) return false;
   const expectedSignature = generateReceiptSignature(receipt);
-  return crypto.timingSafeEqual(Buffer.from(receipt.signature), Buffer.from(expectedSignature));
+  const actual   = Buffer.from(receipt.signature);
+  const expected = Buffer.from(expectedSignature);
+  // crypto.timingSafeEqual throws a RangeError when the two buffers have
+  // different lengths.  A length mismatch is itself proof of a bad signature,
+  // so we treat it as verification failure rather than letting it propagate.
+  if (actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(actual, expected);
 }
 
 /**

@@ -2,6 +2,8 @@
 
 const { deriveIdempotencyKey, fingerprintRequest } = require('../utils/idempotencyKey');
 const idempotencyStore = require('../services/idempotencyStore');
+const currencyConversionService = require('../services/currencyConversionService');
+const logger = require('../utils/logger').child('Idempotency');
 
 /**
  * Idempotency middleware.
@@ -10,7 +12,9 @@ const idempotencyStore = require('../services/idempotencyStore');
  * exactly-once semantics over a TTL window:
  *
  *  - Replay (same key, same body, request already completed) → the cached
- *    response is returned verbatim (same status, same body).
+ *    response is returned verbatim (same status, same body) EXCEPT for
+ *    volatile fields (see `refreshVolatileFields` below), which are
+ *    recomputed on every replay.
  *  - Key reuse with a DIFFERENT body → 422. Reusing a key for a different
  *    payload is a client bug; replaying the first response would be wrong and
  *    re-executing would violate idempotency, so we refuse it.
@@ -33,97 +37,214 @@ const idempotencyStore = require('../services/idempotencyStore');
  *
  * Usage: apply to individual POST routes that must be idempotent.
  */
-function idempotency(req, res, next) {
-  const rawKey = req.headers['idempotency-key'];
 
-  if (!rawKey || typeof rawKey !== 'string' || !rawKey.trim()) {
-    return res.status(400).json({
-      error: 'Idempotency-Key header is required for this request',
-      code: 'MISSING_IDEMPOTENCY_KEY',
-    });
+/**
+ * A 24h idempotency TTL is appropriate for replay/reuse protection but far too
+ * long to freeze a currency-conversion rate: a cached body embedding
+ * `localCurrency` (e.g. the payment verify response) would otherwise replay
+ * whatever FX rate happened to be current at the moment of the FIRST call,
+ * potentially showing a parent a stale converted amount hours or days later.
+ *
+ * Rather than giving currency-bearing records their own (still-arbitrary) short
+ * TTL, we exclude `localCurrency` from the "frozen" part of the cache entirely:
+ * every replay recomputes it fresh from the stored `amount`/`assetCode`, using
+ * the currency-conversion service's own (much shorter) rate cache. A refresh
+ * failure falls back to the originally cached value rather than breaking the
+ * replay.
+ */
+async function refreshVolatileFields(body) {
+  if (!body || typeof body !== 'object') return body;
+  const localCurrency = body.localCurrency;
+  if (!localCurrency || typeof localCurrency !== 'object' || !localCurrency.currency) {
+    return body;
   }
+  if (typeof body.amount !== 'number') return body;
 
-  const scope = req.path;
-  const canonicalKey = deriveIdempotencyKey(rawKey, scope);
-  const fingerprint = fingerprintRequest(req.body);
+  try {
+    const fresh = await currencyConversionService.convertToLocalCurrency(
+      body.amount,
+      body.assetCode || 'XLM',
+      localCurrency.currency
+    );
+    return {
+      ...body,
+      localCurrency: {
+        amount: fresh.available ? fresh.localAmount : null,
+        currency: fresh.currency,
+        rate: fresh.rate,
+        rateTimestamp: fresh.rateTimestamp,
+        available: fresh.available,
+      },
+    };
+  } catch (err) {
+    logger.warn('Failed to refresh currency rate on idempotent replay, serving cached value', {
+      error: err.message,
+    });
+    return body;
+  }
+}
 
-  // Decide what to do with an existing record for this key.
-  function resolveExisting(record) {
-    if (!record) return null;
-    if (record.state === 'completed') {
-      if (record.requestFingerprint && record.requestFingerprint !== fingerprint) {
-        res.status(422).json({
-          error:
-            'Idempotency-Key was already used with a different request body',
-          code: 'IDEMPOTENCY_KEY_REUSE',
-        });
+function idempotency(opts = {}) {
+  const failClosed = opts.failClosed ?? false; // Default to fail-open for backwards compatibility
+  const criticalPaymentEndpoints = opts.criticalPaymentEndpoints ?? false;
+
+  return function idempotencyMiddleware(req, res, next) {
+    const rawKey = req.headers['idempotency-key'];
+
+    if (!rawKey || typeof rawKey !== 'string' || !rawKey.trim()) {
+      return res.status(400).json({
+        error: 'Idempotency-Key header is required for this request',
+        code: 'MISSING_IDEMPOTENCY_KEY',
+      });
+    }
+
+    const scope = req.schoolId
+      ? `${req.schoolId}:${req.baseUrl}${req.path}`
+      : req.path;
+    const canonicalKey = deriveIdempotencyKey(rawKey, scope);
+    const fingerprint = fingerprintRequest(req.body);
+
+    // Decide what to do with an existing record for this key.
+    async function resolveExisting(record) {
+      if (!record) return null;
+      if (record.state === 'completed') {
+        if (record.requestFingerprint && record.requestFingerprint !== fingerprint) {
+          res.status(422).json({
+            error:
+              'Idempotency-Key was already used with a different request body',
+            code: 'IDEMPOTENCY_KEY_REUSE',
+          });
+          return 'handled';
+        }
+        const body = await refreshVolatileFields(record.responseBody);
+        res.status(record.responseStatus).json(body);
         return 'handled';
       }
-      res.status(record.responseStatus).json(record.responseBody);
+      // in_progress
+      res.status(409).json({
+        error: 'A request with this Idempotency-Key is already being processed',
+        code: 'IDEMPOTENCY_KEY_IN_PROGRESS',
+      });
       return 'handled';
     }
-    // in_progress
-    res.status(409).json({
-      error: 'A request with this Idempotency-Key is already being processed',
-      code: 'IDEMPOTENCY_KEY_IN_PROGRESS',
-    });
-    return 'handled';
-  }
 
-  idempotencyStore
-    .getFull(canonicalKey)
-    .then((record) => {
-      // Fast path: a non-stale existing record fully decides the outcome.
-      if (record) {
-        const ageMs = Date.now() - record.createdAt.getTime();
-        const staleInFlight =
-          record.state === 'in_progress' && ageMs >= idempotencyStore.IN_FLIGHT_TTL_MS;
-        if (!staleInFlight) {
-          return resolveExisting(record);
-        }
-        // Stale in-flight reservation: fall through to reserve() which takes it over.
-      }
-
-      // Atomically claim the key. This is the race-safe arbiter: if two requests
-      // reach here at once, exactly one reserves and the other gets the record.
-      return idempotencyStore
-        .reserve(canonicalKey, { scope, fingerprint })
-        .then((reservation) => {
-          if (!reservation.reserved) {
-            return resolveExisting(reservation.record);
+    idempotencyStore
+      .getFull(canonicalKey)
+      .then((record) => {
+        // Fast path: a non-stale existing record fully decides the outcome.
+        if (record) {
+          const ageMs = Date.now() - record.createdAt.getTime();
+          const staleInFlight =
+            record.state === 'in_progress' && ageMs >= idempotencyStore.IN_FLIGHT_TTL_MS;
+          if (!staleInFlight) {
+            return resolveExisting(record);
           }
+          // Stale in-flight reservation: fall through to reserve() which takes it over.
+        }
 
-          // We own the reservation. Intercept res.json to persist the outcome.
-          const originalJson = res.json.bind(res);
-          res.json = function (body) {
-            if (res.statusCode < 500) {
-              idempotencyStore
+        // Atomically claim the key. This is the race-safe arbiter: if two requests
+        // reach here at once, exactly one reserves and the other gets the record.
+        return idempotencyStore
+          .reserve(canonicalKey, { scope, fingerprint })
+          .then((reservation) => {
+            if (!reservation.reserved) {
+              return resolveExisting(reservation.record);
+            }
+
+            // We own the reservation. Persist the outcome regardless of how the
+            // response is ultimately sent (res.json, res.send, res.end,
+            // res.sendStatus, res.redirect, streams, ...).
+            let capturedBody;
+            let bodyCaptured = false;
+            let settled = false;
+
+            const originalJson = res.json.bind(res);
+            const originalSend = res.send.bind(res);
+
+            res.json = function (body) {
+              if (!bodyCaptured) {
+                capturedBody = body;
+                bodyCaptured = true;
+              }
+              return originalJson(body);
+            };
+
+            res.send = function (body) {
+              if (!bodyCaptured) {
+                capturedBody = body;
+                bodyCaptured = true;
+              }
+              return originalSend(body);
+            };
+
+            function completeReservation() {
+              if (settled) return;
+              settled = true;
+              // Cache 2xx-3xx and 4xx (except 404) responses.
+              // 404 is excluded because it can be transient (e.g., transaction not yet visible on Horizon).
+              // Caching a transient 404 prevents successful retries when the resource becomes available.
+              // 5xx is never cached — release the reservation so the client can retry.
+              if (res.statusCode < 500 && res.statusCode !== 404) {
+                idempotencyStore
                   .complete(canonicalKey, {
                     scope,
                     responseStatus: res.statusCode,
-                    responseBody: body,
+                    responseBody: capturedBody,
                     fingerprint,
                   })
                   .catch((err) => {
-                    const logger = require('../utils/logger').child('Idempotency');
                     logger.error('Failed to cache response', { error: err.message });
+                    if (typeof idempotencyStore.recordCompletionFailure === 'function') {
+                      idempotencyStore.recordCompletionFailure();
+                    }
                   });
-            } else {
-              // 5xx is never cached — release the reservation so the client can retry.
-              idempotencyStore.release(canonicalKey).catch(() => logger.debug('[Idempotency] release missed'));
+              } else {
+                // 5xx or 404 — release the reservation so the client can retry.
+                idempotencyStore.release(canonicalKey).catch((err) => {
+                  logger.debug('[Idempotency] release missed', { error: err.message });
+                });
+              }
             }
-            return originalJson(body);
-          };
 
-          next();
-        });
-    })
-    .catch((err) => {
-      const logger = require('../utils/logger').child('Idempotency');
-      logger.error('store operation failed', { error: err.message });
-      // Fail open — let the request through rather than blocking the user.
-      next();
-    });
+            function releaseReservation() {
+              if (settled) return;
+              settled = true;
+              idempotencyStore.release(canonicalKey).catch((err) => {
+                logger.debug('[Idempotency] release missed', { error: err.message });
+              });
+            }
+
+            // `finish` fires once the response has been fully flushed to the
+            // client, no matter which method produced it.
+            res.on('finish', completeReservation);
+            // `close` fires when the underlying connection is closed. If it
+            // fires without `finish` the client aborted before we responded, so
+            // release the reservation instead of leaving the key in progress.
+            res.on('close', () => {
+              if (res.writableFinished) {
+                completeReservation();
+              } else {
+                releaseReservation();
+              }
+            });
+
+            next();
+          });
+      })
+      .catch((err) => {
+        logger.error('store operation failed', { error: err.message });
+        // For critical payment endpoints, reject the request (fail-closed) to ensure
+        // duplicate-protection is never bypassed during outages. For other endpoints,
+        // fail-open to allow the request through.
+        if (failClosed || criticalPaymentEndpoints) {
+          return res.status(503).json({
+            error: 'Idempotency service unavailable',
+            code: 'IDEMPOTENCY_SERVICE_UNAVAILABLE',
+          });
+        }
+        next();
+      });
+  };
 }
 
 module.exports = idempotency;

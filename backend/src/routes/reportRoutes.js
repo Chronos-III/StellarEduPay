@@ -9,8 +9,8 @@ const { validate } = require('../middleware/validate');
 const { reportQuerySchema } = require('../middleware/schemas/reportSchemas');
 
 // All report endpoints expose full financial data and CSV/accounting exports.
-// Gate every route behind the finance permission (fix #887).
-const requireFinanceRole = requireSchoolAuth(['owner', 'finance']);
+// Owner and staff roles can view reports
+const requireFinanceRole = requireSchoolAuth(['owner', 'staff', 'read_only']);
 
 router.use(resolveSchool);
 

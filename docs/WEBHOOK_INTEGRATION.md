@@ -4,21 +4,33 @@ StellarEduPay notifies external systems in real-time when payment events occur.
 
 ## Setup
 
-### 1. Register a webhook URL
+### 1. Register a webhook endpoint
 
-Register your HTTPS endpoint per school via the admin API:
+Webhooks are configured only through `WebhookEndpoint` subscriptions (#1640) —
+see [Multiple endpoints and per-event subscriptions](#multiple-endpoints-and-per-event-subscriptions-865):
 
 ```
-POST /api/schools/:slug/webhooks
-Authorization: Bearer <admin-token>
+POST /api/webhook-endpoints
+Authorization: Bearer <school-token>
 Content-Type: application/json
 
 {
-  "webhookUrl": "https://your-server.com/webhook"
+  "url": "https://your-server.com/webhook",
+  "subscribedEvents": ["payment.confirmed", "dispute.created", "dispute.resolved"]
 }
 ```
 
-Your school's HMAC signing secret is provisioned automatically when the school is created. Retrieve it from the admin dashboard to use in signature verification.
+The response contains the endpoint's signing `secret`, shown **once**. Send a
+test event before going live — see [Testing an endpoint](#testing-an-endpoint).
+
+> **Deprecated:** `POST /api/schools/:slug/webhooks` (and
+> `PUT /api/schools/:schoolId/webhook-secret`) still work for one release but
+> respond with a `Deprecation` header. They now create/update the school's
+> legacy `WebhookEndpoint` (`source: "legacy_school_webhook"`) instead of
+> `School.webhookUrl`, which has been removed. Existing `School.webhookUrl`
+> registrations were converted to endpoints by migration 036, keeping their
+> URL, secret, signature versions and the events they received. The
+> `PAYMENT_WEBHOOK_URL` global fallback has been removed.
 
 ### 2. Receive events
 
@@ -46,6 +58,15 @@ Your endpoint receives `POST` requests with a JSON body:
 | `payment.pending` | Payment detected, awaiting confirmation |
 | `payment.failed` | Payment failed on Stellar network |
 | `payment.suspicious` | Flagged by fraud detection |
+| `payment.refunded` / `payment.refund_rejected` | Refund confirmed / rejected |
+| `dispute.created` | A payment dispute was raised |
+| `dispute.under_review` | A dispute moved to review |
+| `dispute.resolved` | A dispute was closed (`status` is `resolved` or `rejected`) |
+| `dispute.reopened` | A closed dispute was reopened |
+| `dispute.sla_breached` | An open dispute passed its SLA deadline (sent once per dispute) |
+| `webhook.test` | Only sent by `POST /api/webhook-endpoints/:id/test`; not subscribable |
+
+---
 
 ## Security: verifying the signature
 
@@ -55,39 +76,63 @@ Every delivery is signed with HMAC-SHA256 using your school's secret. Always ver
 
 | Header | Example | Purpose |
 |--------|---------|---------|
-| `X-StellarEduPay-Signature` | `sha256=a1b2c3...` | HMAC-SHA256 of the entire JSON body |
+| `X-StellarEduPay-Signature-V2` | `sha256=a1b2c3...` | **V2 HMAC-SHA256** covering timestamp, delivery-ID, and body (recommended). During a secret-rotation overlap it carries two comma-separated values, `sha256=<new>,sha256=<old>` — accept the delivery if **any** value verifies |
+| `X-StellarEduPay-Signature` | `sha256=d4e5f6...` | V1 HMAC-SHA256 of the JSON body only (deprecated — only sent to endpoints whose `signatureVersions` include `v1`, and never after `WEBHOOK_V1_SUNSET`) |
+| `X-StellarEduPay-Signature-V2-Previous` | `sha256=0a1b2c...` | V2 signature computed with your **previous** secret — only sent during a secret-rotation overlap window (see [Rotating your signing secret](#rotating-your-signing-secret)) |
 | `X-StellarEduPay-Timestamp` | `1711532400` | Unix timestamp (seconds) of delivery |
 | `X-StellarEduPay-Delivery-ID` | `550e8400-...` | Unique delivery UUID for idempotency |
 
-### Signature algorithm
+---
 
-The signature is computed over the **serialised JSON body** (the exact bytes you receive):
+## V2 Signature algorithm (recommended)
+
+The V2 signature closes the replay-attack vector present in V1. It covers the
+timestamp, the delivery-ID, **and** the exact body bytes in one signed string:
 
 ```
-HMAC-SHA256(secret, JSON.stringify(body))
+signing_base  = timestamp + "." + deliveryId + "." + rawBody
+signature_v2  = HMAC-SHA256(secret, signing_base)
+header_value  = "sha256=" + hex(signature_v2)
 ```
 
-The header value is `sha256=<hex-digest>`.
+Where:
+- `timestamp` is the value in `X-StellarEduPay-Timestamp` (Unix seconds, as a string)
+- `deliveryId` is the value in `X-StellarEduPay-Delivery-ID`
+- `rawBody` is the **exact bytes** of the HTTP request body
 
-### Verification recipe (Node.js)
+Because the timestamp and delivery-ID are now bound to the signature, an attacker
+who captures a delivery cannot replay it by rewriting either header — the
+signature check will fail.
+
+> **Important:** compute the V2 signing base from the raw request body bytes
+> (the exact bytes received over the wire). Do **not** re-serialise a parsed JS
+> object; key-ordering differences will break the signature.
+
+### Verification recipe (Node.js) — V2
 
 ```js
 const crypto = require('crypto');
 
-function verifyWebhook(rawBody, headers, secret) {
-  // 1. Reject stale deliveries (replay protection — 5 min tolerance)
+const TOLERANCE_S = 300; // 5 minutes
+
+function verifyWebhookV2(rawBody, headers, secret) {
+  // 1. Parse and range-check the timestamp
   const ts = parseInt(headers['x-stellaredupay-timestamp'], 10);
-  if (Math.abs(Date.now() / 1000 - ts) > 300) {
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > TOLERANCE_S) {
     return { valid: false, reason: 'timestamp out of tolerance' };
   }
 
-  // 2. Verify HMAC — use constant-time comparison to prevent timing attacks
-  const [, provided] = (headers['x-stellaredupay-signature'] || '').split('sha256=');
-  if (!provided) return { valid: false, reason: 'missing signature' };
+  // 2. Extract the V2 signature
+  const deliveryId = headers['x-stellaredupay-delivery-id'] || '';
+  const [, provided] = (headers['x-stellaredupay-signature-v2'] || '').split('sha256=');
+  if (!provided) return { valid: false, reason: 'missing V2 signature' };
 
-  const body = typeof rawBody === 'string' ? rawBody : JSON.stringify(rawBody);
-  const expected = crypto.createHmac('sha256', secret).update(body).digest('hex');
+  // 3. Recompute over timestamp.deliveryId.rawBody
+  const body = typeof rawBody === 'string' ? rawBody : rawBody.toString();
+  const signingBase = `${ts}.${deliveryId}.${body}`;
+  const expected = crypto.createHmac('sha256', secret).update(signingBase).digest('hex');
 
+  // 4. Constant-time comparison
   const expectedBuf = Buffer.from(expected, 'hex');
   const providedBuf = Buffer.from(provided, 'hex');
   if (expectedBuf.length !== providedBuf.length) {
@@ -101,37 +146,236 @@ function verifyWebhook(rawBody, headers, secret) {
 }
 ```
 
-> **Important:** parse the raw request body as a `Buffer` or `string` — do not re-serialise a parsed JS object, as key ordering may differ and the signature will not match.
-
-### Verification recipe (Python)
+### Verification recipe (Python) — V2
 
 ```python
-import hashlib, hmac, time
+import hashlib
+import hmac
+import time
 
-def verify_webhook(raw_body: bytes, headers: dict, secret: str) -> bool:
-    # Reject stale deliveries
-    ts = int(headers.get('x-stellaredupay-timestamp', 0))
-    if abs(time.time() - ts) > 300:
+TOLERANCE_S = 300  # 5 minutes
+
+def verify_webhook_v2(raw_body: bytes, headers: dict, secret: str) -> bool:
+    # 1. Parse and range-check the timestamp
+    try:
+        ts = int(headers.get('x-stellaredupay-timestamp', '0'))
+    except ValueError:
+        return False
+    if abs(time.time() - ts) > TOLERANCE_S:
         return False
 
-    provided = headers.get('x-stellaredupay-signature', '').removeprefix('sha256=')
-    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    # 2. Extract the V2 signature
+    delivery_id = headers.get('x-stellaredupay-delivery-id', '')
+    sig_header = headers.get('x-stellaredupay-signature-v2', '')
+    if not sig_header.startswith('sha256='):
+        return False
+    provided = sig_header.removeprefix('sha256=')
+
+    # 3. Recompute over timestamp.deliveryId.rawBody
+    body_str = raw_body.decode('utf-8') if isinstance(raw_body, bytes) else raw_body
+    signing_base = f'{ts}.{delivery_id}.{body_str}'.encode('utf-8')
+    expected = hmac.new(secret.encode('utf-8'), signing_base, hashlib.sha256).hexdigest()
+
+    # 4. Constant-time comparison
     return hmac.compare_digest(expected, provided)
 ```
 
+### Verification recipe (Java) — V2
+
+```java
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+
+public class WebhookVerifier {
+
+    private static final int TOLERANCE_S = 300; // 5 minutes
+
+    public static boolean verifyV2(
+            byte[] rawBody,
+            String timestampHeader,
+            String deliveryIdHeader,
+            String signatureV2Header,
+            String secret) throws Exception {
+
+        // 1. Parse and range-check the timestamp
+        long ts = Long.parseLong(timestampHeader);
+        if (Math.abs(System.currentTimeMillis() / 1000L - ts) > TOLERANCE_S) {
+            return false;
+        }
+
+        // 2. Extract the V2 signature
+        if (!signatureV2Header.startsWith("sha256=")) return false;
+        String provided = signatureV2Header.substring(7);
+
+        // 3. Recompute over timestamp.deliveryId.rawBody
+        String bodyStr = new String(rawBody, StandardCharsets.UTF_8);
+        String signingBase = ts + "." + deliveryIdHeader + "." + bodyStr;
+
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        byte[] expectedBytes = mac.doFinal(signingBase.getBytes(StandardCharsets.UTF_8));
+        String expected = HexFormat.of().formatHex(expectedBytes);
+
+        // 4. Constant-time comparison
+        byte[] expectedBuf = expected.getBytes(StandardCharsets.UTF_8);
+        byte[] providedBuf = provided.getBytes(StandardCharsets.UTF_8);
+        return MessageDigest.isEqual(expectedBuf, providedBuf);
+    }
+}
+```
+
+---
+
+## Signing secrets
+
+- If you omit `secret` when creating an endpoint (`POST /api/webhook-endpoints`),
+  a 256-bit secret is generated for you and returned **once** in the response.
+- A caller-supplied `secret` must be at least 32 characters, contain no
+  whitespace and be random — weak or repetitive values (e.g. `"a"`,
+  `"aaaa…"`) are rejected with `400 WEAK_WEBHOOK_SECRET`.
+- Secrets are encrypted at rest and are never returned by `GET` endpoints.
+
+### Rotating your signing secret
+
+```
+POST /api/webhook-endpoints/:id/rotate-secret
+{ "overlapSeconds": 86400 }        # optional; default 24h, max 7 days, 0 = no overlap
+```
+
+The new secret is generated server-side and returned once, with
+`previousSecretExpiresAt`. Until that time every delivery is signed with
+**both** secrets (#1639):
+
+- `X-StellarEduPay-Signature-V2: sha256=<new>,sha256=<old>` — split on `,` and
+  accept the delivery if any value verifies against the secret your receiver
+  currently holds (Stripe-style);
+- `X-StellarEduPay-Signature-V2-Previous: sha256=<old>` — kept for receivers
+  written against the earlier contract.
+
+So you can deploy the new secret at any point inside the window without a
+single failed delivery. When the window closes the old secret is deleted.
+
+`PUT /api/webhook-endpoints/:id` with a caller-supplied `secret` now uses the
+same overlap (`overlapSeconds`, default 24h; pass `0` to switch immediately).
+Prefer `rotate-secret`, which also guarantees a strong secret. Both actions
+are recorded in the audit log.
+
+### Testing an endpoint
+
+```
+POST /api/webhook-endpoints/:id/test
+```
+
+Sends a signed `webhook.test` event with sample payment data through the
+normal delivery path (same signatures, SSRF checks and delivery log) and
+returns the result:
+
+```json
+{ "success": true, "event": "webhook.test", "deliveryId": "…", "statusCode": 200, "latencyMs": 84, "error": null }
+```
+
+A failed test is not retried. The endpoint does not need to be active, so you
+can verify a receiver before switching it on. Each test is audited.
+
+---
+
+## Choosing signature versions
+
+Each endpoint has a `signatureVersions` setting:
+
+| Value | Headers sent |
+|-------|--------------|
+| `["v2"]` | V2 only — **default for endpoints created from now on** |
+| `["v1", "v2"]` | V1 and V2 — the setting existing endpoints were migrated to |
+
+Opt out of V1 as soon as your receiver verifies V2:
+
+```
+PUT /api/webhook-endpoints/:id
+{ "signatureVersions": ["v2"] }
+```
+
+`v2` is always required. Regardless of this setting, V1 is never sent after
+the `WEBHOOK_V1_SUNSET` date (default **2027-02-28**).
+
+---
+
+## V1 Signature algorithm (deprecated)
+
+> **V1 is deprecated.** It signs only the JSON body, leaving the timestamp and
+> delivery-ID unsigned. An attacker who captures one delivery can replay it with
+> a rewritten `X-StellarEduPay-Timestamp` header, bypassing the tolerance check.
+> Migrate to V2 before the V1 removal date (see [Migration guide](#migration-guide-v1--v2) below).
+
+The V1 signature is only sent to endpoints whose `signatureVersions` include
+`v1` (endpoints that existed before V1 became opt-in), and never after the
+V1 sunset date.
+
+```
+signature_v1 = HMAC-SHA256(secret, JSON.stringify(body))
+header_value = "sha256=" + hex(signature_v1)
+```
+
+---
+
+## Migration guide: V1 → V2
+
+The V2 header (`X-StellarEduPay-Signature-V2`) is present on all deliveries
+**now**. V1 (`X-StellarEduPay-Signature`) will continue to be sent in parallel
+during the migration window to give you time to update your receiver.
+
+**Migration steps:**
+
+1. Update your signature-verification code to use `X-StellarEduPay-Signature-V2`
+   with the new signing base `timestamp.deliveryId.rawBody` (examples above).
+2. Ensure you read the raw request body bytes before parsing — many frameworks
+   expose a `rawBody` buffer or middleware option (e.g. `express.raw()` or
+   `bodyParser` with a `verify` hook).
+3. Deploy and verify that your receiver accepts V2-signed deliveries in
+   staging/pre-production.
+4. Remove your V1 verification path.
+
+5. Opt out of V1: `PUT /api/webhook-endpoints/:id` with
+   `{ "signatureVersions": ["v2"] }`.
+
+**V1 removal date:** V1 signatures will be dropped after **2027-02-28**
+(configured server-side as `WEBHOOK_V1_SUNSET`; no code change is needed to
+remove V1). You will receive advance notice via the developer changelog and
+email — operators list the endpoints still on V1 with
+`GET /api/admin/webhooks/v1-endpoints` and email their owners with
+`POST /api/admin/webhooks/v1-endpoints/notify`. The
+`webhook_deliveries_total{signature_version}` metric shows how many deliveries
+still carry V1.
+
+> **Dual-signature transition period:** until you opt out (or the V1 removal
+> date passes), deliveries to existing endpoints carry both
+> `X-StellarEduPay-Signature` (V1) and `X-StellarEduPay-Signature-V2`. Once you
+> have migrated, verify only V2 and ignore V1. Endpoints created from now on
+> receive V2 only.
+
+---
+
 ## Replay protection
 
-Use the `X-StellarEduPay-Delivery-ID` header as an idempotency key. Store the delivery IDs you have already processed and reject any request whose ID you have seen before:
+Use both the timestamp tolerance check **and** the delivery-ID as an idempotency
+key. The V2 signature binds the timestamp and delivery-ID to the HMAC, so a
+forged or rewritten header will fail the signature check. The delivery-ID
+deduplication is a second, independent guard against exact replays.
 
 ```js
 const processedIds = new Set(); // use Redis or a database for durability
 
 app.post('/webhook', (req, res) => {
+  const { valid, reason } = verifyWebhookV2(req.rawBody, req.headers, WEBHOOK_SECRET);
+  if (!valid) {
+    console.error('Webhook verification failed:', reason);
+    return res.status(401).end();
+  }
+
   const deliveryId = req.headers['x-stellaredupay-delivery-id'];
-
-  const { valid } = verifyWebhook(req.rawBody, req.headers, WEBHOOK_SECRET);
-  if (!valid) return res.status(401).end();
-
   if (processedIds.has(deliveryId)) {
     return res.status(200).json({ status: 'duplicate, ignored' });
   }
@@ -141,6 +385,11 @@ app.post('/webhook', (req, res) => {
   res.status(200).end();
 });
 ```
+
+> **Durability:** store delivery IDs in Redis or a database (not a process-local
+> Set) so replay protection survives restarts and works across multiple replicas.
+
+---
 
 ## Acknowledge quickly
 
@@ -188,6 +437,8 @@ Response includes the `secret` (shown **once** at creation — store it securely
 | `GET`    | `/api/webhook-endpoints/:id`    | Get single endpoint |
 | `PUT`    | `/api/webhook-endpoints/:id`    | Update url / events / isActive |
 | `DELETE` | `/api/webhook-endpoints/:id`    | Delete endpoint |
+| `POST`   | `/api/webhook-endpoints/:id/test` | Send a signed `webhook.test` event and get status code + latency |
+| `POST`   | `/api/webhook-endpoints/:id/rotate-secret` | Generate a new secret with a dual-signing overlap |
 
 **Disabling an endpoint**: set `isActive: false` — it is silently skipped on all deliveries.
 
@@ -226,7 +477,7 @@ By default, webhook payloads are **minimal — no PII**. The fields `studentId` 
 
 ### Opt-in to PII fields
 
-Update the school's `webhookPayloadConfig` via `PUT /api/schools/:id`:
+Update the school's `webhookPayloadConfig` via `PATCH /api/schools/:schoolId`:
 
 ```json
 {
@@ -253,3 +504,51 @@ All webhook URLs are validated at **registration time and again at every send**:
 - **Redirects are disabled** — a 3xx response from the endpoint is treated as a delivery failure (`SSRF_REDIRECT_BLOCKED`).
 - Response bodies are capped at 64 KB.
 - DNS is re-resolved immediately before each delivery (DNS-rebinding defence).
+
+## Delivery history retention (#1414)
+
+Every delivery attempt is recorded in the `webhookdeliveries` collection — one
+document per attempt, per endpoint, per school. A busy deployment produces
+these continuously, so the collection is bounded by a TTL index on `createdAt`
+rather than kept forever.
+
+**Default retention is 90 days.** After that MongoDB removes the record
+automatically; the background TTL monitor runs about once a minute, so deletion
+is prompt but not instant.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `WEBHOOK_DELIVERY_RETENTION_DAYS` | Retention in days | `90` |
+| `WEBHOOK_DELIVERY_TTL_SECONDS` | Retention in seconds; **takes precedence** when set | — |
+
+`WEBHOOK_DELIVERY_TTL_SECONDS` is kept for deployments that already configured
+it, so upgrading does not silently change their retention. New deployments
+should use `WEBHOOK_DELIVERY_RETENTION_DAYS`.
+
+### What this means for you
+
+- **Debugging window.** Delivery history for an endpoint is available for the
+  retention period. Anything you need beyond that — compliance evidence, audit
+  trails — must be exported to your own store before it expires.
+- **Dead-letter counts.** The `webhook_dead_letter_total` metric counts failed
+  deliveries that exhausted their retries. Expired records leave that count, so
+  it reflects the retention window rather than all time.
+
+### Applying it to an existing deployment
+
+Mongoose only creates schema indexes on collections it creates, so a collection
+that predates the TTL declaration will not have the index. Migration
+`028_add_webhook_delivery_ttl_index` adds it, and re-creates it if the
+configured retention has changed — MongoDB will not alter `expireAfterSeconds`
+on an existing index in place.
+
+```bash
+npm run migrate
+```
+
+Verify:
+
+```js
+db.webhookdeliveries.getIndexes()
+// { v: 2, key: { createdAt: 1 }, name: 'createdAt_1', expireAfterSeconds: 7776000 }
+```

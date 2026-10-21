@@ -1,21 +1,78 @@
 'use strict';
 
-const { server } = require('../config/stellarConfig');
+const { horizonClient } = require('../config/stellarConfig');
+const { withStellarRetry } = require('../utils/withStellarRetry');
 const Payment = require('../models/paymentModel');
 const Student = require('../models/studentModel');
 const School = require('../models/schoolModel');
+const logger = require('../utils/logger').child('ConsistencyService');
+
+const CHAIN_PAGE_SIZE = 200;
+const CHAIN_MAX_PAGES = 50; // hard ceiling so a stuck cursor can't loop forever
+const DEFAULT_CHAIN_LOOKBACK_DAYS = parseInt(process.env.RECONCILIATION_CHAIN_LOOKBACK_DAYS, 10) || 90;
 
 /**
- * Fetch up to 200 transactions for a given wallet address from Horizon.
+ * Fetch transactions for a given wallet address from Horizon with full pagination
+ * support, routing through the rate-limited client infrastructure.
+ *
+ * Issue #1479: Use horizonClient.call() and withStellarRetry for rate limiting
+ * instead of calling server directly, and implement cursor-based pagination to
+ * cover complete transaction histories beyond the first 200 records.
+ *
  * @param {string} walletAddress
+ * @param {{ lookbackDays?: number }} [options] lookbackDays <= 0 disables the window.
+ * @returns {Promise<Array>} Array of all matching transactions
  */
-async function fetchChainTransactions(walletAddress) {
-  const result = await server.transactions()
-    .forAccount(walletAddress)
-    .order('desc')
-    .limit(200)
-    .call();
-  return result.records;
+async function fetchChainTransactions(walletAddress, { lookbackDays = DEFAULT_CHAIN_LOOKBACK_DAYS } = {}) {
+  const cutoff = lookbackDays > 0 ? Date.now() - lookbackDays * 24 * 60 * 60 * 1000 : null;
+  const records = [];
+  let cursor = null;
+
+  for (let page = 0; page < CHAIN_MAX_PAGES; page++) {
+    // Issue #1479: Route through rate-limited horizonClient and withStellarRetry
+    const result = await withStellarRetry(
+      () => horizonClient.call(
+        (server) => {
+          let builder = server.transactions()
+            .forAccount(walletAddress)
+            .order('desc')
+            .limit(CHAIN_PAGE_SIZE);
+          if (cursor) builder = builder.cursor(cursor);
+          return builder.call();
+        }
+      ),
+      { label: 'FetchChainTransactions', context: `for account ${walletAddress}` }
+    );
+
+    const batch = result.records || [];
+    if (batch.length === 0) break;
+
+    for (const tx of batch) {
+      if (cutoff && new Date(tx.created_at).getTime() < cutoff) {
+        logger.info('Reached lookback cutoff', {
+          walletAddress,
+          lookbackDays,
+          recordsScanned: records.length,
+          cutoffTime: new Date(cutoff).toISOString(),
+        });
+        return records; // reached the lookback boundary — stop paginating
+      }
+      records.push(tx);
+      cursor = tx.paging_token;
+    }
+
+    if (batch.length < CHAIN_PAGE_SIZE) {
+      // Drained all available records
+      logger.info('Pagination complete', {
+        walletAddress,
+        totalRecords: records.length,
+        pagesScanned: page + 1,
+      });
+      break;
+    }
+  }
+
+  return records;
 }
 
 /**
@@ -113,7 +170,13 @@ async function checkStudentBalanceConsistency(schoolId) {
       { $group: { _id: null, computedTotal: { $sum: '$amount' } } },
     ]);
 
-    const computedTotal = agg?.computedTotal ?? 0;
+    // creditAdjustments represents cumulative manual partial-credit overrides
+    // applied by admins. They are intentional deviations from the raw payment
+    // sum and must be included in the expected total so the consistency job
+    // never treats them as drift and silently reverts them.
+    const paymentTotal = agg?.computedTotal ?? 0;
+    const creditAdjustments = student.creditAdjustments || 0;
+    const computedTotal = parseFloat((paymentTotal + creditAdjustments).toFixed(7));
     const computedRemaining = Math.max(0, student.feeAmount - computedTotal);
 
     const totalDrift = Math.abs(computedTotal - (student.totalPaid || 0));
@@ -149,7 +212,10 @@ async function checkStudentBalanceConsistency(schoolId) {
 async function checkConsistency() {
   const schools = await School.find({ isActive: true }).lean();
 
-  const schoolResults = await Promise.all(
+  // Use Promise.allSettled so a transient Horizon error for one school does not
+  // abort the entire consistency cycle — every other school's check still runs
+  // and records its results normally.
+  const settled = await Promise.allSettled(
     schools.map((school) =>
       checkSchoolConsistency({
         schoolId: school.schoolId,
@@ -157,6 +223,30 @@ async function checkConsistency() {
       })
     )
   );
+
+  const schoolResults = [];
+  for (let i = 0; i < settled.length; i++) {
+    const outcome = settled[i];
+    if (outcome.status === 'fulfilled') {
+      schoolResults.push(outcome.value);
+    } else {
+      // Log the per-school failure so operators know which tenant is affected,
+      // but don't let it silence the results from healthy schools.
+      const schoolId = schools[i]?.schoolId ?? `index-${i}`;
+      console.error(
+        `[consistencyService] checkSchoolConsistency failed for school ${schoolId}:`,
+        outcome.reason
+      );
+      schoolResults.push({
+        schoolId,
+        error: outcome.reason?.message ?? String(outcome.reason),
+        totalDbPayments: 0,
+        totalChainTxsScanned: 0,
+        mismatchCount: 0,
+        mismatches: [],
+      });
+    }
+  }
 
   const totalDbPayments = schoolResults.reduce((s, r) => s + r.totalDbPayments, 0);
   const totalChainTxsScanned = schoolResults.reduce((s, r) => s + r.totalChainTxsScanned, 0);
@@ -176,5 +266,6 @@ async function checkConsistency() {
 module.exports = {
   checkConsistency,
   checkSchoolConsistency,
+  checkStudentBalanceConsistency,
   fetchChainTransactions,
 };

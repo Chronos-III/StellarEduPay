@@ -1,3 +1,5 @@
+import i18n from "../i18n";
+
 /**
  * Maps backend API error codes to human-readable messages for display in the UI.
  * Falls back to the raw message if no mapping exists.
@@ -25,7 +27,6 @@ const ERROR_MESSAGES = {
   AMOUNT_TOO_LOW:              "Payment amount is below the minimum allowed.",
   AMOUNT_TOO_HIGH:             "Payment amount exceeds the maximum allowed.",
   UNDERPAID:                   "Payment amount is less than the required fee.",
-  STELLAR_NETWORK_ERROR:       "The Stellar network is currently unavailable. Please try again later.",
   PAYMENT_LOCKED:              "This payment is currently being processed. Please wait.",
   INTENT_EXPIRED:              "The payment session has expired. Please start again.",
   INVALID_FEE_CATEGORY:        "Invalid fee category specified.",
@@ -71,6 +72,17 @@ const ERROR_MESSAGES = {
   CSV_TOO_MANY_ROWS:           "The CSV file contains too many rows.",
   CSV_TOO_LARGE:               "The CSV file is too large to process.",
 
+  // Stellar / Horizon errors
+  // These codes are surfaced by the backend or by parseStellarError() in
+  // stellarErrors.js — all user-facing text for Stellar failures lives here so
+  // every component shows identical wording for the same underlying failure.
+  STELLAR_NETWORK_ERROR:       "The Stellar network is currently unavailable. Please try again later.",
+  HORIZON_UNREACHABLE:         "The Stellar network is temporarily unavailable. Please check the network status and try again later.",
+  HORIZON_UNAVAILABLE:         "The Stellar network is temporarily unavailable. Please check the network status and try again later.",
+  // Horizon result codes (lowercase, as returned by the Stellar SDK)
+  tx_insufficient_fee:         "The Stellar network is congested and rejected the transaction fee. Please try again in a few minutes or use a higher transaction fee.",
+  op_underfunded:              "Insufficient XLM balance. Please fund your wallet with enough XLM to cover the payment and transaction fee.",
+
   // Rate limiting / system errors
   RATE_LIMIT_EXCEEDED:         "Too many requests. Please slow down and try again.",
   IP_BLOCKED:                  "Your IP address has been temporarily blocked.",
@@ -89,13 +101,32 @@ const ERROR_MESSAGES = {
 };
 
 /**
+ * Resolves a locale key to a translated string.
+ *
+ * Returns the active-language translation when the key exists (falling back to
+ * English via i18next), or the provided English fallback when the key itself is
+ * missing. Used for non-React code paths (e.g. utils); components should use
+ * `useTranslation()` instead.
+ *
+ * @param {string} key - i18n key, e.g. "errors.DUPLICATE_STUDENT".
+ * @param {string} enFallback - English fallback text if the key is absent.
+ * @returns {string} Translated string.
+ */
+export function tr(key, enFallback) {
+  const resolved = i18n.t(key);
+  return typeof resolved === "string" && resolved !== key ? resolved : enFallback;
+}
+
+/**
  * Returns a human-readable message for the given error code.
  * Falls back to the raw message string, or a generic error if neither is available.
  */
 export function getErrorMessage(code, fallback) {
-  if (code && ERROR_MESSAGES[code]) return ERROR_MESSAGES[code];
+  if (code && ERROR_MESSAGES[code]) {
+    return tr(`errors.${code}`, ERROR_MESSAGES[code]);
+  }
   if (fallback && typeof fallback === "string" && fallback.trim()) return fallback;
-  return "An unexpected error occurred. Please try again.";
+  return tr("errors.UNKNOWN", "An unexpected error occurred. Please try again.");
 }
 
 export default ERROR_MESSAGES;

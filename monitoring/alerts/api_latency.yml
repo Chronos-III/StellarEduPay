@@ -1,0 +1,41 @@
+groups:
+  - name: api_latency
+    interval: 60s
+    rules:
+      # ── Warning: p95 latency degraded ─────────────────────────────────────
+      # http_request_duration_seconds_bucket carries buckets up to 5s
+      # (metrics/index.js). A p95 above 1s across all routes is a real
+      # degradation for a payment-confirmation API where most requests are
+      # simple reads/writes, not a false positive from one slow report endpoint.
+      - alert: ApiLatencyP95High
+        expr: >
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[10m])) by (le)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p95 latency above 1s"
+          description: >
+            The 95th-percentile HTTP response time across all routes has been
+            above 1 second for 10 minutes ({{ $value | printf "%.2f" }}s).
+            Check MongoDB connection health (mongodb_connection_state) and
+            Horizon request latency (horizon_request_duration_seconds) for a
+            root cause.
+
+      # ── Critical: p99 latency severely degraded ───────────────────────────
+      # p99 above 2.5s (the second-highest configured bucket) means even
+      # typical-tail requests are approaching timeout territory for
+      # payment-confirmation traffic.
+      - alert: ApiLatencyP99Critical
+        expr: >
+          histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[10m])) by (le)) > 2.5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API p99 latency critically high"
+          description: >
+            The 99th-percentile HTTP response time across all routes has been
+            above 2.5 seconds for 10 minutes ({{ $value | printf "%.2f" }}s).
+            Parent- and admin-facing payment requests are likely timing out or
+            about to. Page on-call.

@@ -1,0 +1,45 @@
+groups:
+  - name: queue_backpressure
+    interval: 60s
+    rules:
+      # ── Warning: backpressure threshold reached ───────────────────────────
+      # payment_processor_queue_depth is the concurrent payment processor's
+      # in-flight count (ConcurrentPaymentProcessor.activeCount);
+      # payment_processor_queue_backpressure_high_water mirrors the live
+      # configured QUEUE_BACKPRESSURE_HIGH_WATER value (config/index.js), so
+      # this alert stays correct even if that env var is overridden. Crossing
+      # it is exactly the condition that makes transactionPollingService
+      # throttle its batch size (getEffectiveBatchSize) — expected behaviour,
+      # but sustained for 5+ minutes means the processor isn't draining fast
+      # enough to keep up with intake.
+      - alert: PaymentQueueBackpressureHighWater
+        expr: payment_processor_queue_depth >= payment_processor_queue_backpressure_high_water
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Payment processor queue at backpressure high-water mark"
+          description: >
+            The payment processor's in-flight queue depth
+            ({{ $value }}) has been at or above the configured backpressure
+            high-water mark for 5 minutes. The poller is throttling intake
+            (see transactionPollingService.getEffectiveBatchSize). Check
+            whether Horizon or MongoDB latency is the bottleneck.
+
+      # ── Critical: queue at/near configured maximum depth ─────────────────
+      # payment_processor_queue_max_depth mirrors MAX_QUEUE_DEPTH. At or above
+      # it, processPayment starts rejecting new work outright with
+      # QUEUE_FULL — a payment-processing outage for whoever gets rejected.
+      - alert: PaymentQueueNearCapacity
+        expr: payment_processor_queue_depth >= payment_processor_queue_max_depth
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Payment processor queue is full — payments are being rejected"
+          description: >
+            The payment processor's in-flight queue depth
+            ({{ $value }}) has reached the configured MAX_QUEUE_DEPTH for 2
+            minutes. New payments are being rejected with QUEUE_FULL. Page
+            on-call; consider raising MAX_QUEUE_DEPTH or investigating why the
+            queue isn't draining.

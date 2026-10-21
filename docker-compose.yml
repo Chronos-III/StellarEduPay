@@ -1,18 +1,29 @@
 version: '3.8'
 
 services:
+  migrate:
+    build: ./backend
+    command: ["node", "scripts/migrate.js"]
+    environment:
+      - MONGO_URI=mongodb://${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME must be set}:${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD must be set}@mongo:27017/stellaredupay?authSource=admin&replicaSet=rs0
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - backend-db
+    restart: "no"
+
   backend:
     build: ./backend
     ports:
       - "${PORT:-5000}:5000"
     environment:
-      - MONGO_URI=mongodb://${MONGO_ROOT_USERNAME:-root}:${MONGO_ROOT_PASSWORD:-password}@mongo:27017/stellaredupay?authSource=admin
+      # MONGO_ROOT_USERNAME and MONGO_ROOT_PASSWORD have no defaults — docker
+      # compose up will fail loudly with a clear error if they are not set,
+      # rather than silently starting with well-known default credentials.
+      - MONGO_URI=mongodb://${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME must be set}:${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD must be set}@mongo:27017/stellaredupay?authSource=admin&replicaSet=rs0
       - STELLAR_NETWORK=${STELLAR_NETWORK}
       - SCHOOL_WALLET_ADDRESS=${SCHOOL_WALLET_ADDRESS}
-      # STELLAR_SECRET_KEY is only needed if the backend ever signs transactions.
-      # The default read-only integration does NOT require it — leave unset if unused.
-      # If required, inject via Docker secrets or a secrets manager rather than .env.
-      - STELLAR_SECRET_KEY=${STELLAR_SECRET_KEY}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - NODE_OPTIONS=--max-old-space-size=400
@@ -20,11 +31,32 @@ services:
       - JWT_EXPIRES_IN=8h
       - ADMIN_USERNAME=${ADMIN_USERNAME}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      # RECEIPT_SIGNATURE_SECRET — required (config schema marks it .required())
+      # and receipts fail closed without it (#1498). No default: fail loudly at
+      # compose up rather than crash-looping the backend at config validation.
+      # Generate with: openssl rand -hex 32
+      - RECEIPT_SIGNATURE_SECRET=${RECEIPT_SIGNATURE_SECRET:?RECEIPT_SIGNATURE_SECRET must be set}
+      # BACKUP_NOTIFY_TOKEN — shared secret used by backup.sh to authenticate
+      # the POST /api/internal/backup-heartbeat call. Must be the same value
+      # set in the backup service. See issue #1102.
+      - BACKUP_NOTIFY_TOKEN=${BACKUP_NOTIFY_TOKEN:-}
+      # Email bounce/complaint webhook authentication (issue #1537). In
+      # production the webhook rejects every call unless at least one of these
+      # is configured: EMAIL_SNS_TOPIC_ARNS (SES via SNS, signature-verified),
+      # EMAIL_SENDGRID_WEBHOOK_PUBLIC_KEY (SendGrid Signed Event Webhook), or
+      # EMAIL_WEBHOOK_SECRET (shared secret, X-Webhook-Token header only).
+      - EMAIL_WEBHOOK_SECRET=${EMAIL_WEBHOOK_SECRET:-}
+      - EMAIL_SNS_TOPIC_ARNS=${EMAIL_SNS_TOPIC_ARNS:-}
+      - EMAIL_SENDGRID_WEBHOOK_PUBLIC_KEY=${EMAIL_SENDGRID_WEBHOOK_PUBLIC_KEY:-}
+      # Date after which the deprecated V1 webhook signature is never sent (#1539).
+      - WEBHOOK_V1_SUNSET=${WEBHOOK_V1_SUNSET:-2027-02-28}
     depends_on:
       mongo:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks:
       - frontend-backend
       - backend-db
@@ -32,18 +64,28 @@ services:
     memswap_limit: ${BACKEND_MEM_LIMIT:-512m}
     cpus: ${BACKEND_CPUS:-1.0}
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      test: ["CMD-SHELL", "node -e \"const h=require('http');h.get('http://localhost:5000/health/live',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))\""]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    # The process-level error handlers (src/errorHandling.js) deliberately
+    # process.exit(1) on an unhandled rejection or uncaught exception (see
+    # docs/error-handling.md). Without a restart policy, a crash here was a
+    # permanent, all-tenants outage requiring manual intervention — this was
+    # previously unset. See docs/error-handling.md "Recovery Time & Blast
+    # Radius" for the measured/expected recovery time this now provides.
+    restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       args:
         # NEXT_PUBLIC_* vars are inlined at build time by Next.js — pass as build arg
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:5000/api}
+        # #1578 — same-origin by default: the browser calls /api on :3000 and
+        # Next proxies it to the backend service, keeping auth cookies first-party.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
+        BACKEND_PROXY_TARGET: ${BACKEND_PROXY_TARGET:-http://backend:5000}
         NEXT_PUBLIC_STELLAR_NETWORK: ${STELLAR_NETWORK:-testnet}
     ports:
       - "3000:3000"
@@ -54,9 +96,13 @@ services:
       - frontend-backend
     mem_limit: ${FRONTEND_MEM_LIMIT:-256m}
     cpus: ${FRONTEND_CPUS:-0.5}
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
     networks:
       - backend-db
     mem_limit: ${REDIS_MEM_LIMIT:-128m}
@@ -70,59 +116,78 @@ services:
 
   mongo:
     image: mongo:7
-    ports:
-      - "27017:27017"
+    # ── Single-node replica set ("rs0") — REQUIRED, not optional ──────────────
+    # Multi-document MongoDB transactions are used by the payment pipeline
+    # (transactionPollingService.processTransaction), fee batch operations
+    # (feeController, feeAdjustmentController) and TransactionManager. A
+    # standalone mongod rejects every startTransaction() with:
+    #   "Transaction numbers are only allowed on a replica set member or mongos"
+    # so a replica set is an infrastructure requirement — see
+    # docs/architecture.md "Replica Set Requirement".
+    #
+    # --keyFile enables both intra-cluster auth and client authentication; the
+    # official entrypoint strips it (and --replSet) during its one-shot init
+    # phase that creates the root user from MONGO_INITDB_* below, then restarts
+    # with the full flags. The keyfile is generated at first boot and is never
+    # committed to the repository.
+    entrypoint:
+      - /bin/bash
+      - -ec
+      - |
+        mkdir -p /etc/mongodb
+        if [ ! -f /etc/mongodb/keyfile ]; then
+          openssl rand -base64 756 > /etc/mongodb/keyfile
+          chmod 400 /etc/mongodb/keyfile
+          chown mongodb:mongodb /etc/mongodb/keyfile
+        fi
+        exec docker-entrypoint.sh mongod --replSet rs0 --auth --keyFile /etc/mongodb/keyfile --bind_ip_all
+    # MongoDB port is NOT exposed to the host by default. The backend reaches
+    # it over the internal backend-db network. To access MongoDB from the host
+    # for local debugging only, override this in a docker-compose.override.yml:
+    #   services:
+    #     mongo:
+    #       ports:
+    #         - "127.0.0.1:27017:27017"
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USERNAME:-root}
-      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-password}
+      # No defaults — must be explicitly set. See MONGO_ROOT_USERNAME /
+      # MONGO_ROOT_PASSWORD in .env.example.
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME must be set}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD must be set}
     volumes:
       - mongo_data:/data/db
     networks:
       - backend-db
     mem_limit: ${MONGO_MEM_LIMIT:-1g}
     cpus: ${MONGO_CPUS:-1.0}
+    # Healthy only once rs0 is initiated AND this member is PRIMARY. The first
+    # probe performs rs.initiate(); subsequent probes flip healthy once the
+    # single-node election completes (~seconds). dependents (backend, backup)
+    # wait on service_healthy, so they never start against a non-primary node.
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  # Runs a mongodump every 24 hours and retains 7 days of backups.
-  # Backups are written to the host path defined by BACKUP_DIR (default: ./backups).
-  backup:
-    image: mongo:7
-    entrypoint: >
-      /bin/sh -c '
-        while true; do
-          echo "[backup] $(date -u) — starting backup";
-          mongodump
-            --uri="$$MONGO_URI"
-            --archive="/backups/$$(date -u +%Y%m%dT%H%M%SZ).gz"
-            --gzip &&
-          echo "[backup] done" ||
-          echo "[backup] FAILED";
-          find /backups -name "*.gz" -mtime +$$RETAIN_DAYS -delete;
-          sleep 86400;
-        done
-      '
-    environment:
-      - MONGO_URI=mongodb://${MONGO_ROOT_USERNAME:-root}:${MONGO_ROOT_PASSWORD:-password}@mongo:27017/stellaredupay?authSource=admin
-      - RETAIN_DAYS=${RETAIN_DAYS:-7}
-    volumes:
-      - ${BACKUP_DIR:-./backups}:/backups
-    depends_on:
-      mongo:
-        condition: service_healthy
-    networks:
-      - backend-db
+      test: |
+        mongosh -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --quiet --eval "
+          var status;
+          try {
+            status = rs.status();
+          } catch (e) {
+            try { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }); } catch (e2) {}
+            quit(1);
+          }
+          if (status.ok !== 1 || !db.hello().isWritablePrimary) { quit(1); }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 20s
     restart: unless-stopped
 
-volumes:
-  mongo_data:
+  # Runs scripts/backup.sh every 24 hours and retains RETAIN_DAYS of backups.
+  # Backups are written to the host path defined by BACKUP_DIR (default: ./backups).
+  #
+  # This deliberately invokes the SAME verified scripts/backup.sh used for
+  # manual/CI backups rather than a raw mongodump call, so the compose-embedded
+  # path carries identical integrity guarantees (minimum-size check +
+  # mongorestore --dryRun verification + retention pruning). See issue #1106 —
+  # there is now a single, well
 
-networks:
-  frontend-backend:
-    driver: bridge
-  backend-db:
-    driver: bridge
+/* … truncated 5320 chars — edit only what you need near the top … */

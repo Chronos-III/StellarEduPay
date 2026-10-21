@@ -7,6 +7,14 @@ const { logAudit } = require('../services/auditService');
 const { verifyStellarAccountFunding } = require('../services/stellarAccountVerificationService');
 const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 const schoolCache = require('../services/schoolCacheInvalidator');
+const {
+  parseOverlapSeconds,
+  applySecretRotation,
+  findLegacySchoolEndpoint,
+  upsertLegacySchoolEndpoint,
+  setWebhookDeprecationHeaders,
+  generateWebhookSecret,
+} = require('../services/webhookEndpointService');
 const { isSupportedCurrency } = require('../services/currencyConversionService');
 
 function isValidTimezone(tz) {
@@ -61,7 +69,7 @@ async function createSchool(req, res, next) {
     }
 
     // Verify Stellar account funding (non-blocking)
-    const { isFunded, warning } = await verifyStellarAccountFunding(stellarAddress);
+    const { warning } = await verifyStellarAccountFunding(stellarAddress);
 
     const schoolId = `SCH-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
     const school = await School.create({
@@ -72,6 +80,8 @@ async function createSchool(req, res, next) {
       network: network || 'testnet',
       adminEmail: adminEmail || null,
       address: address || null,
+      // A new wallet's pre-existing history is not ingested (#1818).
+      ingestStartsAt: new Date(),
       ...(localCurrency !== undefined && { localCurrency: localCurrency.toUpperCase() }),
       ...(timezone !== undefined && { timezone }),
       ...(suspiciousPaymentMultiplier !== undefined && { suspiciousPaymentMultiplier }),
@@ -92,6 +102,8 @@ async function createSchool(req, res, next) {
         userAgent: req.auditContext.userAgent,
       });
     }
+
+    schoolCache.invalidate(school);
 
     // Return 202 with warning if account is unfunded
     if (warning) {
@@ -119,43 +131,72 @@ async function createSchool(req, res, next) {
 // GET /api/schools
 async function getAllSchools(req, res, next) {
   try {
+    // ?includeInactive=true is gated by requireAdminAuth in schoolRoutes.js
     const includeInactive = req.query.includeInactive === 'true';
 
-    // ?includeInactive=true is admin-only — verify JWT inline
-    if (includeInactive) {
-      const jwt = require('jsonwebtoken');
-      const authHeader = req.headers['authorization'];
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Authentication required to include inactive schools.', code: 'MISSING_AUTH_TOKEN' });
-      }
-      try {
-        const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
-        if (decoded.role !== 'admin') {
-          return res.status(403).json({ error: 'Admin role required to include inactive schools.', code: 'INSUFFICIENT_ROLE' });
-        }
-      } catch {
-        return res.status(401).json({ error: 'Invalid token.', code: 'INVALID_AUTH_TOKEN' });
-      }
-    }
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
 
     const query = includeInactive ? {} : { isActive: true };
-    const schools = await School.find(query).sort({ name: 1 }).lean();
-    res.json(schools);
+    if (typeof req.query.q === 'string' && req.query.q.trim()) {
+      const escaped = req.query.q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      query.name = { $regex: escaped, $options: 'i' };
+    }
+    const publicFields = {
+      schoolId: 1,
+      name: 1,
+      slug: 1,
+      stellarAddress: 1,
+      previousStellarAddress: 1,
+      network: 1,
+      isActive: 1,
+      adminEmail: 1,
+      address: 1,
+      contactEmail: 1,
+      localCurrency: 1,
+      timezone: 1,
+      suspiciousPaymentMultiplier: 1,
+      suspiciousAmountConfig: 1,
+      maxPaymentMultiplier: 1,
+      maxStudents: 1,
+      logoUrl: 1,
+      supportContact: 1,
+      primaryColor: 1,
+      emailLocale: 1,
+      maintenanceMode: 1,
+      webhookPayloadConfig: 1,
+      classOptions: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const [schools, total] = await Promise.all([
+      School.find(query, publicFields)
+        .sort({ name: 1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      School.countDocuments(query),
+    ]);
+    res.json({
+      schools,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
   } catch (err) {
     next(err);
   }
 }
 
-// GET /api/schools/:schoolSlug
+// GET /api/schools/:schoolId
 async function getSchool(req, res, next) {
   try {
     const school = await School.findOne({
-      slug: req.params.schoolSlug.toLowerCase(),
+      schoolId: req.params.schoolId,
       isActive: true,
     }, {
       jwtSecret: 0,
-      webhookSecret: 0,
       internalNotes: 0,
+      mfaSecret: 0,
+      mfaBackupCodes: 0,
     }).lean();
     if (!school) {
       const e = new Error('School not found');
@@ -171,7 +212,7 @@ async function getSchool(req, res, next) {
 // PATCH /api/schools/:schoolSlug
 async function updateSchool(req, res, next) {
   try {
-    const allowed = ['name', 'stellarAddress', 'network', 'adminEmail', 'address', 'suspiciousPaymentMultiplier', 'suspiciousAmountConfig', 'localCurrency'];
+    const allowed = ['name', 'stellarAddress', 'network', 'adminEmail', 'address', 'suspiciousPaymentMultiplier', 'suspiciousAmountConfig', 'localCurrency', 'classOptions'];
     const updates = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
@@ -243,7 +284,24 @@ async function updateSchool(req, res, next) {
       updates.localCurrency = String(updates.localCurrency).toUpperCase();
     }
 
-    const original = await School.findOne({ slug: req.params.schoolSlug.toLowerCase(), isActive: true }).lean();
+    // Issue #1337: Validate classOptions if being updated
+    if (updates.classOptions !== undefined) {
+      if (!Array.isArray(updates.classOptions) || updates.classOptions.length === 0) {
+        return res.status(400).json({
+          error: 'classOptions must be a non-empty array of class/grade names',
+          code: 'INVALID_CLASS_OPTIONS',
+        });
+      }
+      if (!updates.classOptions.every(opt => typeof opt === 'string' && opt.trim().length > 0)) {
+        return res.status(400).json({
+          error: 'All classOptions must be non-empty strings',
+          code: 'INVALID_CLASS_OPTIONS',
+        });
+      }
+      updates.classOptions = updates.classOptions.map(opt => opt.trim());
+    }
+
+    const original = await School.findOne({ schoolId: req.params.schoolId, isActive: true }).lean();
     if (!original) {
       const e = new Error('School not found');
       e.code = 'NOT_FOUND';
@@ -253,12 +311,12 @@ async function updateSchool(req, res, next) {
     // Verify Stellar account funding if address is being updated (non-blocking)
     let warning = null;
     if (updates.stellarAddress) {
-      const { isFunded, warning: fundingWarning } = await verifyStellarAccountFunding(updates.stellarAddress);
+      const { warning: fundingWarning } = await verifyStellarAccountFunding(updates.stellarAddress);
       warning = fundingWarning;
     }
 
     const school = await School.findOneAndUpdate(
-      { slug: req.params.schoolSlug.toLowerCase(), isActive: true },
+      { schoolId: req.params.schoolId, isActive: true },
       updates,
       { new: true, runValidators: true }
     );
@@ -302,49 +360,213 @@ async function updateSchool(req, res, next) {
   }
 }
 
-// DELETE /api/schools/:schoolSlug  (soft-delete)
-async function deactivateSchool(req, res, next) {
+// PUT /api/schools/:schoolId/stellar-address
+// Issue #1387: a dedicated, audited wallet-rotation endpoint. Requires the
+// same step-up password confirmation as the stellarAddress path in
+// updateSchool() above, plus a mandatory `reason` — rotating a school's
+// payment-receiving wallet has no legitimate "no reason given" case, and the
+// reason is what makes the audit trail (and docs/runbooks/wallet-rotation.md)
+// useful during an incident review.
+async function rotateStellarAddress(req, res, next) {
   try {
-    const school = await School.findOneAndUpdate(
-      { slug: req.params.schoolSlug.toLowerCase() },
-      { isActive: false },
-      { new: true }
-    );
+    const { stellarAddress, reason, confirmPassword } = req.body || {};
+
+    if (!reason || typeof reason !== 'string' || !reason.trim()) {
+      return res.status(400).json({
+        error: 'A reason is required when rotating a school\'s Stellar wallet address.',
+        code: 'REASON_REQUIRED',
+      });
+    }
+
+    if (!stellarAddress || !StellarSdk.StrKey.isValidEd25519PublicKey(stellarAddress)) {
+      return res.status(400).json({
+        error: 'stellarAddress must be a valid Stellar public key (Ed25519)',
+        code: 'INVALID_STELLAR_ADDRESS',
+      });
+    }
+
+    // Step-up authentication — same pattern as updateSchool()'s stellarAddress
+    // path: a valid admin session alone (requireAdminAuth) is not sufficient
+    // to move where a school's fee payments are received.
+    const expectedPassword = process.env.ADMIN_PASSWORD;
+    const bufExpected = Buffer.from(expectedPassword || '');
+    const bufProvided = Buffer.from(confirmPassword || '');
+    const passwordOk =
+      !!expectedPassword &&
+      !!confirmPassword &&
+      bufExpected.length === bufProvided.length &&
+      crypto.timingSafeEqual(bufExpected, bufProvided);
+
+    if (!passwordOk) {
+      return res.status(403).json({
+        error: 'Password confirmation required for stellarAddress rotation',
+        code: 'STEP_UP_REQUIRED',
+      });
+    }
+
+    const school = await School.findOne({ schoolId: req.params.schoolId, isActive: true });
     if (!school) {
       const e = new Error('School not found');
       e.code = 'NOT_FOUND';
       return next(e);
     }
 
-    // Drop the cached copy everywhere so deactivation blocks requests at once.
+    if (school.stellarAddress === stellarAddress) {
+      return res.status(400).json({
+        error: 'New stellarAddress must differ from the current address',
+        code: 'STELLAR_ADDRESS_UNCHANGED',
+      });
+    }
+
+    const previousStellarAddress = school.stellarAddress;
+
+    // Verify the new Stellar account is funded (non-blocking — same as
+    // updateSchool()'s stellarAddress path).
+    const { warning } = await verifyStellarAccountFunding(stellarAddress);
+
+    school.previousStellarAddress = previousStellarAddress;
+    school.stellarAddress = stellarAddress;
+    // A cursor scoped to the old address has no meaning against the new
+    // address's transaction history — see docs/runbooks/wallet-rotation.md
+    // for draining the old address and confirming no in-flight payments are
+    // missed across the cutover.
+    school.syncCursor = null;
+    // The new wallet's pre-existing history must not be credited as fees (#1818).
+    school.ingestStartsAt = new Date();
+    await school.save();
+
     schoolCache.invalidate(school);
 
-    // Audit log
     if (req.auditContext) {
       await logAudit({
         schoolId: school.schoolId,
-        action: 'school_deactivate',
+        action: 'school_stellar_address_rotated',
         performedBy: req.auditContext.performedBy,
         targetId: school.schoolId,
         targetType: 'school',
-        details: { name: school.name, slug: school.slug },
+        details: {
+          previousStellarAddress,
+          newStellarAddress: stellarAddress,
+          reason: reason.trim(),
+          severity: 'high',
+        },
         result: 'success',
         ipAddress: req.auditContext.ipAddress,
         userAgent: req.auditContext.userAgent,
       });
     }
 
-    res.json({ message: `School "${school.name}" deactivated` });
+    if (warning) {
+      return res.status(202).json({ ...school.toObject(), warning });
+    }
+
+    res.json(school);
+  } catch (err) {
+    if (err.name === 'ValidationError') {
+      const validationErrors = Object.values(err.errors).map(e => e.message);
+      return res.status(400).json({ errors: validationErrors, code: 'VALIDATION_ERROR' });
+    }
+    next(err);
+  }
+}
+
+// PUT /api/schools/:schoolId/webhook-secret
+// Issue #1412: regenerating the webhook secret controls webhook signature
+// verification, so — like stellarAddress — it requires the same step-up
+// password confirmation before a new session-hijacked admin can silently
+// take over webhook delivery for a school.
+//
+// DEPRECATED (#1640): School.webhookSecret no longer exists. This rotates the
+// secret of the school's legacy WebhookEndpoint (with the same dual-signing
+// overlap as POST /api/webhook-endpoints/:id/rotate-secret). Will be removed
+// in the next release.
+async function rotateWebhookSecret(req, res, next) {
+  try {
+    setWebhookDeprecationHeaders(res);
+    const { confirmPassword, overlapSeconds } = req.body || {};
+
+    const expectedPassword = process.env.ADMIN_PASSWORD;
+    const bufExpected = Buffer.from(expectedPassword || '');
+    const bufProvided = Buffer.from(confirmPassword || '');
+    const passwordOk =
+      !!expectedPassword &&
+      !!confirmPassword &&
+      bufExpected.length === bufProvided.length &&
+      crypto.timingSafeEqual(bufExpected, bufProvided);
+
+    if (!passwordOk) {
+      return res.status(403).json({
+        error: 'Password confirmation required for webhookSecret rotation',
+        code: 'STEP_UP_REQUIRED',
+      });
+    }
+
+    const school = await School.findOne({ schoolId: req.params.schoolId, isActive: true });
+    if (!school) {
+      const e = new Error('School not found');
+      e.code = 'NOT_FOUND';
+      return next(e);
+    }
+
+    const overlap = parseOverlapSeconds(overlapSeconds);
+    if (!overlap.ok) {
+      return res.status(400).json({ error: overlap.error, code: 'VALIDATION_ERROR' });
+    }
+
+    const endpoint = await findLegacySchoolEndpoint(school.schoolId, { withSecrets: true });
+    if (!endpoint) {
+      return res.status(404).json({
+        error: 'No school webhook is registered. Manage webhooks via /api/webhook-endpoints.',
+        code: 'NOT_FOUND',
+      });
+    }
+
+    const newSecret = generateWebhookSecret();
+    applySecretRotation(endpoint, newSecret, overlap.value);
+    await endpoint.save();
+
+    if (req.auditContext) {
+      await logAudit({
+        schoolId: school.schoolId,
+        action: 'school_webhook_secret_rotated',
+        performedBy: req.auditContext.performedBy,
+        targetId: school.schoolId,
+        targetType: 'school',
+        details: {
+          severity: 'high',
+          endpointId: String(endpoint._id),
+          overlapSeconds: overlap.value,
+          previousSecretExpiresAt: endpoint.previousSecretExpiresAt,
+          deprecatedRoute: true,
+        },
+        result: 'success',
+        ipAddress: req.auditContext.ipAddress,
+        userAgent: req.auditContext.userAgent,
+      });
+    }
+
+    // The plaintext secret is only ever returned once, at rotation time — it
+    // is encrypted at rest (webhookEndpointModel's pre-save hook).
+    res.json({
+      webhookSecret: newSecret,
+      endpointId: String(endpoint._id),
+      previousSecretExpiresAt: endpoint.previousSecretExpiresAt,
+      deprecated: true,
+    });
   } catch (err) {
     next(err);
   }
 }
 
-// PATCH /api/schools/:schoolSlug/deactivate
-async function deactivateSchoolEndpoint(req, res, next) {
+// PATCH /api/schools/:schoolId/deactivate
+// Single code path for soft-deactivating a school. Side effects:
+//   - sets isActive=false
+//   - writes a school_deactivate audit log entry
+//   - invalidates the school cache so requests for it are blocked at once
+async function deactivateSchool(req, res, next) {
   try {
     const school = await School.findOneAndUpdate(
-      { slug: req.params.schoolSlug.toLowerCase() },
+      { schoolId: req.params.schoolId },
       { isActive: false },
       { new: true }
     );
@@ -375,11 +597,18 @@ async function deactivateSchoolEndpoint(req, res, next) {
   }
 }
 
-// PATCH /api/schools/:schoolSlug/activate
+// DELETE /api/schools/:schoolId — deprecated alias for PATCH /:schoolId/deactivate
+function deprecatedDeleteSchool(req, res, next) {
+  res.set('Deprecation', 'true');
+  res.set('Link', `</api/schools/${req.params.schoolId}/deactivate>; rel="successor-version"`);
+  return deactivateSchool(req, res, next);
+}
+
+// PATCH /api/schools/:schoolId/activate
 async function activateSchool(req, res, next) {
   try {
     const school = await School.findOneAndUpdate(
-      { slug: req.params.schoolSlug.toLowerCase() },
+      { schoolId: req.params.schoolId },
       { isActive: true },
       { new: true }
     );
@@ -411,8 +640,15 @@ async function activateSchool(req, res, next) {
 }
 
 // POST /api/schools/:slug/webhooks
+//
+// DEPRECATED (#1640): WebhookEndpoint is the only webhook configuration model.
+// This route now creates (or re-points) the school's legacy WebhookEndpoint,
+// subscribed to the events the old School.webhookUrl path delivered, and
+// answers with a Deprecation header. Will be removed in the next release —
+// use POST /api/webhook-endpoints.
 async function registerWebhook(req, res, next) {
   try {
+    setWebhookDeprecationHeaders(res);
     const { webhookUrl } = req.body;
 
     if (!webhookUrl || typeof webhookUrl !== 'string') {
@@ -424,17 +660,19 @@ async function registerWebhook(req, res, next) {
       return res.status(400).json({ error: 'webhookUrl must use https:// and resolve to a public IP address', code: 'INVALID_WEBHOOK_URL' });
     }
 
-    const school = await School.findOneAndUpdate(
-      { slug: req.params.slug, isActive: true },
-      { webhookUrl },
-      { new: true }
-    );
+    const school = await School.findOne({ slug: req.params.slug, isActive: true });
 
     if (!school) {
       const e = new Error('School not found');
       e.code = 'NOT_FOUND';
       return next(e);
     }
+
+    const { endpoint, created, secret } = await upsertLegacySchoolEndpoint({
+      schoolId: school.schoolId,
+      url: webhookUrl,
+      createdBy: req.auditContext?.performedBy || null,
+    });
 
     if (req.auditContext) {
       await logAudit({
@@ -443,25 +681,33 @@ async function registerWebhook(req, res, next) {
         performedBy: req.auditContext.performedBy,
         targetId: school.schoolId,
         targetType: 'school',
-        details: { webhookUrl },
+        details: { webhookUrl, endpointId: String(endpoint._id), created, deprecatedRoute: true },
         result: 'success',
         ipAddress: req.auditContext.ipAddress,
         userAgent: req.auditContext.userAgent,
       });
     }
 
-    schoolCache.invalidate(school);
-    res.json({ webhookUrl: school.webhookUrl });
+    const body = {
+      webhookUrl: endpoint.url,
+      endpointId: String(endpoint._id),
+      subscribedEvents: endpoint.subscribedEvents,
+      deprecated: true,
+    };
+    // A newly created endpoint's secret is returned once, like
+    // POST /api/webhook-endpoints.
+    if (created) body.webhookSecret = secret;
+    res.status(created ? 201 : 200).json(body);
   } catch (err) {
     next(err);
   }
 }
 
-// GET /api/schools/:schoolSlug/settings
+// GET /api/schools/:schoolId/settings
 async function getSchoolSettings(req, res, next) {
   try {
     const { getSchoolSettings } = require('../services/schoolSettingsService');
-    const school = await School.findOne({ slug: req.params.schoolSlug.toLowerCase(), isActive: true }, { schoolId: 1 }).lean();
+    const school = await School.findOne({ schoolId: req.params.schoolId, isActive: true }, { schoolId: 1 }).lean();
     if (!school) return next(Object.assign(new Error('School not found'), { code: 'NOT_FOUND' }));
     const settings = await getSchoolSettings(school.schoolId);
     res.json({ settings });
@@ -470,11 +716,11 @@ async function getSchoolSettings(req, res, next) {
   }
 }
 
-// PATCH /api/schools/:schoolSlug/settings
+// PATCH /api/schools/:schoolId/settings
 async function updateSchoolSettings(req, res, next) {
   try {
     const { setSchoolSetting, SETTING_KEYS } = require('../services/schoolSettingsService');
-    const school = await School.findOne({ slug: req.params.schoolSlug.toLowerCase(), isActive: true }, { schoolId: 1 }).lean();
+    const school = await School.findOne({ schoolId: req.params.schoolId, isActive: true }, { schoolId: 1 }).lean();
     if (!school) return next(Object.assign(new Error('School not found'), { code: 'NOT_FOUND' }));
 
     const updated = {};
@@ -506,11 +752,11 @@ async function updateSchoolSettings(req, res, next) {
   }
 }
 
-// DELETE /api/schools/:schoolSlug/settings/:key
+// DELETE /api/schools/:schoolId/settings/:key
 async function clearSchoolSetting(req, res, next) {
   try {
     const { clearSchoolSetting, SETTING_KEYS } = require('../services/schoolSettingsService');
-    const school = await School.findOne({ slug: req.params.schoolSlug.toLowerCase(), isActive: true }, { schoolId: 1 }).lean();
+    const school = await School.findOne({ schoolId: req.params.schoolId, isActive: true }, { schoolId: 1 }).lean();
     if (!school) return next(Object.assign(new Error('School not found'), { code: 'NOT_FOUND' }));
 
     const { key } = req.params;
@@ -535,10 +781,10 @@ async function clearSchoolSetting(req, res, next) {
       });
     }
 
-    res.json({ message: `Setting "${key}" cleared for school`, schoolSlug: req.params.schoolSlug });
+    res.json({ message: `Setting "${key}" cleared for school`, schoolId: req.params.schoolId });
   } catch (err) {
     next(err);
   }
 }
 
-module.exports = { createSchool, getAllSchools, getSchool, updateSchool, deactivateSchool, deactivateSchoolEndpoint, activateSchool, registerWebhook, getSchoolSettings, updateSchoolSettings, clearSchoolSetting };
+module.exports = { createSchool, getAllSchools, getSchool, updateSchool, rotateStellarAddress, rotateWebhookSecret, deactivateSchool, deprecatedDeleteSchool, activateSchool, registerWebhook, getSchoolSettings, updateSchoolSettings, clearSchoolSetting };

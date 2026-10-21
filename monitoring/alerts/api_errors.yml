@@ -1,0 +1,48 @@
+groups:
+  - name: api_errors
+    interval: 60s
+    rules:
+      # ── Warning: sustained elevated 5xx rate ──────────────────────────────
+      # http_request_duration_seconds_count{method,route,status} is recorded
+      # for every request by the requestLogger middleware. A 5% error rate
+      # sustained for 10 minutes is well above normal background noise
+      # (transient DB blips, individual bad requests) without being so
+      # sensitive that a single slow deploy trips it.
+      - alert: ApiHigh5xxRateWarning
+        expr: >
+          sum(rate(http_request_duration_seconds_count{status=~"5.."}[10m]))
+            /
+          clamp_min(sum(rate(http_request_duration_seconds_count[10m])), 0.001)
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated HTTP 5xx rate on the API"
+          description: >
+            {{ $value | printf "%.1f%%" }} of requests have returned a 5xx
+            status over the last 10 minutes. This includes the payment
+            confirmation and processing endpoints. Check application logs and
+            the mongodb_connection_state / horizon_circuit_breaker_state
+            gauges for a root cause before escalating.
+
+      # ── Critical: fast-burn 5xx spike ─────────────────────────────────────
+      # A short (5m), high (20%) ratio catches an acute outage (e.g. a bad
+      # deploy or a dependency going down hard) far faster than the 10m/5%
+      # warning window would, at the cost of being noisier on brief blips —
+      # acceptable for a critical page on the payment-processing path.
+      - alert: ApiHigh5xxRateCritical
+        expr: >
+          sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(http_request_duration_seconds_count[5m])), 0.001)
+            > 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical HTTP 5xx rate on the API — payment processing likely impacted"
+          description: >
+            {{ $value | printf "%.1f%%" }} of requests have returned a 5xx
+            status over the last 5 minutes. This is very likely an active
+            incident on the payment-processing path. Page on-call.

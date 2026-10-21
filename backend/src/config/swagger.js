@@ -1,101 +1,34 @@
 'use strict';
 
 /**
- * OpenAPI 3.0 specification for StellarEduPay API
+ * OpenAPI specification for StellarEduPay API
  * Issue #671: Serves at GET /api/docs.json
  */
 
+const path = require('path');
 const swaggerJsdoc = require('swagger-jsdoc');
+
+// Issue #1632: backend/openapi.json is the single source of truth for the HTTP
+// contract. It is generated from the routers by scripts/openapi/generate.js and
+// CI fails when it drifts (undocumented routes, stale paths, frontend/docs
+// calls to paths that do not exist). Hand-written summaries, request bodies and
+// responses live in that file; @swagger JSDoc blocks in the routers are merged
+// on top for the few endpoints that still carry them.
+const contract = require('../../openapi.json');
 
 const options = {
   definition: {
-    openapi: '3.0.0',
-    info: {
-      title: 'StellarEduPay API',
-      version: '1.0.0',
-      description: 'Decentralized school fee payment system built on Stellar blockchain',
-      contact: {
-        name: 'StellarEduPay Support',
-        url: 'https://github.com/manuelusman73-png/StellarEduPay',
-      },
-      license: {
-        name: 'MIT',
-        url: 'https://opensource.org/licenses/MIT',
-      },
-    },
+    ...contract,
     servers: [
       {
-        url: process.env.API_URL || 'http://localhost:5000/api',
+        url: process.env.API_ORIGIN || 'http://localhost:5000',
         description: 'API Server',
       },
     ],
-    components: {
-      securitySchemes: {
-        BearerAuth: {
-          type: 'http',
-          scheme: 'bearer',
-          bearerFormat: 'JWT',
-          description: 'JWT token for admin authentication',
-        },
-      },
-      schemas: {
-        Payment: {
-          type: 'object',
-          properties: {
-            _id: { type: 'string' },
-            schoolId: { type: 'string' },
-            studentId: { type: 'string' },
-            txHash: { type: 'string' },
-            amount: { type: 'number' },
-            feeAmount: { type: 'number' },
-            status: { type: 'string', enum: ['PENDING', 'SUBMITTED', 'SUCCESS', 'FAILED', 'DISPUTED', 'INVALID'] },
-            confirmedAt: { type: 'string', format: 'date-time' },
-            feeValidationStatus: { type: 'string', enum: ['valid', 'underpaid', 'overpaid', 'partial', 'unknown'] },
-          },
-        },
-        Student: {
-          type: 'object',
-          properties: {
-            _id: { type: 'string' },
-            schoolId: { type: 'string' },
-            studentId: { type: 'string' },
-            name: { type: 'string' },
-            class: { type: 'string' },
-            feeAmount: { type: 'number' },
-            contactEmail: { type: 'string', format: 'email' },
-          },
-        },
-        School: {
-          type: 'object',
-          properties: {
-            _id: { type: 'string' },
-            schoolId: { type: 'string' },
-            name: { type: 'string' },
-            slug: { type: 'string' },
-            stellarAddress: { type: 'string' },
-            network: { type: 'string', enum: ['testnet', 'mainnet'] },
-            isActive: { type: 'boolean' },
-          },
-        },
-        Error: {
-          type: 'object',
-          properties: {
-            error: { type: 'string' },
-            code: { type: 'string' },
-          },
-        },
-      },
-    },
-    security: [
-      {
-        BearerAuth: [],
-      },
-    ],
   },
-  apis: [
-    './backend/src/routes/*.js',
-    './backend/src/controllers/*.js',
-  ],
+  // Absolute so annotations are found regardless of the process CWD (the
+  // relative './backend/src/...' globs only matched from the repo root).
+  apis: [path.join(__dirname, '../routes/*.js')],
 };
 
 const specs = swaggerJsdoc(options);

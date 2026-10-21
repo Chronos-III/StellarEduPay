@@ -12,7 +12,7 @@
  */
 
 process.env.MONGO_URI  = 'mongodb://localhost:27017/test';
-process.env.JWT_SECRET = 'test-secret-for-cache-headers';
+process.env.JWT_SECRET = 'test-jwt-secret-1234567890abcdef';
 
 const request = require('supertest');
 const jwt     = require('jsonwebtoken');
@@ -36,10 +36,6 @@ jest.mock('../backend/src/services/retryService',   () => ({
   queueForRetry: jest.fn(), startRetryWorker: jest.fn(), stopRetryWorker: jest.fn(),
   isRetryWorkerRunning: jest.fn().mockReturnValue(false),
 }));
-jest.mock('../backend/src/utils/memoEncryption',    () => ({
-  encryptMemo: jest.fn(x => x), isEncryptionEnabled: jest.fn(() => false),
-}));
-
 const app = require('../backend/src/app');
 
 // ── Cache-Control tests via HTTP ──────────────────────────────────────────────

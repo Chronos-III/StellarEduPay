@@ -35,6 +35,7 @@ module.exports = {
       subject: message.subject,
       text: message.text,
       html: message.html,
+      ...(message.headers && { headers: message.headers }),
     });
     return { messageId: info.messageId };
   },

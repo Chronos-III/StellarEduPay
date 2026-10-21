@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { flagDispute } from "../services/api";
 import { getErrorMessage } from "../utils/errorMessages";
+import { validateStellarTxHash } from "../utils/stellarTxHash";
+import { useTranslation } from "react-i18next";
 
 /**
  * DisputeForm — lets a parent raise a dispute for a confirmed payment.
@@ -12,8 +14,10 @@ import { getErrorMessage } from "../utils/errorMessages";
  *   onCancel  {function} — called when the user dismisses the form
  */
 export default function DisputeForm({ txHash, studentId, onSuccess, onCancel }) {
+  const { t } = useTranslation();
   const [raisedBy, setRaisedBy] = useState("");
   const [reason, setReason] = useState("");
+  const [contactEmail, setContactEmail] = useState("");
   const [errors, setErrors] = useState({});
   const [submitting, setSubmitting] = useState(false);
   const [serverError, setServerError] = useState(null);
@@ -21,10 +25,17 @@ export default function DisputeForm({ txHash, studentId, onSuccess, onCancel }) 
 
   function validate() {
     const e = {};
-    if (!raisedBy.trim()) e.raisedBy = "Your name is required.";
-    else if (raisedBy.trim().length > 200) e.raisedBy = "Must be 200 characters or fewer.";
-    if (!reason.trim()) e.reason = "Reason is required.";
-    else if (reason.trim().length > 1000) e.reason = "Must be 1000 characters or fewer.";
+    if (!raisedBy.trim()) e.raisedBy = t("disputeForm.nameRequired");
+    else if (raisedBy.trim().length > 200) e.raisedBy = t("disputeForm.nameTooLong");
+    if (contactEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim())) {
+      e.contactEmail = "Enter a valid email address.";
+    }
+    if (!reason.trim()) e.reason = t("disputeForm.reasonRequired");
+    else if (reason.trim().length > 1000) e.reason = t("disputeForm.reasonTooLong");
+    const hashVal = validateStellarTxHash(txHash);
+    if (!hashVal.valid) {
+      e.txHash = t("disputeForm.invalidTxHash") || hashVal.error;
+    }
     return e;
   }
 
@@ -42,14 +53,20 @@ export default function DisputeForm({ txHash, studentId, onSuccess, onCancel }) 
     setSubmitting(true);
 
     try {
-      const res = await flagDispute({ txHash, studentId, raisedBy: raisedBy.trim(), reason: reason.trim() });
+      const res = await flagDispute({
+        txHash,
+        studentId,
+        raisedBy: raisedBy.trim(),
+        reason: reason.trim(),
+        ...(contactEmail.trim() ? { raisedByEmail: contactEmail.trim() } : {}),
+      });
       onSuccess && onSuccess(res.data);
     } catch (err) {
       const data = err.response?.data;
       if (err.response?.status === 409 && data?.disputeId) {
         setExistingDisputeId(data.disputeId);
       } else {
-        setServerError(getErrorMessage(data?.code, data?.error) || "Failed to submit dispute. Please try again.");
+        setServerError(getErrorMessage(data?.code, data?.error) || t("disputeForm.failedToSubmit"));
       }
     } finally {
       setSubmitting(false);
@@ -70,16 +87,16 @@ export default function DisputeForm({ txHash, studentId, onSuccess, onCancel }) 
       }}
     >
       <h3 id="dispute-form-title" style={{ marginBottom: "0.25rem", fontSize: "1rem" }}>
-        Raise a Dispute
+        {t("disputeForm.title")}
       </h3>
       <p style={{ color: "var(--muted)", fontSize: "0.8rem", marginBottom: "1.25rem" }}>
-        Transaction: <code style={{ fontFamily: "monospace" }}>{txHash?.slice(0, 16)}…</code>
+        {t("disputeForm.transactionPrefix")}<code style={{ fontFamily: "monospace" }}>{txHash?.slice(0, 16)}…</code>
       </p>
 
       {existingDisputeId && (
         <div role="alert" style={{ background: "#fef9c3", border: "1px solid #fde68a", borderRadius: 6, padding: "0.75rem", fontSize: "0.85rem", color: "#854d0e", marginBottom: "1rem" }}>
-          A dispute is already open for this payment.{" "}
-          <strong>Dispute ID:</strong> <code>{existingDisputeId}</code>
+          {t("disputeForm.alreadyOpen")}{" "}
+          <strong>{t("disputeForm.disputeIdLabel")}</strong> <code>{existingDisputeId}</code>
         </div>
       )}
 
@@ -89,10 +106,16 @@ export default function DisputeForm({ txHash, studentId, onSuccess, onCancel }) 
         </div>
       )}
 
+      {errors.txHash && (
+        <div role="alert" style={{ background: "#fee2e2", border: "1px solid #fecaca", borderRadius: 6, padding: "0.75rem", fontSize: "0.85rem", color: "#991b1b", marginBottom: "1rem" }}>
+          {errors.txHash}
+        </div>
+      )}
+
       <form onSubmit={handleSubmit} noValidate>
         <div style={{ marginBottom: "1rem" }}>
           <label htmlFor="df-raisedBy" style={{ display: "block", fontSize: "0.78rem", textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--muted)", marginBottom: "0.3rem" }}>
-            Your Name
+            {t("disputeForm.nameLabel")}
           </label>
           <input
             id="df-raisedBy"
@@ -110,8 +133,27 @@ export default function DisputeForm({ txHash, studentId, onSuccess, onCancel }) 
         </div>
 
         <div style={{ marginBottom: "1.25rem" }}>
+          <label htmlFor="df-contactEmail" style={{ display: "block", fontSize: "0.78rem", textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--muted)", marginBottom: "0.3rem" }}>
+            Contact email for updates (optional)
+          </label>
+          <input
+            id="df-contactEmail"
+            type="email"
+            value={contactEmail}
+            onChange={(ev) => setContactEmail(ev.target.value)}
+            placeholder="Defaults to the parent email on file"
+            aria-describedby={errors.contactEmail ? "df-contactEmail-err" : undefined}
+            aria-invalid={!!errors.contactEmail}
+            style={{ width: "100%", padding: "0.6rem 0.75rem", border: `1px solid ${errors.contactEmail ? "#f87171" : "var(--border)"}`, borderRadius: 6, background: "var(--bg)", color: "var(--text)", fontSize: "0.9rem", boxSizing: "border-box" }}
+          />
+          {errors.contactEmail && (
+            <span id="df-contactEmail-err" role="alert" style={{ color: "#dc2626", fontSize: "0.78rem" }}>{errors.contactEmail}</span>
+          )}
+        </div>
+
+        <div style={{ marginBottom: "1.25rem" }}>
           <label htmlFor="df-reason" style={{ display: "block", fontSize: "0.78rem", textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--muted)", marginBottom: "0.3rem" }}>
-            Reason <span style={{ color: "var(--muted)", fontWeight: 400 }}>({reason.length}/1000)</span>
+            {t("disputeForm.reasonLabel")} <span style={{ color: "var(--muted)", fontWeight: 400 }}>({reason.length}/1000)</span>
           </label>
           <textarea
             id="df-reason"
@@ -134,14 +176,14 @@ export default function DisputeForm({ txHash, studentId, onSuccess, onCancel }) 
             onClick={onCancel}
             style={{ padding: "0.5rem 1rem", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg)", color: "var(--text)", cursor: "pointer", fontSize: "0.875rem" }}
           >
-            Cancel
+            {t("actions.cancel")}
           </button>
           <button
             type="submit"
             disabled={submitting}
             style={{ padding: "0.5rem 1.25rem", border: "none", borderRadius: 6, background: "var(--primary)", color: "#fff", cursor: submitting ? "not-allowed" : "pointer", fontSize: "0.875rem", opacity: submitting ? 0.7 : 1 }}
           >
-            {submitting ? "Submitting…" : "Submit Dispute"}
+            {submitting ? t("disputeForm.submitting") : t("disputeForm.submitDispute")}
           </button>
         </div>
       </form>

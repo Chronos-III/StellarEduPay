@@ -1,6 +1,7 @@
 'use strict';
 
-const { getAuditLogs, getRecentAuditLogs, verifyAuditChain } = require('../services/auditService');
+const { getAuditLogs, getRecentAuditLogs, verifyAuditChain, exportAuditLogs } = require('../services/auditService');
+const { csvEscape } = require('../utils/csv');
 
 /**
  * GET /api/audit-logs
@@ -18,7 +19,15 @@ const { getAuditLogs, getRecentAuditLogs, verifyAuditChain } = require('../servi
 async function getAuditLogsEndpoint(req, res, next) {
   try {
     const { schoolId } = req;
-    const { action, targetType, performedBy, result, startDate, endDate, cursor, page, limit } = req.query;
+    const { action, targetType, performedBy, result, search, startDate, endDate, cursor, page, limit } = req.query;
+
+    // Validate page and limit as positive integers if provided
+    if (page && (isNaN(parseInt(page, 10)) || parseInt(page, 10) < 1)) {
+      return res.status(400).json({ error: 'page must be a positive integer', code: 'VALIDATION_ERROR' });
+    }
+    if (limit && (isNaN(parseInt(limit, 10)) || parseInt(limit, 10) < 1)) {
+      return res.status(400).json({ error: 'limit must be a positive integer', code: 'VALIDATION_ERROR' });
+    }
 
     const auditResult = await getAuditLogs({
       schoolId,
@@ -26,6 +35,7 @@ async function getAuditLogsEndpoint(req, res, next) {
       targetType,
       performedBy,
       result,
+      search,
       startDate,
       endDate,
       cursor: cursor || null,
@@ -59,14 +69,79 @@ async function getRecentAuditLogsEndpoint(req, res, next) {
   }
 }
 
-module.exports = { getAuditLogsEndpoint, getRecentAuditLogsEndpoint, verifyChainEndpoint };
+/**
+ * GET /api/audit/export
+ *
+ * Download all matching audit logs as CSV or JSON (for compliance exports).
+ *
+ * Query parameters (all optional):
+ *   - format:      'csv' (default) or 'json'
+ *   - action, targetType, performedBy, result: same filters as GET /api/audit
+ *   - startDate, endDate: ISO 8601 date range
+ *   - limit: max rows to export (default/max: 10 000)
+ *
+ * CSV columns: _id, schoolId, action, targetType, targetId, performedBy,
+ *              result, errorMessage, ipAddress, createdAt
+ */
+async function exportAuditLogsEndpoint(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const {
+      format = 'csv',
+      action, targetType, performedBy, result,
+      startDate, endDate, limit,
+    } = req.query;
 
+    const logs = await exportAuditLogs({
+      schoolId, action, targetType, performedBy, result,
+      startDate, endDate, limit,
+    });
+
+    if (format === 'json') {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', 'attachment; filename="audit-export.json"');
+      return res.json(logs);
+    }
+
+    // Default: CSV
+    const CSV_COLUMNS = [
+      '_id', 'schoolId', 'action', 'targetType', 'targetId',
+      'performedBy', 'result', 'errorMessage', 'ipAddress', 'createdAt',
+    ];
+
+    const header = CSV_COLUMNS.join(',');
+    const rows = logs.map((log) =>
+      CSV_COLUMNS.map((col) => csvEscape(log[col])).join(',')
+    );
+    const csv = [header, ...rows].join('\r\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="audit-export.csv"');
+    return res.send(csv);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/audit/verify-chain
+ *
+ * Walks the per-school audit hash chain and reports any breaks. The chain is
+ * ordered by the monotonic `seq` assigned at append time (see auditService),
+ * not by `_id`, so concurrent writes cannot produce false positives.
+ *
+ * Query parameters:
+ *   - limit: max entries to verify (default: 1000, max: 5000)
+ */
 async function verifyChainEndpoint(req, res, next) {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 1000, 5000);
-    const report = await verifyAuditChain(req.schoolId, { limit });
+    const fromCheckpoint = req.query.fromCheckpoint === 'true';
+    const report = await verifyAuditChain(req.schoolId, { limit, fromCheckpoint });
     res.json(report);
   } catch (err) {
     next(err);
   }
 }
+
+module.exports = { getAuditLogsEndpoint, getRecentAuditLogsEndpoint, verifyChainEndpoint, exportAuditLogsEndpoint };

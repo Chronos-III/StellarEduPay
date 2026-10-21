@@ -26,9 +26,30 @@ const MIGRATIONS_DIR = path.join(__dirname, '../../migrations');
  * identify stuck locks.
  *
  * @param {Function} [_require] - injectable require for testing
+ * @param {object} [_db] - injectable database handle for testing
  */
-async function runMigrations(_require = require) {
-  if (!fs.existsSync(MIGRATIONS_DIR)) return;
+async function runMigrations(_require = require, _db = null) {
+  // Fail loudly rather than silently no-op. The migrations directory is a
+  // required part of every deployment (it is copied into the production image
+  // by backend/Dockerfile). If it is missing here we are almost certainly in a
+  // broken build/deploy where migrations would otherwise be skipped without a
+  // trace — that must abort the run so the operator notices, not proceed as if
+  // there were nothing to apply.
+  if (!fs.existsSync(MIGRATIONS_DIR)) {
+    throw new Error(
+      `[Migration] Migrations directory not found at "${MIGRATIONS_DIR}". ` +
+      'The production image must include the migrations/ directory ' +
+      '(see backend/Dockerfile). Refusing to continue.'
+    );
+  }
+
+  // Get database handle if not injected (normal operation)
+  let db = _db;
+  if (!db) {
+    const databaseConfig = require('../config/database');
+    const connection = databaseConfig.getConnection();
+    db = connection.db;
+  }
 
   const files = fs.readdirSync(MIGRATIONS_DIR)
     .filter(f => f.endsWith('.js'))
@@ -55,7 +76,7 @@ async function runMigrations(_require = require) {
     const logger = require('../utils/logger').child('Migration');
     logger.info(`Running: ${migration.version}`);
     try {
-      await migration.up();
+      await migration.up(db);
     } catch (err) {
       // Remove the lock document so the migration is not silently skipped on
       // the next run — the operator must fix the migration and redeploy.
@@ -78,8 +99,9 @@ async function runMigrations(_require = require) {
  * can be re-applied later.
  *
  * @param {Function} [_require] - injectable require for testing
+ * @param {object} [_db] - injectable database handle for testing
  */
-async function rollback(_require = require) {
+async function rollback(_require = require, _db = null) {
   const last = await Migration.findOne({ appliedAt: { $exists: true } })
     .sort({ appliedAt: -1 });
 
@@ -87,6 +109,14 @@ async function rollback(_require = require) {
     const logger = require('../utils/logger').child('Migration');
     logger.info('Nothing to roll back.');
     return;
+  }
+
+  // Get database handle if not injected (normal operation)
+  let db = _db;
+  if (!db) {
+    const databaseConfig = require('../config/database');
+    const connection = databaseConfig.getConnection();
+    db = connection.db;
   }
 
   // Find the matching file by version string
@@ -111,7 +141,7 @@ async function rollback(_require = require) {
 
   const logger = require('../utils/logger').child('Migration');
   logger.info(`Rolling back: ${last.version}`);
-  await migration.down();
+  await migration.down(db);
   await Migration.deleteOne({ version: last.version });
   logger.info(`Rolled back: ${last.version}`);
 }

@@ -13,6 +13,43 @@ const Payment = require('../models/paymentModel');
 const { DailyMetrics, MonthlyMetrics } = require('../models/metricsModel');
 const logger = require('../utils/logger');
 
+// #1766 — 'partial' and 'underpaid' are distinct statuses (see
+// docs/payment-plans-underpaid-reconciliation.md); both are counted so the
+// buckets always sum to paymentCount.
+const FEE_STATUSES = ['valid', 'partial', 'underpaid', 'overpaid', 'unknown'];
+
+/** Normalise a feeValidationStatus to one of FEE_STATUSES. */
+function _normaliseFeeStatus(status) {
+  return FEE_STATUSES.includes(status) ? status : 'unknown';
+}
+
+/** Build the per-status $inc/$sum counters for a single payment. */
+function _statusCounters(status) {
+  const normalised = _normaliseFeeStatus(status);
+  const counters = {};
+  for (const s of FEE_STATUSES) {
+    counters[`${s}Count`] = s === normalised ? 1 : 0;
+  }
+  return counters;
+}
+
+/** Merge per-asset amount maps ({ XLM: 1.2, USDC: 3 }) into a plain object. */
+function _mergeAssetTotals(target, source) {
+  for (const [asset, amount] of Object.entries(source || {})) {
+    target[asset] = (target[asset] || 0) + amount;
+  }
+  return target;
+}
+
+/** Round every asset total to 7 decimals. */
+function _roundAssetTotals(totals) {
+  const out = {};
+  for (const [asset, amount] of Object.entries(totals || {})) {
+    out[asset] = parseFloat(amount.toFixed(7));
+  }
+  return out;
+}
+
 /** Format a Date as 'YYYY-MM-DD' (UTC). */
 function _dayKey(date) {
   return new Date(date).toISOString().slice(0, 10);
@@ -34,13 +71,13 @@ async function incrementPaymentMetrics(payment) {
   const day   = _dayKey(confirmedAt);
   const month = _monthKey(confirmedAt);
 
+  const assetCode = payment.assetCode || 'XLM';
   const inc = {
-    paymentCount:   1,
-    totalAmount:    payment.amount || 0,
+    paymentCount:    1,
     totalFiatAmount: payment.fiatSnapshot?.fiatAmount || 0,
-    validCount:     payment.feeValidationStatus === 'valid'      ? 1 : 0,
-    overpaidCount:  payment.feeValidationStatus === 'overpaid'   ? 1 : 0,
-    underpaidCount: payment.feeValidationStatus === 'underpaid'  ? 1 : 0,
+    ..._statusCounters(payment.feeValidationStatus),
+    // #1767 — amounts are tracked per asset; never summed across assets.
+    [`assetTotals.${assetCode}`]: payment.amount || 0,
   };
 
   const setOnInsert = {
@@ -85,13 +122,26 @@ async function reconcileMetrics(schoolId, { startDate, endDate } = {}) {
       $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$confirmedAt', timezone: 'UTC' } },
         paymentCount:   { $sum: 1 },
-        totalAmount:    { $sum: '$amount' },
         totalFiatAmount:{ $sum: { $ifNull: ['$fiatSnapshot.fiatAmount', 0] } },
         fiatCurrency:   { $first: '$fiatSnapshot.fiatCurrency' },
         validCount:     { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'valid'] }, 1, 0] } },
-        overpaidCount:  { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'overpaid'] }, 1, 0] } },
+        partialCount:   { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'partial'] }, 1, 0] } },
         underpaidCount: { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'underpaid'] }, 1, 0] } },
+        overpaidCount:  { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'overpaid'] }, 1, 0] } },
+        unknownCount:   { $sum: { $cond: [{ $in: ['$feeValidationStatus', ['valid', 'partial', 'underpaid', 'overpaid']] }, 0, 1] } },
+        // #1767 — group amounts by asset so XLM and USDC are never added together.
+        assetTotals: {
+          $push: {
+            k: { $ifNull: ['$assetCode', 'XLM'] },
+            v: { $ifNull: ['$amount', 0] },
+          },
+        },
         uniqueStudents: { $addToSet: '$studentId' },
+      },
+    },
+    {
+      $addFields: {
+        assetTotals: { $arrayToObject: '$assetTotals' },
       },
     },
   ]);
@@ -105,12 +155,14 @@ async function reconcileMetrics(schoolId, { startDate, endDate } = {}) {
           schoolId,
           period:          r._id,
           paymentCount:    r.paymentCount,
-          totalAmount:     parseFloat(r.totalAmount.toFixed(7)),
+          assetTotals:     _roundAssetTotals(r.assetTotals),
           totalFiatAmount: parseFloat(r.totalFiatAmount.toFixed(2)),
           fiatCurrency:    r.fiatCurrency || null,
           validCount:      r.validCount,
-          overpaidCount:   r.overpaidCount,
+          partialCount:    r.partialCount,
           underpaidCount:  r.underpaidCount,
+          overpaidCount:   r.overpaidCount,
+          unknownCount:    r.unknownCount,
           uniqueStudents:  r.uniqueStudents.length,
           reconciledAt:    now,
         },
@@ -126,15 +178,17 @@ async function reconcileMetrics(schoolId, { startDate, endDate } = {}) {
   for (const r of dailyRows) {
     const m = r._id.slice(0, 7); // 'YYYY-MM'
     if (!monthMap[m]) {
-      monthMap[m] = { paymentCount: 0, totalAmount: 0, totalFiatAmount: 0, validCount: 0, overpaidCount: 0, underpaidCount: 0, students: new Set(), fiatCurrency: r.fiatCurrency };
+      monthMap[m] = { paymentCount: 0, assetTotals: {}, totalFiatAmount: 0, validCount: 0, partialCount: 0, underpaidCount: 0, overpaidCount: 0, unknownCount: 0, students: new Set(), fiatCurrency: r.fiatCurrency };
     }
     const mm = monthMap[m];
     mm.paymentCount   += r.paymentCount;
-    mm.totalAmount    += r.totalAmount;
+    _mergeAssetTotals(mm.assetTotals, r.assetTotals);
     mm.totalFiatAmount+= r.totalFiatAmount;
     mm.validCount     += r.validCount;
-    mm.overpaidCount  += r.overpaidCount;
+    mm.partialCount   += r.partialCount;
     mm.underpaidCount += r.underpaidCount;
+    mm.overpaidCount  += r.overpaidCount;
+    mm.unknownCount   += r.unknownCount;
     r.uniqueStudents.forEach(s => mm.students.add(s));
   }
 
@@ -146,12 +200,14 @@ async function reconcileMetrics(schoolId, { startDate, endDate } = {}) {
           schoolId,
           period,
           paymentCount:    m.paymentCount,
-          totalAmount:     parseFloat(m.totalAmount.toFixed(7)),
+          assetTotals:     _roundAssetTotals(m.assetTotals),
           totalFiatAmount: parseFloat(m.totalFiatAmount.toFixed(2)),
           fiatCurrency:    m.fiatCurrency || null,
           validCount:      m.validCount,
-          overpaidCount:   m.overpaidCount,
+          partialCount:    m.partialCount,
           underpaidCount:  m.underpaidCount,
+          overpaidCount:   m.overpaidCount,
+          unknownCount:    m.unknownCount,
           uniqueStudents:  m.students.size,
           reconciledAt:    now,
         },
@@ -167,14 +223,77 @@ async function reconcileMetrics(schoolId, { startDate, endDate } = {}) {
 }
 
 // ── Scheduled full reconciliation ─────────────────────────────────────────────
-// Runs once every 6 hours; rebuilds the last 32 days to self-heal any drift.
+// #1607 — A plain setInterval(24h) never fires when the process restarts or
+// leadership moves more often than the interval. Persist the last successful
+// run per job and, on start plus a short check interval, run the job when
+// `now - lastRunAt >= interval`. This guarantees the daily job runs once per
+// day regardless of restarts/leader changes, and exposes
+// job_last_success_timestamp_seconds{job} for overdue alerting.
 
 const RECONCILE_INTERVAL_MS = parseInt(process.env.METRICS_RECONCILE_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
+const CHECK_INTERVAL_MS = parseInt(process.env.SCHEDULER_CHECK_INTERVAL_MS || String(5 * 60 * 1000), 10);
+const JOB_NAME = 'metrics_rollup_reconcile';
+
 let _timer = null;
+let _running = false;
+
+/**
+ * Persist the last successful run timestamp for a scheduled job.
+ * Uses SystemConfig when available; falls back to an in-memory value so the
+ * scheduler still works in environments without the model.
+ */
+const _memoryLastRun = {};
+
+async function _getLastRunAt(jobName) {
+  try {
+    const SystemConfig = require('../models/systemConfigModel');
+    const doc = await SystemConfig.findOne({ key: `scheduler:${jobName}:lastRunAt` }).lean();
+    if (doc && doc.value) return new Date(doc.value);
+  } catch (err) {
+    logger.warn('SCHEDULER_LAST_RUN_READ_FAILED', { job: jobName, error: err.message });
+  }
+  return _memoryLastRun[jobName] || null;
+}
+
+async function _setLastRunAt(jobName, when) {
+  _memoryLastRun[jobName] = when;
+  try {
+    const SystemConfig = require('../models/systemConfigModel');
+    await SystemConfig.findOneAndUpdate(
+      { key: `scheduler:${jobName}:lastRunAt` },
+      { $set: { key: `scheduler:${jobName}:lastRunAt`, value: when.toISOString() } },
+      { upsert: true },
+    );
+  } catch (err) {
+    logger.warn('SCHEDULER_LAST_RUN_WRITE_FAILED', { job: jobName, error: err.message });
+  }
+}
+
+/**
+ * Expose job_last_success_timestamp_seconds{job} for overdue alerting.
+ * Best-effort: uses the metrics registry if present, otherwise logs.
+ */
+function _recordJobSuccess(jobName, when) {
+  const seconds = Math.floor(when.getTime() / 1000);
+  try {
+    const metrics = require('../utils/metrics');
+    if (metrics && typeof metrics.setGauge === 'function') {
+      metrics.setGauge('job_last_success_timestamp_seconds', seconds, { job: jobName });
+      return;
+    }
+    if (metrics && metrics.jobLastSuccessTimestampSeconds && typeof metrics.jobLastSuccessTimestampSeconds.set === 'function') {
+      metrics.jobLastSuccessTimestampSeconds.set({ job: jobName }, seconds);
+      return;
+    }
+  } catch (err) {
+    // metrics module optional — fall through to log
+  }
+  logger.info('JOB_LAST_SUCCESS_TIMESTAMP_SECONDS', { job: jobName, value: seconds });
+}
 
 async function _runScheduledReconciliation() {
   const School = require('../models/schoolModel');
-  const schools = await School.find({}, 'schoolId').lean();
+  const schools = await School.find({ isActive: true }, 'schoolId').lean();
   const endDate   = _dayKey(new Date());
   const startDate = _dayKey(new Date(Date.now() - 32 * 86400000));
   for (const school of schools) {
@@ -186,9 +305,37 @@ async function _runScheduledReconciliation() {
   }
 }
 
+/**
+ * Run the job if it is due (now - lastRunAt >= interval). Persists the last
+ * successful run and records the success metric. Safe to call on start and
+ * from the short check interval; guarded against overlapping runs.
+ */
+async function _runIfDue() {
+  if (_running) return;
+  _running = true;
+  try {
+    const lastRunAt = await _getLastRunAt(JOB_NAME);
+    const now = Date.now();
+    if (lastRunAt && now - lastRunAt.getTime() < RECONCILE_INTERVAL_MS) return;
+
+    await _runScheduledReconciliation();
+
+    const completedAt = new Date();
+    await _setLastRunAt(JOB_NAME, completedAt);
+    _recordJobSuccess(JOB_NAME, completedAt);
+  } catch (err) {
+    logger.error('METRICS_RECONCILE_SCHEDULER_FAILED', { error: err.message });
+  } finally {
+    _running = false;
+  }
+}
+
 function startMetricsRollupScheduler() {
   if (_timer) return;
-  _timer = setInterval(_runScheduledReconciliation, RECONCILE_INTERVAL_MS);
+  // Run immediately on start (catch-up after restart/leader change), then
+  // check frequently so a missed interval is picked up promptly.
+  _runIfDue();
+  _timer = setInterval(_runIfDue, CHECK_INTERVAL_MS);
   _timer.unref();
 }
 
@@ -201,4 +348,5 @@ module.exports = {
   reconcileMetrics,
   startMetricsRollupScheduler,
   stopMetricsRollupScheduler,
+  FEE_STATUSES,
 };

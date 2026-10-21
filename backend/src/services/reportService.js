@@ -1,8 +1,103 @@
 'use strict';
 
 const Payment = require('../models/paymentModel');
+const { csvEscape } = require('../utils/csv');
 const Student = require('../models/studentModel');
 const FeeStructure = require('../models/feeStructureModel');
+const { POOL_CONFIG } = require('../config/database');
+
+/**
+ * Convert a local calendar date string (YYYY-MM-DD) and an IANA timezone to a
+ * UTC Date representing the **start** of that calendar day in that timezone.
+ *
+ * Uses the Intl API to find the UTC offset at that local midnight, so it handles
+ * DST transitions correctly (e.g. on the day clocks go forward/back, the
+ * calendar day is shorter/longer than 24 h).
+ *
+ * Issue #1572 — replaces the old pattern of appending 'T00:00:00.000Z' which
+ * forced UTC boundaries regardless of the school's timezone.
+ *
+ * @param {string} dateStr   YYYY-MM-DD local calendar date
+ * @param {string} timezone  IANA timezone (e.g. 'Pacific/Port_Moresby', 'America/New_York')
+ * @returns {Date}           UTC Date for the start of that local day
+ */
+function localDayStartUTC(dateStr, timezone) {
+  // Parse the local date parts
+  const [year, month, day] = dateStr.split('-').map(Number);
+
+  // Build a reference instant: treat the date as UTC midnight first, then use
+  // Intl to find what UTC offset applies in the target timezone at that time.
+  // We iterate once because the offset itself can change near midnight.
+  let approxUtc = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+
+  // Determine the UTC offset (in minutes) that the timezone has at this moment.
+  // We use Intl.DateTimeFormat to format the same instant in the target timezone
+  // and in UTC, then diff the two representations.
+  for (let pass = 0; pass < 2; pass++) {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false,
+    });
+    // Format the approxUtc instant in the target timezone
+    const parts = fmt.formatToParts(new Date(approxUtc));
+    const get = (type) => parseInt(parts.find(p => p.type === type).value, 10);
+    const localYear  = get('year');
+    const localMonth = get('month');
+    const localDay   = get('day');
+    const localHour  = get('hour') % 24; // guard against 24:00 representation
+    const localMin   = get('minute');
+    const localSec   = get('second');
+
+    // Compute how far off we are from local midnight
+    const localMsFromMidnight = (localHour * 3600 + localMin * 60 + localSec) * 1000;
+    // Also adjust if the date shifted (can happen near DST transitions)
+    const dateDiff = Date.UTC(year, month - 1, day) -
+                     Date.UTC(localYear, localMonth - 1, localDay);
+
+    approxUtc = approxUtc - localMsFromMidnight + dateDiff;
+  }
+
+  return new Date(approxUtc);
+}
+
+/**
+ * UTC Date for the **exclusive** end of a local calendar day: i.e. the start
+ * of the next calendar day in the timezone. Used in half-open interval queries:
+ *   confirmedAt >= localDayStartUTC(startDate)
+ *   confirmedAt <  localDayEndUTC(endDate)
+ *
+ * A half-open interval avoids the '23:59:59.999' millisecond edge case.
+ *
+ * @param {string} dateStr   YYYY-MM-DD local calendar date
+ * @param {string} timezone  IANA timezone
+ * @returns {Date}
+ */
+function localDayEndUTC(dateStr, timezone) {
+  // End of day = start of the *next* calendar day
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const next = new Date(Date.UTC(year, month - 1, day + 1)); // safe — Date handles overflow
+  const nextStr = next.toISOString().slice(0, 10);           // YYYY-MM-DD of next day
+  return localDayStartUTC(nextStr, timezone);
+}
+
+/**
+ * Build a confirmedAt range filter using timezone-aware boundaries (Issue #1572).
+ * Returns an object suitable for spreading into a $match.confirmedAt constraint,
+ * or an empty object if neither bound is supplied.
+ *
+ * Uses a half-open interval [start, end) to avoid edge cases at 23:59:59.999.
+ *
+ * @param {{ startDate?: string, endDate?: string, timezone?: string }} opts
+ * @returns {object} e.g. { $gte: Date, $lt: Date }
+ */
+function buildDateRangeFilter({ startDate, endDate, timezone = 'UTC' }) {
+  const filter = {};
+  if (startDate) filter.$gte = localDayStartUTC(startDate, timezone);
+  if (endDate)   filter.$lt  = localDayEndUTC(endDate, timezone);
+  return filter;
+}
 
 /**
  * Get the data version for cache key generation.
@@ -24,30 +119,63 @@ async function getDataVersion(schoolId) {
 /**
  * Aggregate confirmed payments grouped by date (YYYY-MM-DD), scoped to a school.
  *
- * @param {{ schoolId: string, startDate?: string, endDate?: string, timezone?: string }} options
+ * @param {{ schoolId: string, startDate?: string, endDate?: string, timezone?: string, periodId?: string }} options
  */
-async function aggregateByDate({ schoolId, startDate, endDate, timezone = 'UTC' } = {}) {
+async function aggregateByDate({ schoolId, startDate, endDate, timezone = 'UTC', periodId } = {}) {
   const match = { schoolId, status: 'SUCCESS', studentDeleted: { $ne: true }, deletedAt: null };
 
+  // Issue #1572 — use timezone-aware boundaries so a report for 'YYYY-MM-DD to
+  // YYYY-MM-DD' captures exactly the payments whose local confirmation date
+  // falls in that range, regardless of the school's UTC offset.
   if (startDate || endDate) {
-    match.confirmedAt = {};
-    if (startDate) match.confirmedAt.$gte = new Date(startDate + 'T00:00:00.000Z');
-    if (endDate)   match.confirmedAt.$lte = new Date(endDate   + 'T23:59:59.999Z');
+    match.confirmedAt = buildDateRangeFilter({ startDate, endDate, timezone });
+  }
+
+  // Issue #1569 — optional period-scoped filter: if periodId is supplied,
+  // narrow the date range to the period's startsAt/endsAt boundaries.
+  if (periodId) {
+    const AcademicPeriod = require('../models/academicPeriodModel');
+    const period = await AcademicPeriod.findOne({ _id: periodId, schoolId }).lean();
+    if (period) {
+      if (!match.confirmedAt) match.confirmedAt = {};
+      if (!match.confirmedAt.$gte || period.startsAt > match.confirmedAt.$gte) {
+        match.confirmedAt.$gte = period.startsAt;
+      }
+      if (!match.confirmedAt.$lte || period.endsAt < match.confirmedAt.$lte) {
+        match.confirmedAt.$lte = period.endsAt;
+      }
+    }
   }
 
   const rows = await Payment.aggregate([
     { $match: match },
     {
       $group: {
-        _id: { $dateToString: { format: '%Y-%m-%d', date: '$confirmedAt', timezone } },
-        totalAmount:   { $sum: '$amount' },
+        // #1362 — confirmedAt may be null for payments recorded but not yet
+        // confirmed (e.g. recorded via sync before the horizon confirmation).
+        // Fall back to updatedAt so these payments are bucketed to a real date
+        // rather than grouped under a null key and sorted before all real dates.
+        _id: { $dateToString: { format: '%Y-%m-%d', date: { $ifNull: ['$confirmedAt', '$updatedAt'] }, timezone } },
         paymentCount:  { $sum: 1 },
+        // #1766 — every feeValidationStatus value gets its own bucket so that
+        // valid + partial + underpaid + overpaid + unknown == paymentCount.
         validCount:    { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'valid'] }, 1, 0] } },
+        partialCount:  { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'partial'] }, 1, 0] } },
         overpaidCount: { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'overpaid'] }, 1, 0] } },
         underpaidCount:{ $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'underpaid'] }, 1, 0] } },
+        unknownCount:  { $sum: { $cond: [{ $in: ['$feeValidationStatus', ['valid', 'partial', 'underpaid', 'overpaid']] }, 0, 1] } },
         uniqueStudents:{ $addToSet: '$studentId' },
+        // #1767 — never sum amounts across assets. Collect per-asset sums keyed
+        // by assetCode so XLM and USDC stay in separate buckets.
+        assetTotals: {
+          $push: {
+            asset: { $ifNull: ['$assetCode', 'XLM'] },
+            amount: '$amount',
+          },
+        },
         // #883 — sum historical fiat amounts from locked snapshots
         totalFiatAmount:{ $sum: { $ifNull: ['$fiatSnapshot.fiatAmount', 0] } },
+        fiatSnapshotCount: { $sum: { $cond: [{ $ne: [{ $ifNull: ['$fiatSnapshot.fiatAmount', null] }, null] }, 1, 0] } },
         fiatCurrency:  { $first: '$fiatSnapshot.fiatCurrency' },
       },
     },
@@ -55,20 +183,114 @@ async function aggregateByDate({ schoolId, startDate, endDate, timezone = 'UTC' 
       $project: {
         _id: 0,
         date: '$_id',
-        totalAmount: { $round: ['$totalAmount', 7] },
         paymentCount: 1,
         validCount: 1,
+        partialCount: 1,
         overpaidCount: 1,
         underpaidCount: 1,
+        unknownCount: 1,
         uniqueStudentCount: { $size: '$uniqueStudents' },
+        // #1767 — fold the pushed (asset, amount) pairs into per-asset sums.
+        assetTotals: {
+          $arrayToObject: {
+            $map: {
+              input: { $setUnion: ['$assetTotals.asset', []] },
+              as: 'asset',
+              in: {
+                k: '$$asset',
+                v: {
+                  $round: [
+                    {
+                      $sum: {
+                        $map: {
+                          input: {
+                            $filter: {
+                              input: '$assetTotals',
+                              as: 't',
+                              cond: { $eq: ['$$t.asset', '$$asset'] },
+                            },
+                          },
+                          as: 't',
+                          in: '$$t.amount',
+                        },
+                      },
+                    },
+                    7,
+                  ],
+                },
+              },
+            },
+          },
+        },
         totalFiatAmount: { $round: ['$totalFiatAmount', 2] },
+        fiatSnapshotCount: 1,
         fiatCurrency: 1,
       },
     },
     { $sort: { date: 1 } },
-  ], { hint: { schoolId: 1, status: 1, confirmedAt: -1 } });
+  ], {
+    hint: { schoolId: 1, status: 1, confirmedAt: -1 },
+    maxTimeMS: POOL_CONFIG.reportAggregationMaxTimeMS,
+  });
 
-  return rows;
+  // #1767 — expose per-asset totals as exact decimal strings and compute the
+  // fiat coverage percentage (share of payments that carry a fiat snapshot).
+  return rows.map((row) => {
+    const totals = {};
+    for (const [asset, amount] of Object.entries(row.assetTotals || {})) {
+      totals[asset] = toExactAmountString(amount);
+    }
+    const fiatCoverage = row.paymentCount > 0
+      ? parseFloat(((row.fiatSnapshotCount / row.paymentCount) * 100).toFixed(2))
+      : 0;
+    return {
+      date: row.date,
+      totals,
+      paymentCount: row.paymentCount,
+      validCount: row.validCount,
+      partialCount: row.partialCount,
+      overpaidCount: row.overpaidCount,
+      underpaidCount: row.underpaidCount,
+      unknownCount: row.unknownCount,
+      uniqueStudentCount: row.uniqueStudentCount,
+      totalFiatAmount: row.totalFiatAmount,
+      fiatCurrency: row.fiatCurrency,
+      fiatCoverage,
+    };
+  });
+}
+
+/**
+ * #1767 — Render a numeric amount as an exact decimal string (no float
+ * rounding artefacts). Trailing zeros are trimmed but at least one decimal
+ * place is kept for whole numbers so consumers can tell it is a decimal.
+ *
+ * @param {number|string} value
+ * @returns {string}
+ */
+function toExactAmountString(value) {
+  if (value === null || value === undefined) return '0';
+  const num = typeof value === 'number' ? value : parseFloat(value);
+  if (!Number.isFinite(num)) return '0';
+  // toFixed(7) matches the precision used elsewhere in this service.
+  return num.toFixed(7).replace(/\.?0+$/, '') || '0';
+}
+
+/**
+ * #1767 — Merge per-asset totals objects without ever adding different assets
+ * together. Each asset key is summed independently.
+ *
+ * @param {Record<string, string>} acc
+ * @param {Record<string, string>} totals
+ * @returns {Record<string, string>}
+ */
+function mergeAssetTotals(acc, totals) {
+  for (const [asset, amount] of Object.entries(totals || {})) {
+    const prev = parseFloat(acc[asset] || '0');
+    const next = parseFloat(amount || '0');
+    acc[asset] = toExactAmountString(prev + next);
+  }
+  return acc;
 }
 
 /**
@@ -80,24 +302,45 @@ async function aggregateByDate({ schoolId, startDate, endDate, timezone = 'UTC' 
 async function generateReport({ schoolId, startDate, endDate, timezone = 'UTC' } = {}) {
   const byDate = await aggregateByDate({ schoolId, startDate, endDate, timezone });
 
+  // #1767 — accumulate per-asset totals separately; never add XLM to USDC.
+  // #1766 — include partialCount and unknownCount so buckets sum to paymentCount.
   const totals = byDate.reduce(
     (acc, row) => {
-      acc.totalAmount    = parseFloat((acc.totalAmount + row.totalAmount).toFixed(7));
+      mergeAssetTotals(acc.totals, row.totals);
       acc.paymentCount  += row.paymentCount;
       acc.validCount    += row.validCount;
+      acc.partialCount  += row.partialCount;
       acc.overpaidCount += row.overpaidCount;
       acc.underpaidCount+= row.underpaidCount;
+      acc.unknownCount  += row.unknownCount;
+      acc.totalFiatAmount = parseFloat((acc.totalFiatAmount + (row.totalFiatAmount || 0)).toFixed(2));
+      acc.fiatSnapshotCount += Math.round(((row.fiatCoverage || 0) / 100) * row.paymentCount);
       return acc;
     },
-    { totalAmount: 0, paymentCount: 0, validCount: 0, overpaidCount: 0, underpaidCount: 0 }
+    {
+      totals: {},
+      paymentCount: 0,
+      validCount: 0,
+      partialCount: 0,
+      overpaidCount: 0,
+      underpaidCount: 0,
+      unknownCount: 0,
+      totalFiatAmount: 0,
+      fiatSnapshotCount: 0,
+    }
   );
+
+  const fiatCoverage = totals.paymentCount > 0
+    ? parseFloat(((totals.fiatSnapshotCount / totals.paymentCount) * 100).toFixed(2))
+    : 0;
+  delete totals.fiatSnapshotCount;
+  totals.fiatCoverage = fiatCoverage;
 
   // Count students who have fully paid within the period
   const match = { schoolId, status: 'SUCCESS', studentDeleted: { $ne: true }, deletedAt: null };
   if (startDate || endDate) {
-    match.confirmedAt = {};
-    if (startDate) match.confirmedAt.$gte = new Date(startDate + 'T00:00:00.000Z');
-    if (endDate)   match.confirmedAt.$lte = new Date(endDate   + 'T23:59:59.999Z');
+    // Issue #1572 — consistent with aggregateByDate: use timezone-aware boundaries.
+    match.confirmedAt = buildDateRangeFilter({ startDate, endDate, timezone });
   }
 
   const paidStudentIds = await Payment.distinct('studentId', match);
@@ -127,10 +370,8 @@ async function generateReport({ schoolId, startDate, endDate, timezone = 'UTC' }
           },
           {
             $match: startDate || endDate ? {
-              confirmedAt: {
-                ...(startDate ? { $gte: new Date(startDate + 'T00:00:00.000Z') } : {}),
-                ...(endDate ? { $lte: new Date(endDate + 'T23:59:59.999Z') } : {}),
-              },
+              // Issue #1572 — timezone-aware boundaries for the $lookup sub-pipeline.
+              confirmedAt: buildDateRangeFilter({ startDate, endDate, timezone }),
             } : {},
           },
         ],
@@ -140,7 +381,16 @@ async function generateReport({ schoolId, startDate, endDate, timezone = 'UTC' }
     {
       $group: {
         _id: '$class',
-        totalCollected: { $sum: { $sum: '$payments.amount' } },
+        // #1767 — keep per-asset collected amounts separate.
+        collectedByAsset: {
+          $push: {
+            $map: {
+              input: '$payments',
+              as: 'p',
+              in: { asset: { $ifNull: ['$$p.assetCode', 'XLM'] }, amount: '$$p.amount' },
+            },
+          },
+        },
         paymentCount: { $sum: { $size: '$payments' } },
         paidStudentIds: { $addToSet: { $cond: ['$feePaid', '$studentId', '$$REMOVE'] } },
         unpaidStudentIds: { $addToSet: { $cond: ['$feePaid', '$$REMOVE', '$studentId'] } },
@@ -150,14 +400,32 @@ async function generateReport({ schoolId, startDate, endDate, timezone = 'UTC' }
       $project: {
         _id: 0,
         className: '$_id',
-        totalCollected: { $round: ['$totalCollected', 7] },
+        collectedByAsset: 1,
         paymentCount: 1,
         paidCount: { $size: '$paidStudentIds' },
         unpaidCount: { $size: '$unpaidStudentIds' },
       },
     },
     { $sort: { className: 1 } },
-  ]);
+  ], { maxTimeMS: POOL_CONFIG.reportAggregationMaxTimeMS });
+
+  // #1767 — flatten the nested per-payment asset pairs into per-asset totals.
+  const byClassWithTotals = byClass.map((row) => {
+    const totals = {};
+    for (const paymentList of row.collectedByAsset || []) {
+      for (const p of paymentList || []) {
+        const prev = parseFloat(totals[p.asset] || '0');
+        totals[p.asset] = toExactAmountString(prev + (p.amount || 0));
+      }
+    }
+    return {
+      className: row.className,
+      totals,
+      paymentCount: row.paymentCount,
+      paidCount: row.paidCount,
+      unpaidCount: row.unpaidCount,
+    };
+  });
 
   // Calculate dateRangeDays to indicate actual range returned
   let dateRangeDays = null;
@@ -174,31 +442,8 @@ async function generateReport({ schoolId, startDate, endDate, timezone = 'UTC' }
     dateRangeDays,
     summary: { ...totals, fullyPaidStudentCount: fullyPaidCount },
     byDate,
-    byClass,
+    byClass: byClassWithTotals,
   };
-}
-
-/**
- * Escape a single CSV field value per RFC 4180.
- * Wraps in double-quotes when the value contains a comma, double-quote, or newline.
- * Internal double-quotes are doubled ("").
- * Leading formula-injection characters (=, +, -, @, tab, CR) are prefixed with
- * a single-quote so spreadsheet apps do not evaluate them as formulas.
- *
- * @param {*} value
- * @returns {string}
- */
-function csvEscape(value) {
-  let str = String(value ?? '');
-  // Neutralize CSV injection: prefix with single-quote if the value starts with
-  // a formula-trigger character.
-  if (/^[=+\-@\t\r]/.test(str)) {
-    str = `'${str}`;
-  }
-  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
 }
 
 /**
@@ -206,8 +451,13 @@ function csvEscape(value) {
  * All user-supplied string fields (school name, class name, etc.) are passed
  * through csvEscape so that commas, quotes, and newlines do not break parsers.
  */
+// #1767 — report CSV schema version. Bumped to 2 because amounts are now
+// emitted one row per asset instead of a single cross-asset "Total Amount".
+const REPORT_CSV_SCHEMA_VERSION = 2;
+
 function reportToCsv(report) {
   const lines = [];
+  lines.push(`Schema Version,${csvEscape(REPORT_CSV_SCHEMA_VERSION)}`);
   lines.push(`Generated At,${csvEscape(report.generatedAt)}`);
   lines.push(`School ID,${csvEscape(report.schoolId)}`);
   lines.push(`Period Start,${csvEscape(report.period.startDate || 'all time')}`);
@@ -217,38 +467,78 @@ function reportToCsv(report) {
   }
   lines.push('');
   lines.push('--- Summary ---');
-  lines.push(`Total Amount,${csvEscape(report.summary.totalAmount)}`);
+  // #1767 — one row per asset; never a single cross-asset total.
+  lines.push('Asset,Total Amount');
+  for (const [asset, amount] of Object.entries(report.summary.totals || {})) {
+    lines.push([csvEscape(asset), csvEscape(amount)].join(','));
+  }
+  lines.push(`Total Fiat,${csvEscape(report.summary.totalFiatAmount)}`);
+  lines.push(`Fiat Coverage %,${csvEscape(report.summary.fiatCoverage)}`);
   lines.push(`Total Payments,${csvEscape(report.summary.paymentCount)}`);
   lines.push(`Valid Payments,${csvEscape(report.summary.validCount)}`);
+  lines.push(`Partial Payments,${csvEscape(report.summary.partialCount)}`);
   lines.push(`Overpaid,${csvEscape(report.summary.overpaidCount)}`);
   lines.push(`Underpaid,${csvEscape(report.summary.underpaidCount)}`);
+  lines.push(`Unknown,${csvEscape(report.summary.unknownCount)}`);
   lines.push(`Fully Paid Students,${csvEscape(report.summary.fullyPaidStudentCount)}`);
   lines.push('');
   lines.push('--- Daily Breakdown ---');
-  lines.push('Date,Total Amount,Payment Count,Valid,Overpaid,Underpaid,Unique Students');
+  lines.push('Date,Asset,Total Amount,Payment Count,Valid,Partial,Overpaid,Underpaid,Unknown,Unique Students');
   for (const row of report.byDate) {
-    lines.push([
-      csvEscape(row.date),
-      csvEscape(row.totalAmount),
-      csvEscape(row.paymentCount),
-      csvEscape(row.validCount),
-      csvEscape(row.overpaidCount),
-      csvEscape(row.underpaidCount),
-      csvEscape(row.uniqueStudentCount),
-    ].join(','));
+    const assets = Object.entries(row.totals || {});
+    if (assets.length === 0) {
+      lines.push([
+        csvEscape(row.date), '', '',
+        csvEscape(row.paymentCount),
+        csvEscape(row.validCount),
+        csvEscape(row.partialCount),
+        csvEscape(row.overpaidCount),
+        csvEscape(row.underpaidCount),
+        csvEscape(row.unknownCount),
+        csvEscape(row.uniqueStudentCount),
+      ].join(','));
+      continue;
+    }
+    for (const [asset, amount] of assets) {
+      lines.push([
+        csvEscape(row.date),
+        csvEscape(asset),
+        csvEscape(amount),
+        csvEscape(row.paymentCount),
+        csvEscape(row.validCount),
+        csvEscape(row.partialCount),
+        csvEscape(row.overpaidCount),
+        csvEscape(row.underpaidCount),
+        csvEscape(row.unknownCount),
+        csvEscape(row.uniqueStudentCount),
+      ].join(','));
+    }
   }
   if (report.byClass && report.byClass.length > 0) {
     lines.push('');
     lines.push('--- Class Breakdown ---');
-    lines.push('Class,Total Collected,Payment Count,Paid Students,Unpaid Students');
+    lines.push('Class,Asset,Total Collected,Payment Count,Paid Students,Unpaid Students');
     for (const row of report.byClass) {
-      lines.push([
-        csvEscape(row.className),
-        csvEscape(row.totalCollected),
-        csvEscape(row.paymentCount),
-        csvEscape(row.paidCount),
-        csvEscape(row.unpaidCount),
-      ].join(','));
+      const assets = Object.entries(row.totals || {});
+      if (assets.length === 0) {
+        lines.push([
+          csvEscape(row.className), '', '',
+          csvEscape(row.paymentCount),
+          csvEscape(row.paidCount),
+          csvEscape(row.unpaidCount),
+        ].join(','));
+        continue;
+      }
+      for (const [asset, amount] of assets) {
+        lines.push([
+          csvEscape(row.className),
+          csvEscape(asset),
+          csvEscape(amount),
+          csvEscape(row.paymentCount),
+          csvEscape(row.paidCount),
+          csvEscape(row.unpaidCount),
+        ].join(','));
+      }
     }
   }
   return lines.join('\n');
@@ -285,14 +575,14 @@ async function getDashboardMetrics({ schoolId, timezone = 'UTC' } = {}) {
     MonthlyMetrics.aggregate([
       { $match: { schoolId } },
       { $group: { _id: null, totalCollected: { $sum: '$totalAmount' }, count: { $sum: '$paymentCount' } } },
-    ]),
+    ], { maxTimeMS: POOL_CONFIG.reportAggregationMaxTimeMS }),
 
     // Today from daily rollup (O(1) point-read)
     DailyMetrics.findOne({ schoolId, period: todayKey }).lean(),
 
     // Per-class breakdown (from Student collection — these are small)
     Student.aggregate([
-      { $match: { schoolId } },
+      { $match: Student.activeFilter({ schoolId }) },
       {
         $group: {
           _id: '$class',
@@ -315,7 +605,7 @@ async function getDashboardMetrics({ schoolId, timezone = 'UTC' } = {}) {
         },
       },
       { $sort: { class: 1 } },
-    ]),
+    ], { maxTimeMS: POOL_CONFIG.reportAggregationMaxTimeMS }),
 
     // 5 most recent successful payments (small bounded query, always fast)
     Payment.find({ schoolId, status: 'SUCCESS', studentDeleted: { $ne: true }, deletedAt: null })
@@ -325,9 +615,9 @@ async function getDashboardMetrics({ schoolId, timezone = 'UTC' } = {}) {
       .lean(),
 
     Student.aggregate([
-      { $match: { schoolId } },
+      { $match: Student.activeFilter({ schoolId }) },
       { $group: { _id: null, totalExpected: { $sum: '$feeAmount' }, totalPaid: { $sum: '$totalPaid' } } },
-    ]),
+    ], { maxTimeMS: POOL_CONFIG.reportAggregationMaxTimeMS }),
   ]);
 
   const collected = allTimeRollup[0] || { totalCollected: 0, count: 0 };
@@ -496,6 +786,14 @@ module.exports = {
   generateAccountingCsv,
   generateAccountingCsvStream,
   ACCOUNTING_SCHEMA_VERSION,
+  REPORT_CSV_SCHEMA_VERSION,
   getDashboardMetrics,
   getDataVersion,
+  // Exported for testing (Issue #1572)
+  localDayStartUTC,
+  localDayEndUTC,
+  buildDateRangeFilter,
+  // Exported for testing (Issue #1767)
+  toExactAmountString,
+  mergeAssetTotals,
 };

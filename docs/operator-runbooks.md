@@ -2,6 +2,54 @@
 
 These runbooks cover the main operational failures for the async payment path: Redis or queue outage, Horizon outage, Mongo or database outage, stuck payments, key rotation, and restore.
 
+## Canary Deployment Rollout
+
+A canary deployment routes a small percentage of traffic to a new backend image tag before rolling out to all replicas. This allows validation of database migrations and payment pipeline changes without affecting 100% of production traffic.
+
+**Canary Deployment Procedure:**
+
+1. **Prepare the canary image:**
+   ```sh
+   docker build -t stellaredupay/backend:canary .
+   docker push stellaredupay/backend:canary
+   ```
+
+2. **Deploy the canary:**
+   ```sh
+   kubectl apply -k deploy/k8s/overlays/canary
+   ```
+   This deploys a single canary pod with the new image. The readiness probe (`/health/ready`) ensures the migration initContainer has completed before the pod is added to the load balancer.
+
+3. **Monitor canary health:**
+   ```sh
+   kubectl logs -f deployment/backend -l environment=canary
+   kubectl get pod -l environment=canary -w
+   ```
+   Watch for:
+   - Successful migration execution (initContainer logs should show "Migrations completed")
+   - /health/ready probe passing
+   - No error spikes in /metrics or logs
+
+4. **Validate payment pipeline:**
+   - Verify `/health` returns healthy
+   - Submit a test payment and confirm it progresses through polling
+   - Monitor /api/payments queries for latency or errors
+
+5. **Proceed to full rollout (if canary is healthy):**
+   ```sh
+   kubectl set image deployment/backend backend=stellaredupay/backend:canary
+   kubectl set env deployment/backend CANARY=false
+   ```
+
+6. **Rollback (if canary fails):**
+   ```sh
+   kubectl delete deployment backend -l environment=canary
+   kubectl set image deployment/backend backend=stellaredupay/backend:previous-tag
+   ```
+   Verify /health and /metrics return to baseline.
+
+**Readiness Probe:** The canary uses `/health/ready` (not `/health`) to ensure that database migrations complete before traffic is routed to the new pod. If migrations fail, the readiness probe fails, and the pod is not added to the load balancer.
+
 ## General Incident Steps
 
 1. Open an incident record with time, environment, reporter, and affected tenants.
@@ -36,19 +84,143 @@ Triage payment ID, tenant ID, user ID, idempotency key, amount, asset, destinati
 
 Procedure: if a transaction hash exists, query Stellar/Horizon directly. If confirmed, update payment state with an audit reason. If failed, mark failed with the failure reason. If no hash exists and no transfer occurred, retry from queued state. If state is ambiguous, keep manual-review and do not retry automatically.
 
-## Key Rotation
+## Secret Provisioning
 
-Rotate JWT or session secrets, webhook secrets, database credentials, queue credentials, deployment tokens, and Stellar signing credentials when compromise is suspected, operator membership changes, or the scheduled interval expires.
+Before deploying the backend for the first time in any environment, provision
+the `stellaredupay` Kubernetes Secret using the scripted process below. Never
+use a hand-typed `kubectl create secret` command — the script validates inputs,
+is idempotent, and emits an audit trail for your change-management log.
 
-Rotation order: create replacement secret, deploy dual-read support if required, rotate provider-side secret, redeploy API and workers, revoke old secret, verify operations, and record rotation time and operator.
+**Checklist — run before every new environment or after a credential reset:**
 
-## Restore Procedure
+1. Generate values for all required secrets (see script header for generation
+   commands): `JWT_SECRET`, `MONGO_URI`, and (for production) `SIGNER_MASTER_KEY`.
+2. Verify you are targeting the correct cluster context:
+   `kubectl config current-context`
+3. Run the provisioning script:
+   ```sh
+   JWT_SECRET=<value> MONGO_URI=<value> SIGNER_MASTER_KEY=<value> \
+     NAMESPACE=<namespace> \
+     ./scripts/provision-k8s-secrets.sh
+Record the script's audit output (context, operator, timestamp) in your
+incident or change-management log.
+Deploy via the environment overlay — not the base manifest directly:
+kubectl apply -k deploy/k8s/overlays/mainnet   # production
+kubectl apply -k deploy/k8s/overlays/testnet   # staging
+Verify the backend pods reach Running state and the /health endpoint
+returns {"status":"healthy"}.
+The script (scripts/provision-k8s-secrets.sh) uses --dry-run=client | apply
+so it is safe to re-run; it patches an existing secret without error.
+Key Rotation
+Rotate JWT secrets, webhook secrets, database credentials, queue credentials, deployment tokens, and Stellar signing credentials when compromise is suspected, operator membership changes, or the scheduled interval expires.
+General rotation order (used for any credential not covered by a script below): create replacement secret, deploy dual-read support if required, rotate provider-side secret, redeploy API and workers, revoke old secret, verify operations, and record rotation time and operator.
+JWT secret — node scripts/rotate-jwt-secret.js --confirm
+Generates a new secret, patches the stellaredupay Kubernetes Secret's JWT_SECRET, and rolls deployment/backend — the create/rotate/redeploy/revoke sequence above run as one script instead of hand-typed kubectl commands, removing the risk of doing those steps out of order.
+This is a hard cutover (JWT_SECRET has no dual-secret verification support): every live session is invalidated immediately, and stored MFA secrets — encrypted with a key derived from JWT_SECRET — become undecryptable, so enrolled users must re-enroll MFA. --confirm is required and is the human review/approval gate: read the script's header comment for the full list of side effects before running it. Pass --secret-name, --deployment, or --namespace to target a non-default Secret/Deployment/namespace (e.g. to rehearse against a staging cluster first).
+Stellar signing credential — node scripts/rotate-signer-master-key.js [--apply]
+Rotates SIGNER_MASTER_KEY, the key that encrypts Stellar signing secret keys at rest (backend/src/utils/signerKeyManager.js). Set SIGNER_MASTER_KEY_OLD to the key currently protecting stored records and SIGNER_MASTER_KEY to the replacement, then run the script: it re-encrypts every school's stored signing key under the new key and reports per-record success/failure. Defaults to a dry run (decrypts and re-encrypts in memory without writing) so a bad key pair is caught before any record is touched; pass --apply to persist. After a successful --apply run, update the deployment's SIGNER_MASTER_KEY secret (dropping SIGNER_MASTER_KEY_OLD), redeploy, verify a test decrypt/sign, and record the rotation time and operator.
+Webhook secret encryption key — node scripts/rotate-webhook-encryption-key.js [--apply]
+Rotates WEBHOOK_SECRET_ENCRYPTION_KEY, the key that encrypts per-school webhook secrets at rest (backend/src/services/webhookSecretEncryption.js). Set WEBHOOK_SECRET_ENCRYPTION_KEY_PREVIOUS to the key currently protecting stored secrets and WEBHOOK_SECRET_ENCRYPTION_KEY to the replacement, then run the script: it re-encrypts every school's webhookSecret under the new key. Defaults to a dry run; pass --apply to persist. Unlike the signer key, this rotation supports a dual-key grace period — leave WEBHOOK_SECRET_ENCRYPTION_KEY_PREVIOUS set across the redeploy so decryption falls back to it for any secret not yet migrated, then drop it once the --apply run reports zero failures. See the "Webhook secret encryption key rotation" section of docs/security.md for the full procedure.
+Other credentials
+Database credentials, queue credentials, and deployment tokens do not yet have scripted rotation — follow the general rotation order above and record the rotation in the incident log.
+Restore Procedure
+Stop API writes and workers.
+Create a forensic snapshot of the current database.
+Restore the latest known-good backup into staging.
+Run migrations and integrity checks against staging.
+Compare restored payments with on-chain transaction state.
+Decide whether to promote the backup or repair selected records.
+Communicate RPO impact before production promotion.
+Resume workers only after database and queue state are consistent.
+Backups — RPO / RTO and how they are produced (issue #1630)
+Targets
+- RPO (maximum data loss): 24 hours — one point-in-time backup per night. On-chain payments made after the last backup are recoverable by re-running reconciliation against Horizon after a restore, so the effective RPO for confirmed payments is lower; admin edits, audit entries and webhook state made since the backup are lost.
+- RTO (time to restore service): 4 hours for a database up to ~20 GB — download + decrypt + restore into staging, integrity checks, promotion.
+- Operators who need a tighter RPO should move to a managed MongoDB with continuous PITR (Atlas, DocumentDB) and set BACKUP_OPLOG=false; keep the nightly encrypted export as an independent copy.
 
-1. Stop API writes and workers.
-2. Create a forensic snapshot of the current database.
-3. Restore the latest known-good backup into staging.
-4. Run migrations and integrity checks against staging.
-5. Compare restored payments with on-chain transaction state.
-6. Decide whether to promote the backup or repair selected records.
-7. Communicate RPO impact before production promotion.
-8. Resume workers only after database and queue state are consistent.
+What a backup is
+- Consistent: mongodump --oplog captures a point-in-time snapshot across every collection, so payments, student balances and the hash-chained audit log agree with each other in a restore. It needs a replica set (both Compose and the StatefulSet run rs0), and dumps the whole instance; restore.sh replays the oplog automatically using the archive's .manifest sidecar.
+- Encrypted: the archive is encrypted with an age (BACKUP_AGE_RECIPIENT) or GPG (BACKUP_GPG_RECIPIENT_FILE) public key before it leaves the backup process. The private key is held outside the production host/cluster (password manager / HSM / recovery cluster). backup.sh refuses to run without a key unless BACKUP_REQUIRE_ENCRYPTION=false (local dev only).
+- Off-site: the encrypted archive and manifest are uploaded to object storage (BACKUP_S3_URI via the aws CLI, or BACKUP_RCLONE_REMOTE) and existence is confirmed after upload. Enable versioning, a lifecycle rule for retention, and object lock (compliance mode) on the bucket, and give the backup job PutObject-only credentials. backup.sh refuses to run without a target unless BACKUP_REQUIRE_OFFSITE=false.
+- Verified: every archive passes mongorestore --dryRun before it is encrypted, and its sha256 is recorded in the manifest and checked again on restore.
+
+Where it runs
+- Compose: the backup service (daily) and backup-verify service (weekly), both built from deploy/backup/Dockerfile. backup-verify restores the newest off-site archive into the disposable mongo-verify instance.
+- Kubernetes: deploy/k8s/backup-cronjob.yaml — CronJob mongodb-backup (nightly 02:15 UTC) and CronJob mongodb-restore-verify (Sundays 04:45 UTC). The verify job downloads the newest off-site archive, decrypts it, restores it into a scratch mongod sidecar and runs backend/scripts/verify-restored-db.js (student balances vs payments, orphaned payments). Alert on kube_job_status_failed for either CronJob, and on the existing backup staleness metrics.
+
+Restoring an encrypted archive
+MONGO_URI=mongodb://localhost:27017/stellaredupay?replicaSet=rs0 \
+BACKUP_FILE=./backups/20260324T120000Z.archive.gz.age \
+BACKUP_AGE_IDENTITY_FILE=/secure/backup-identity.txt \
+  ./scripts/restore.sh --dry-run
+The archive's .manifest must sit next to it (download both from the bucket) so restore.sh can verify the checksum and enable --oplogReplay. Legacy plaintext .gz archives are still accepted.
+
+Running the Restore Script
+The restore script (scripts/restore.sh) uses safe defaults — it will not drop
+existing collections unless you explicitly request it.
+Safe defaults (no data loss risk)
+MONGO_URI=mongodb://localhost:27017/stellaredupay \
+BACKUP_FILE=./backups/20260324T120000Z.gz \
+  ./scripts/restore.sh
+This merges the backup into the existing database. Records already in the database
+are preserved; the backup fills in anything that is missing.
+Dry-run mode — preview without mutation
+Use --dry-run (or DRY_RUN=true) to print the target URI and the exact
+mongorestore command that would be executed, without touching the database:
+MONGO_URI=mongodb://localhost:27017/stellaredupay \
+BACKUP_FILE=./backups/20260324T120000Z.gz \
+  ./scripts/restore.sh --dry-run
+Always run dry-run first in production to confirm the correct archive and URI
+before committing to the restore.
+Drop-and-replace restore (destructive — requires confirmation)
+Set DROP=true (or pass --drop) to drop existing collections before restoring.
+The script will prompt for confirmation before proceeding:
+MONGO_URI=mongodb://localhost:27017/stellaredupay \
+BACKUP_FILE=./backups/20260324T120000Z.gz \
+DROP=true \
+  ./scripts/restore.sh
+WARNING: You are about to DROP existing collections on mongodb://localhost:27017/stellaredupay.
+         This will permanently delete all data in those collections before
+         restoring from: ./backups/20260324T120000Z.gz
+
+Are you sure? [y/N]
+You must type y or Y to proceed; any other input aborts the restore.
+Bypassing the interactive prompt (scripted pipelines)
+Pass --yes or -y to skip the interactive confirmation. Only use this in
+automated pipelines where the intent to drop has already been reviewed:
+MONGO_URI=mongodb://localhost:27017/stellaredupay \
+BACKUP_FILE=./backups/20260324T120000Z.gz \
+DROP=true \
+  ./scripts/restore.sh --yes
+Never combine --yes with an unreviewed MONGO_URI in production scripts.
+Image tags and rollbacks
+First-party images are pinned by commit SHA in each Kustomize overlay:
+images:
+  - name: stellaredupay/backend
+    newTag: sha-abc1234
+  - name: stellaredupay/frontend
+    newTag: sha-abc1234
+Promote testnet → mainnet
+Validate the build on testnet (kubectl apply -k deploy/k8s/overlays/testnet).
+Copy the same newTag into overlays/mainnet/kustomization.yaml.
+Open a PR — the diff is a one-line tag change.
+After merge: kubectl apply -k deploy/k8s/overlays/mainnet.
+Rollback
+kubectl rollout undo deployment/backend
+kubectl rollout undo deployment/frontend
+Because the previous ReplicaSet still references the old immutable tag, undo restores that exact image (not whatever :latest points at).
+MongoDB
+deploy/k8s/mongodb-statefulset.yaml runs a single replica (replicas: 1) with no --replSet. This is intentional for the in-cluster baseline; multi-document transactions require a replica set or an external managed MongoDB (e.g. Atlas).
+
+Backend auto-scaling
+deploy/k8s/backend-hpa.yaml defines a HorizontalPodAutoscaler for the backend Deployment: it scales between 2 and 10 replicas, targeting 70% average CPU utilization across pods. This handles end-of-term fee-collection peaks without manual `kubectl scale`. The Deployment's `replicas: 2` field is only the starting point once the HPA is applied — the HPA takes over adjusting replica count from there. Tune `minReplicas`/`maxReplicas`/`averageUtilization` in that file if peak load patterns change.
+
+## Log Collection
+
+By default, containers are configured to output logs exclusively to `stdout` (structured JSON) to integrate with standard log aggregators without risking disk space exhaustion or permission issues on the ephemeral filesystem. No log files are written in containerized environments unless explicitly enabled.
+
+To view logs for the backend:
+- **Directly via Kubernetes:** `kubectl logs -f deployment/backend`
+- **Via Log Aggregators:** Logs are automatically collected by cluster-level agents (like Promtail/Fluentd) and can be queried in your centralized logging system (e.g., **Loki** or **CloudWatch**).
+
+For bare-metal or VM deployments where file-based rotation is required, file transports can be enabled by setting `LOG_TO_FILE=true` and providing an absolute path to a writable directory in `LOG_DIR`.

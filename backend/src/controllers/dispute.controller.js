@@ -7,16 +7,26 @@
  *  - #895: Explicit state machine with validated transitions; authenticated actor required.
  *  - #894: Audit every transition (with actor + note); emit dispute.* webhook, SSE event,
  *          and notification email; synchronise linked payment status on resolution.
+ *  - #1638: Capture the raiser's contact; notify the raiser on creation and every status
+ *          change, alert admins on new disputes (SLA breaches: disputeNotificationService).
  */
 
 const Dispute = require('../models/disputeModel');
+const { decryptLeanDispute } = require('../models/disputeModel');
 const Payment = require('../models/paymentModel');
 const Student = require('../models/studentModel');
 const { logAudit } = require('../services/auditService');
 const { emit: sseEmit } = require('../services/sseService');
-const { fireWebhook, notifyDisputeCreated, notifyDisputeResolved } = require('../services/webhookService');
-const School = require('../models/schoolModel');
+const { dispatchToSchool, notifyDisputeCreated, notifyDisputeResolved } = require('../services/webhookService');
+const { notifyRaiser, notifyAdmins, disputeReference } = require('../services/disputeNotificationService');
+const { isValidE164 } = require('../services/smsService');
+const { updateStudentBalance } = require('../utils/studentBalanceUpdater');
 const logger = require('../utils/logger').child('DisputeController');
+const {
+  recordDisputeRaised,
+  recordDisputeResolved,
+  refreshOpenDisputeGauge,
+} = require('../metrics/disputeMetrics');
 
 // ── State machine (#895) ─────────────────────────────────────────────────────
 //
@@ -88,29 +98,25 @@ async function _notifyDisputeChange(schoolId, eventName, disputeDoc) {
     logger.warn('SSE emit failed for dispute event', { schoolId, eventName, error: err.message });
   }
 
-  // Webhook — HMAC-signed HTTP call to the school's registered endpoint.
-  // Route through the dispute.* notification helpers so the payload shape stays
-  // consistent with the other webhook events (mirrors notifyPaymentConfirmed/…).
+  // Webhook — HMAC-signed delivery to the school's WebhookEndpoints (#1640:
+  // the only outbound webhook path). Created/resolved go through the dispute.*
+  // helpers so the payload shape stays consistent; intermediate transitions
+  // (under_review / reopened) keep their own event name.
   try {
-    const school = await School.findOne({ schoolId }, { webhookUrl: 1, webhookSecret: 1 }).lean();
-    if (school && school.webhookUrl) {
-      const secret = school.webhookSecret || null;
-      if (eventName === 'dispute.created') {
-        await notifyDisputeCreated(school.webhookUrl, disputeDoc, secret);
-      } else if (holdLifted) {
-        await notifyDisputeResolved(school.webhookUrl, disputeDoc, secret);
-      } else {
-        // Intermediate transitions (under_review / reopened) keep their own event name.
-        await fireWebhook(school.webhookUrl, eventName, {
-          disputeId:  String(disputeDoc._id),
-          schoolId,
-          txHash:     disputeDoc.txHash,
-          studentId:  disputeDoc.studentId,
-          status:     disputeDoc.status,
-          resolvedBy: disputeDoc.resolvedBy,
-          updatedAt:  disputeDoc.updatedAt,
-        }, secret);
-      }
+    if (eventName === 'dispute.created') {
+      await notifyDisputeCreated(disputeDoc);
+    } else if (holdLifted) {
+      await notifyDisputeResolved(disputeDoc);
+    } else {
+      await dispatchToSchool(schoolId, eventName, {
+        disputeId:  String(disputeDoc._id),
+        schoolId,
+        txHash:     disputeDoc.txHash,
+        studentId:  disputeDoc.studentId,
+        status:     disputeDoc.status,
+        resolvedBy: disputeDoc.resolvedBy,
+        updatedAt:  disputeDoc.updatedAt,
+      });
     }
   } catch (err) {
     logger.warn('Webhook fire failed for dispute event', { schoolId, eventName, error: err.message });
@@ -118,27 +124,80 @@ async function _notifyDisputeChange(schoolId, eventName, disputeDoc) {
 }
 
 /**
+ * Fire a notification without delaying the response. The notification
+ * service never throws; the catch is a last-resort guard.
+ */
+function _notifyInBackground(promise, context) {
+  Promise.resolve(promise).catch((err) => {
+    logger.warn('Dispute notification failed', { ...context, error: err.message });
+  });
+}
+
+/**
+ * Add derived, read-only fields used by the Disputes page to surface ageing
+ * disputes (#1638): reference, ageHours, and whether an open dispute is past
+ * its SLA deadline.
+ */
+function _withAgeing(dispute, now = Date.now()) {
+  if (!dispute) return dispute;
+  const created = dispute.createdAt ? new Date(dispute.createdAt).getTime() : now;
+  const isOpen = dispute.status === 'open' || dispute.status === 'under_review';
+  return {
+    ...dispute,
+    reference: disputeReference(dispute),
+    ageHours: Math.max(0, Math.round(((now - created) / 36e5) * 10) / 10),
+    slaOverdue: Boolean(isOpen && dispute.slaDeadline && new Date(dispute.slaDeadline).getTime() < now),
+  };
+}
+
+/**
  * Synchronise the linked payment's status when a dispute moves to a terminal
- * (or re-open) state.  Only transitions when the payment is in a compatible
- * state to avoid overwriting unrelated finality values.
+ * (or re-open) state.  Loads the document and goes through `.save()` (with
+ * the admin-override flag) so the same transition-safety guard that
+ * `paymentAdminController.updatePaymentStatus` respects also applies here —
+ * an illegal or no-op transition throws an INVALID_TRANSITION error instead
+ * of silently succeeding.
  */
 async function _syncPaymentStatus(schoolId, txHash, newDisputeStatus) {
   const targetPaymentStatus = DISPUTE_TO_PAYMENT_STATUS[newDisputeStatus];
   if (!targetPaymentStatus) return;
 
-  try {
-    await Payment.findOneAndUpdate(
-      { schoolId, txHash },
-      { $set: { status: targetPaymentStatus } },
-    );
-    logger.info('Payment status synced after dispute transition', {
-      schoolId, txHash, disputeStatus: newDisputeStatus, paymentStatus: targetPaymentStatus,
-    });
-  } catch (err) {
-    logger.error('Failed to sync payment status after dispute transition', {
-      schoolId, txHash, error: err.message,
-    });
+  const payment = await Payment.findOne({ schoolId, txHash });
+  if (!payment) {
+    logger.warn('No payment found to sync after dispute transition', { schoolId, txHash, disputeStatus: newDisputeStatus });
+    return;
   }
+
+  const previousStatus = payment.status;
+  if (previousStatus === targetPaymentStatus) {
+    // Idempotent no-op: payment is already in the target state.
+    // This happens when two dispute statuses (e.g. 'open' and 'under_review')
+    // map to the same payment status (DISPUTED).  Moving between them is a
+    // valid dispute-state-machine transition and must not be treated as an
+    // error — the payment side simply has nothing to do.
+    logger.info('Payment status already at target; skipping sync', {
+      schoolId, txHash, disputeStatus: newDisputeStatus, paymentStatus: previousStatus,
+    });
+    return;
+  }
+
+  // Dispute resolution is an authoritative decision equivalent to an admin
+  // action, so it uses the wider ADMIN_PAYMENT_STATUS_TRANSITIONS table
+  // (e.g. DISPUTED -> SUCCESS on rejection, DISPUTED -> REFUNDED on
+  // resolution) via the same $locals.adminOverride flag updatePaymentStatus
+  // uses. $locals is Mongoose's per-document transient store — never persisted.
+  payment.$locals.adminOverride = true;
+  payment.status = targetPaymentStatus;
+  await payment.save();
+
+  // #1353 — Keep the student's totalPaid/feePaid in sync with the dispute
+  // outcome: DISPUTED payments must not count toward totalPaid, and moving
+  // back to SUCCESS (dispute rejected) must restore it.
+  await updateStudentBalance(schoolId, payment.studentId);
+
+  logger.info('Payment status synced after dispute transition', {
+    schoolId, txHash, disputeStatus: newDisputeStatus, previousStatus, paymentStatus: targetPaymentStatus,
+  });
 }
 
 // ── Controller actions ────────────────────────────────────────────────────────
@@ -152,20 +211,45 @@ async function _syncPaymentStatus(schoolId, txHash, newDisputeStatus) {
 async function flagDispute(req, res, next) {
   try {
     const { schoolId } = req;
-    const { txHash, studentId, raisedBy, reason, txReference, evidence } = req.body;
+    const { txHash, studentId, raisedBy, reason, txReference, evidence, raisedByEmail, raisedByPhone } = req.body;
     if (!txHash || !studentId || !raisedBy || !reason) {
       return res.status(400).json({ error: 'txHash, studentId, raisedBy, and reason are all required.', code: 'VALIDATION_ERROR' });
     }
 
-    // Validate field lengths
-    const raisedByTrimmed = raisedBy.trim();
-    const reasonTrimmed = reason.trim();
+    // #1181 — Trim before validating length and presence so whitespace-only
+    // strings ('   ') are rejected rather than silently accepted.
+    const raisedByTrimmed = typeof raisedBy === 'string' ? raisedBy.trim() : '';
+    const reasonTrimmed   = typeof reason   === 'string' ? reason.trim()   : '';
+
+    if (!raisedByTrimmed) {
+      return res.status(400).json({ error: 'raisedBy must not be blank.', code: 'VALIDATION_ERROR' });
+    }
+    if (!reasonTrimmed) {
+      return res.status(400).json({ error: 'reason must not be blank.', code: 'VALIDATION_ERROR' });
+    }
 
     if (raisedByTrimmed.length > 200) {
       return res.status(400).json({ error: 'raisedBy must not exceed 200 characters.', code: 'VALIDATION_ERROR' });
     }
     if (reasonTrimmed.length > 1000) {
       return res.status(400).json({ error: 'reason must not exceed 1000 characters.', code: 'VALIDATION_ERROR' });
+    }
+
+    // #1638 — optional contact channel for progress/resolution notifications.
+    // When omitted, notifications go to the student's parent contact.
+    let contactEmail = null;
+    let contactPhone = null;
+    if (raisedByEmail !== undefined && raisedByEmail !== null && raisedByEmail !== '') {
+      contactEmail = typeof raisedByEmail === 'string' ? raisedByEmail.trim().toLowerCase() : '';
+      if (!contactEmail || contactEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
+        return res.status(400).json({ error: 'raisedByEmail must be a valid email address.', code: 'VALIDATION_ERROR' });
+      }
+    }
+    if (raisedByPhone !== undefined && raisedByPhone !== null && raisedByPhone !== '') {
+      contactPhone = typeof raisedByPhone === 'string' ? raisedByPhone.replace(/[\s()-]/g, '') : '';
+      if (!isValidE164(contactPhone)) {
+        return res.status(400).json({ error: 'raisedByPhone must be an E.164 phone number, e.g. +2348012345678.', code: 'VALIDATION_ERROR' });
+      }
     }
 
     const payment = await Payment.findOne({ txHash, schoolId });
@@ -186,6 +270,8 @@ async function flagDispute(req, res, next) {
       txHash,
       studentId,
       raisedBy: raisedByTrimmed,
+      raisedByEmail: contactEmail,
+      raisedByPhone: contactPhone,
       reason: reasonTrimmed,
       txReference: txReference ? txReference.trim() : undefined,
       evidence: evidence || [],
@@ -209,7 +295,10 @@ async function flagDispute(req, res, next) {
         performedBy: req.auditContext.performedBy,
         targetId:    String(dispute._id),
         targetType:  'dispute',
-        details:     { txHash, studentId, raisedBy: raisedByTrimmed, reason: reasonTrimmed },
+        details:     {
+          txHash, studentId, raisedBy: raisedByTrimmed, reason: reasonTrimmed,
+          contactProvided: Boolean(contactEmail || contactPhone),
+        },
         result:      'success',
         ipAddress:   req.auditContext.ipAddress,
         userAgent:   req.auditContext.userAgent,
@@ -219,7 +308,23 @@ async function flagDispute(req, res, next) {
     // Notify (best-effort)
     await _notifyDisputeChange(schoolId, 'dispute.created', dispute);
 
-    res.status(201).json(dispute);
+    // #1638 — confirmation (with reference) to the raiser and an alert to the
+    // school's admins. Sent in the background so email retries never delay
+    // the response.
+    const notifyCtx = { schoolId, disputeId: String(dispute._id) };
+    _notifyInBackground(notifyRaiser(dispute, 'created'), notifyCtx);
+    _notifyInBackground(notifyAdmins(dispute, 'created'), notifyCtx);
+
+    // Metrics (#1375). Recorded after the write succeeded, and never allowed to
+    // fail the request — a scrape value is not worth a 500 to the caller.
+    try {
+      recordDisputeRaised(schoolId);
+      await refreshOpenDisputeGauge();
+    } catch (metricsErr) {
+      logger.warn('Failed to record dispute metrics', { error: metricsErr.message });
+    }
+
+    res.status(201).json({ ...dispute.toJSON(), reference: disputeReference(dispute) });
   } catch (err) { next(err); }
 }
 
@@ -241,7 +346,8 @@ async function getDisputes(req, res, next) {
       Dispute.find(filter).sort(sortOption).skip(skip).limit(pageSize).lean(),
       Dispute.countDocuments(filter),
     ]);
-    res.json({ disputes, pagination: { page: pageNum, limit: pageSize, total, totalPages: Math.ceil(total / pageSize) } });
+    const now = Date.now();
+    res.json({ disputes: disputes.map((d) => _withAgeing(decryptLeanDispute(d), now)), pagination: { page: pageNum, limit: pageSize, total, totalPages: Math.ceil(total / pageSize) } });
   } catch (err) { next(err); }
 }
 
@@ -249,7 +355,7 @@ async function getDisputeById(req, res, next) {
   try {
     const dispute = await Dispute.findOne({ _id: req.params.id, schoolId: req.schoolId }).lean();
     if (!dispute) return res.status(404).json({ error: 'Dispute not found.', code: 'NOT_FOUND' });
-    res.json(dispute);
+    res.json(_withAgeing(decryptLeanDispute(dispute)));
   } catch (err) { next(err); }
 }
 
@@ -279,7 +385,11 @@ async function resolveDispute(req, res, next) {
       return res.status(400).json({ error: 'resolutionNote is required.', code: 'VALIDATION_ERROR' });
     }
 
-    const resolutionNoteTrimmed = resolutionNote.trim();
+    // #1181 — Trim before validating so whitespace-only strings are rejected.
+    const resolutionNoteTrimmed = typeof resolutionNote === 'string' ? resolutionNote.trim() : '';
+    if (!resolutionNoteTrimmed) {
+      return res.status(400).json({ error: 'resolutionNote must not be blank.', code: 'VALIDATION_ERROR' });
+    }
     if (resolutionNoteTrimmed.length > 1000) {
       return res.status(400).json({ error: 'resolutionNote must not exceed 1000 characters.', code: 'VALIDATION_ERROR' });
     }
@@ -371,6 +481,22 @@ async function resolveDispute(req, res, next) {
     // #894 — Emit SSE + webhook (best-effort)
     const eventName = newStatus === 'open' ? 'dispute.reopened' : `dispute.${newStatus}`;
     await _notifyDisputeChange(schoolId, eventName, dispute);
+
+    // #1638 — tell the raiser about every status change (background).
+    _notifyInBackground(
+      notifyRaiser(dispute, newStatus === 'open' ? 'reopened' : newStatus),
+      { schoolId, disputeId: String(dispute._id) },
+    );
+
+    // Metrics (#1375). Resolution duration and the SLA breach are only recorded
+    // on a terminal status; a reopen just moves the gauges. Never allowed to
+    // fail the request.
+    try {
+      if (isTerminal) recordDisputeResolved(dispute);
+      await refreshOpenDisputeGauge();
+    } catch (metricsErr) {
+      logger.warn('Failed to record dispute metrics', { error: metricsErr.message });
+    }
 
     res.json(dispute);
   } catch (err) { next(err); }

@@ -42,9 +42,16 @@ healthcheck:
 - Retries up to 5 times before marking as unhealthy
 - Waits 30 seconds before starting checks (allows Node.js app to start and connect to MongoDB)
 
-The `/health` endpoint returns:
-- `200 OK` when both database and Stellar are healthy
-- `503 Service Unavailable` when either check fails
+`/health` is public, so its body is just `{ "status": "..." }` (Issue #1540);
+the detailed per-dependency report is at `GET /api/admin/health/details`
+(admin auth).
+
+The `/health` endpoint returns a three-tier status, not a simple pass/fail:
+- `200 OK` with `status: "healthy"` — database, Stellar, and other subsystems are all fine
+- `200 OK` with `status: "degraded"` — MongoDB is up, but a non-critical subsystem (e.g. Stellar Horizon unreachable, Redis not ready, retry queue failed) is impaired; the app keeps serving traffic
+- `503 Service Unavailable` with `status: "unhealthy"` — MongoDB is disconnected
+
+A Horizon or Redis blip alone will never cause a 503 — only a MongoDB outage does.
 
 ### Service Dependencies
 
@@ -123,8 +130,27 @@ curl http://localhost:5000/health
       "latency_ms": 5
     },
     "stellar": {
-      "status": "healthy",
+      "status": "ok",
       "latency_ms": 150,
+      "network": "testnet",
+      "horizonUrl": "https://horizon-testnet.stellar.org"
+    }
+  }
+}
+
+# Example response when degraded (e.g. Horizon unreachable, MongoDB still up):
+# HTTP 200, not 503 — the app keeps serving traffic
+{
+  "status": "degraded",
+  "timestamp": "2024-03-30T10:00:00.000Z",
+  "checks": {
+    "database": {
+      "status": "healthy",
+      "latency_ms": 5
+    },
+    "stellar": {
+      "status": "unreachable",
+      "error": "Horizon did not respond within 3000ms",
       "network": "testnet",
       "horizonUrl": "https://horizon-testnet.stellar.org"
     }
@@ -196,3 +222,28 @@ docker-compose down
 - Monitor health check failures in production
 - Set up alerts for unhealthy services
 - Consider using orchestration tools (Kubernetes, Docker Swarm) for advanced health management
+
+## Monitoring Stack Prerequisites
+
+Before launching the monitoring stack (`docker-compose.monitoring.yml`), the
+following environment variables **must** be set:
+
+| Variable | Description | How to generate |
+|----------|-------------|-----------------|
+| `GRAFANA_PASSWORD` | **Required.** Grafana admin password. No default — Docker Compose will refuse to start if unset. | `openssl rand -hex 24` |
+| `METRICS_TOKEN` | **Required.** Bearer token for the `/metrics` endpoint. | `openssl rand -hex 32` |
+
+```sh
+# Set required variables before starting the monitoring stack
+export GRAFANA_PASSWORD=$(openssl rand -hex 24)
+export METRICS_TOKEN=$(openssl rand -hex 32)
+
+# Copy METRICS_TOKEN into monitoring/prometheus.yml (authorization.credentials)
+# then start the stack:
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+```
+
+If `GRAFANA_PASSWORD` is not set, Docker Compose will exit immediately with:
+```
+GRAFANA_PASSWORD: Error: GRAFANA_PASSWORD environment variable must be set.
+```

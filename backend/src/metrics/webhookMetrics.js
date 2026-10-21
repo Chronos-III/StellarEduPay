@@ -5,9 +5,12 @@
  *
  * Exported metrics (all registered on the shared registry from metrics/index.js):
  *
- *   webhook_deliveries_total{event, outcome}
+ *   webhook_deliveries_total{event, outcome, signature_version}
  *     Counter. Incremented after every delivery attempt.
  *     outcome: 'success' | 'failure'
+ *     signature_version: signature headers sent — 'v1+v2' | 'v2' | 'v1' | 'none'
+ *     (#1539: drives the V1 sunset — deliveries labelled with v1 are receivers
+ *     that still depend on the deprecated signature).
  *
  *   webhook_delivery_duration_ms{event}
  *     Histogram. Round-trip time in milliseconds for each delivery attempt.
@@ -24,8 +27,8 @@ const client = require('prom-client');
 // ── webhook_deliveries_total ──────────────────────────────────────────────────
 const webhookDeliveriesTotal = new client.Counter({
   name: 'webhook_deliveries_total',
-  help: 'Total webhook delivery attempts by event type and outcome',
-  labelNames: ['event', 'outcome'],
+  help: 'Total webhook delivery attempts by event type, outcome and signature version',
+  labelNames: ['event', 'outcome', 'signature_version'],
   registers: [registry],
 });
 
@@ -79,9 +82,10 @@ async function refreshDeadLetterGauge() {
  *
  * @param {string} event       Webhook event type (e.g. 'payment.confirmed')
  * @param {number} durationMs  Round-trip time in ms
+ * @param {string} [signatureVersion='none']  e.g. 'v1+v2', 'v2' (#1539)
  */
-function recordDeliverySuccess(event, durationMs) {
-  webhookDeliveriesTotal.inc({ event, outcome: 'success' });
+function recordDeliverySuccess(event, durationMs, signatureVersion = 'none') {
+  webhookDeliveriesTotal.inc({ event, outcome: 'success', signature_version: signatureVersion });
   webhookDeliveryDurationMs.observe({ event }, durationMs);
 }
 
@@ -92,9 +96,10 @@ function recordDeliverySuccess(event, durationMs) {
  * @param {number}  durationMs   Round-trip time in ms
  * @param {boolean} [isDeadLetter=false]  True when all retries have been exhausted
  * @param {string}  [schoolId]   Required when isDeadLetter is true
+ * @param {string}  [signatureVersion='none']  e.g. 'v1+v2', 'v2' (#1539)
  */
-function recordDeliveryFailure(event, durationMs, isDeadLetter = false, schoolId = null) {
-  webhookDeliveriesTotal.inc({ event, outcome: 'failure' });
+function recordDeliveryFailure(event, durationMs, isDeadLetter = false, schoolId = null, signatureVersion = 'none') {
+  webhookDeliveriesTotal.inc({ event, outcome: 'failure', signature_version: signatureVersion });
   webhookDeliveryDurationMs.observe({ event }, durationMs);
 
   if (isDeadLetter && schoolId) {

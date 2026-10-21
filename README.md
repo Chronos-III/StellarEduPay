@@ -4,7 +4,7 @@ A production-grade, multi-tenant school fee payment system built on the Stellar 
 
 [![CI](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml/badge.svg)](https://github.com/manuelusman73-png/StellarEduPay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen)](https://nodejs.org/)
 
 ---
 
@@ -106,8 +106,6 @@ Transaction Details:
   Memo:   "STU001"   ← Student ID for automatic matching
 ```
 
-Memos are optionally encrypted at rest for privacy (see `MEMO_ENCRYPTION_KEY` in env vars).
-
 ### Read-Only Blockchain Integration
 
 The backend **never holds the school's private key**. It only:
@@ -171,7 +169,6 @@ Assets are configured per school and can be extended in [`backend/src/config/ste
 - Audit log with pagination, date filtering, and TTL cleanup
 - Soft-delete for students and fee structures
 - PII protection (student data redaction)
-- Memo encryption at rest
 
 **Developer Experience**
 - OpenAPI/Swagger docs at `/api/docs` (development mode)
@@ -199,7 +196,7 @@ StellarEduPay is a three-tier application:
                             │ REST API / SSE
                             ▼
 ┌────────────────────────────────────────────────────────────────┐
-│             Express.js Backend (Node.js 20+)                   │
+│             Express.js Backend (Node.js 24+)                   │
 │  Auth · Payments · Students · Schools · Reports · Webhooks     │
 │  Fee Adjustments · Disputes · Receipts · Audit Logs            │
 └──────────┬─────────────────────────────────┬───────────────────┘
@@ -241,7 +238,7 @@ StellarEduPay is a three-tier application:
 | Layer | Technology |
 |-------|-----------|
 | Blockchain | Stellar Network + Stellar SDK v12 |
-| Backend | Node.js 20+ · Express 4 |
+| Backend | Node.js 24+ · Express 4 |
 | Database | MongoDB 7 (Replica Set) · Mongoose 8 |
 | Queue | BullMQ 5 · Redis 7 |
 | Frontend | Next.js (React) |
@@ -256,7 +253,7 @@ StellarEduPay is a three-tier application:
 
 ### Prerequisites
 
-- **Node.js** ≥ 20 ([download](https://nodejs.org/))
+- **Node.js** ≥ 24 ([download](https://nodejs.org/))
 - **MongoDB 7** running as a **replica set** (required for multi-document transactions)
 - **Redis 7** (required for BullMQ; the service degrades gracefully without it but Redis is recommended for production)
 - **Git**
@@ -327,7 +324,7 @@ See [Environment Variables](#environment-variables) for the full reference.
 
 ```bash
 cp frontend/.env.local.example frontend/.env.local
-# Set NEXT_PUBLIC_API_URL=http://localhost:5000/api
+# Defaults to NEXT_PUBLIC_API_URL=/api (same-origin via the Next.js proxy)
 ```
 
 ### Running the Application
@@ -413,7 +410,6 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 |----------|---------|-------------|
 | `MIN_PAYMENT_AMOUNT` | `0.01` | Minimum payment in XLM/USDC |
 | `MAX_PAYMENT_AMOUNT` | `100000` | Maximum payment in XLM/USDC |
-| `MEMO_ENCRYPTION_KEY` | — | 32-byte hex key for encrypting memos at rest |
 
 ### Background Jobs
 
@@ -442,6 +438,7 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 | `RATE_LIMIT_MAX_REQUESTS` | `100` | Max requests per window |
 | `VERIFY_RATE_LIMIT` | `10` | Max verify requests per minute |
 | `ALLOWED_ORIGINS` | — | Comma-separated CORS origins |
+| `APP_URL` | — | Base URL of the application (required in production) |
 
 ### Server
 
@@ -470,12 +467,11 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 
 ## API Reference
 
-Full OpenAPI specification is available at `GET /api/docs.json` (or `/api/docs` in development). A static reference is in [`docs/api-spec.md`](docs/api-spec.md).
+The HTTP contract lives in [`backend/openapi.json`](backend/openapi.json), generated from the routers by `node scripts/openapi/generate.js` and enforced in CI (`node scripts/openapi/check-contract.js`). It is served at `GET /api/docs.json` (or `/api/docs` in development). In production (unless `SWAGGER_ENABLED=true`) `/api/docs.json` requires admin authentication. [`docs/api-spec.md`](docs/api-spec.md) has the full endpoint index plus request/response examples; the list below is a summary.
 
 ### Authentication
 
 ```
-POST /api/auth/register    Register a new admin account
 POST /api/auth/login       Login (returns JWT in HttpOnly cookie + response body)
 POST /api/auth/refresh     Refresh access token
 POST /api/auth/logout      Invalidate session
@@ -489,8 +485,8 @@ POST /api/auth/mfa/verify  Verify TOTP code
 POST   /api/schools            Create a school
 GET    /api/schools            List schools
 GET    /api/schools/:id        Get school details
-PUT    /api/schools/:id        Update school
-DELETE /api/schools/:id        Deactivate school
+PATCH  /api/schools/:id        Update school
+DELETE /api/schools/:id        Delete school
 ```
 
 ### Students
@@ -499,7 +495,7 @@ DELETE /api/schools/:id        Deactivate school
 POST   /api/students           Register a student (auto-assigns fee from class)
 GET    /api/students           List students (paginated)
 GET    /api/students/:id       Get student
-PUT    /api/students/:id       Update student
+PATCH  /api/students/:id       Update student
 DELETE /api/students/:id       Soft-delete student
 POST   /api/students/bulk      Bulk import via CSV (respects school quota)
 ```
@@ -523,8 +519,8 @@ GET    /api/payments/pending                   List pending verifications (pagin
 POST   /api/fees               Create a fee structure
 GET    /api/fees               List fee structures
 GET    /api/fees/:className    Get fee for a class
-PUT    /api/fees/:id           Update fee structure
-DELETE /api/fees/:id           Soft-delete fee structure
+PUT    /api/fees/:className    Update fee structure
+DELETE /api/fees/:className    Soft-delete fee structure
 ```
 
 ### Fee Adjustments
@@ -539,9 +535,10 @@ DELETE /api/fee-adjustments/:id        Delete rule
 ### Payment Plans
 
 ```
-POST   /api/payment-plans              Create installment plan
-GET    /api/payment-plans/:studentId   Get plan for student
-PUT    /api/payment-plans/:id          Update plan
+POST   /api/payment-plans/:studentId                              Create installment plan
+GET    /api/payment-plans/:studentId                              Get plan for student
+PATCH  /api/payment-plans/:studentId/installment/:installmentIndex Update an installment
+DELETE /api/payment-plans/:studentId                              Cancel plan
 ```
 
 ### Disputes
@@ -549,7 +546,7 @@ PUT    /api/payment-plans/:id          Update plan
 ```
 POST   /api/disputes           Open a dispute
 GET    /api/disputes           List disputes
-PUT    /api/disputes/:id       Update dispute status
+PATCH  /api/disputes/:id/resolve  Resolve a dispute
 ```
 
 ### Reports
@@ -573,14 +570,14 @@ GET    /api/audit              Paginated audit log with date/actor filters
 ### Reminders
 
 ```
-POST   /api/reminders/send     Trigger payment reminder emails
-GET    /api/reminders          List reminder history
+POST   /api/reminders/trigger  Trigger payment reminder emails
+GET    /api/reminders/preview  Preview who would be reminded
 ```
 
 ### Admin
 
 ```
-GET    /api/admin/retry-queue       Retry queue depth and status
+GET    /api/admin/retry-queue/stats Retry queue depth and status
 POST   /api/admin/log-level         Change log level at runtime
 GET    /api/consistency             Run data consistency check
 ```
@@ -591,7 +588,7 @@ GET    /api/consistency             Run data consistency check
 GET    /health                 Health check (ok / degraded / unhealthy)
 GET    /metrics                Prometheus metrics
 GET    /api/docs               Swagger UI (development only)
-GET    /api/docs.json          OpenAPI spec JSON
+GET    /api/docs.json          OpenAPI spec JSON (admin auth in production)
 ```
 
 ### Error Response Format
@@ -619,7 +616,6 @@ Common error codes: `NOT_FOUND`, `VALIDATION_ERROR`, `DUPLICATE_TX`, `TX_FAILED`
 - **Rate limiting**: Per-IP rate limiting with Redis persistence; dedicated stricter limit on `/api/payments/verify`.
 - **Request queue + circuit breaker**: Protects downstream services from overload.
 - **Webhook HMAC signatures**: Outbound webhooks are signed with `HMAC-SHA256` so receivers can verify authenticity.
-- **Memo encryption**: Student IDs in memos can be encrypted at rest with AES-256.
 - **No private key storage**: The backend never holds the school's Stellar secret key.
 - **Proxy trust**: Configurable `TRUSTED_PROXY_HOPS` prevents IP spoofing via `X-Forwarded-For`.
 - **Body size limit**: Configurable `MAX_BODY_SIZE` to prevent request flood attacks.
@@ -790,7 +786,7 @@ node scripts/migrate.js
 
 Migrations are idempotent — safe to run repeatedly. The runner skips already-applied migrations.
 
-Current migrations include: audit log TTL index, student indexes, idempotency key TTL, payment intent TTL, report indexes, pending verification indexes, memo encryption backfill, student soft-delete backfill, school slug uniqueness, webhook secret seeding, and audit log compound index.
+Current migrations include: audit log TTL index, student indexes, idempotency key TTL, payment intent TTL, report indexes, pending verification indexes, student soft-delete backfill, school slug uniqueness, webhook secret seeding, and audit log compound index.
 
 ---
 
@@ -893,7 +889,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for a complete history of changes, breaking c
 | `connection refused` (MongoDB) | DB container not ready or wrong URI | Check `docker ps`; ensure `MONGO_URI` includes `?replicaSet=rs0` |
 | `tx_bad_auth` | Secret key doesn't match public address | Verify the keypair in `.env` |
 | Rate-limit counters reset on restart | `REDIS_HOST` not set | Configure Redis for persistent counters |
-| Swagger UI missing in production | Expected — intentional | Set `NODE_ENV` to anything other than `production`, or use `/api/docs.json` |
+| Swagger UI missing in production | Expected — intentional | Set `NODE_ENV` to anything other than `production`, set `SWAGGER_ENABLED=true`, or fetch `/api/docs.json` with an admin token |
 
 ---
 
@@ -917,3 +913,8 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 **Built with Stellar blockchain technology**
+
+## Handsoff notes
+
+<!-- handsoff-issue-1755 -->
+- #1755: The poller records suspicious payments as status FAILED — real, received funds become indistinguishable from failed transactions and drop out of review queues and refunds

@@ -17,9 +17,13 @@
 
 const IdempotencyKey = require('../models/idempotencyKeyModel');
 const logger = require('../utils/logger').child('IdempotencyStore');
+const { getRedisClient } = require('../config/redisClient');
 
 const TTL_SECONDS = IdempotencyKey.TTL_SECONDS;
 const REDIS_PREFIX = 'idem:';
+
+// Application schema version derived from package.json version
+const APP_SCHEMA_VERSION = require('../../package.json').version;
 
 // How long an `in_progress` reservation is honored before it is considered
 // abandoned (e.g. the owning process crashed mid-request). After this window a
@@ -31,23 +35,7 @@ const IN_FLIGHT_TTL_MS = parseInt(
 );
 
 const redisEnabled = Boolean(process.env.REDIS_HOST);
-
-let redis = null;
-if (redisEnabled) {
-  const Redis = require('ioredis');
-  redis = new Redis({
-    host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT, 10) || 6379,
-    password: process.env.REDIS_PASSWORD || undefined,
-    lazyConnect: true,
-    maxRetriesPerRequest: null,
-    enableOfflineQueue: false,
-  });
-  redis.on('error', (err) => logger.error('Redis idempotency client error', { error: err.message }));
-  redis.connect().catch((err) =>
-    logger.error('Redis idempotency client connect failed', { error: err.message })
-  );
-}
+const redis = redisEnabled ? getRedisClient() : null;
 
 async function redisGet(key) {
   if (!redis) return null;
@@ -80,15 +68,41 @@ async function get(key) {
   if (!key) return null;
 
   const cached = await redisGet(key);
-  if (cached) return cached;
+  if (cached) {
+    // Check if cached version matches current schema version
+    if (cached.schemaVersion && cached.schemaVersion !== APP_SCHEMA_VERSION) {
+      logger.info('Evicting stale cached response due to schema version mismatch', { key, cached: cached.schemaVersion, current: APP_SCHEMA_VERSION });
+      // Evict stale entry by deleting from both Redis and Mongo
+      try {
+        await IdempotencyKey.deleteOne({ key });
+      } catch (err) {
+        logger.warn('Failed to evict stale idempotency record', { error: err.message });
+      }
+      return null;
+    }
+    return cached;
+  }
 
   const record = await IdempotencyKey.findOne({ key }).lean();
   if (!record) return null;
+
+  // Check if stored version matches current schema version
+  if (record.schemaVersion && record.schemaVersion !== APP_SCHEMA_VERSION) {
+    logger.info('Evicting stale stored response due to schema version mismatch', { key, stored: record.schemaVersion, current: APP_SCHEMA_VERSION });
+    // Evict stale entry
+    try {
+      await IdempotencyKey.deleteOne({ key });
+    } catch (err) {
+      logger.warn('Failed to evict stale idempotency record', { error: err.message });
+    }
+    return null;
+  }
 
   const result = {
     responseStatus: record.responseStatus,
     responseBody: record.responseBody,
     scope: record.scope || '',
+    schemaVersion: record.schemaVersion,
   };
 
   // Read-through: warm Redis for subsequent lookups.
@@ -112,6 +126,7 @@ async function set(key, record) {
     responseStatus: record.responseStatus,
     responseBody: record.responseBody,
     scope: record.scope || '',
+    schemaVersion: APP_SCHEMA_VERSION,
   };
 
   try {
@@ -143,6 +158,16 @@ async function getFull(key) {
   // hit is authoritative for the completed case and avoids a Mongo round-trip.
   const cached = await redisGet(key);
   if (cached && cached.state === 'completed') {
+    // Check if cached version matches current schema version
+    if (cached.schemaVersion && cached.schemaVersion !== APP_SCHEMA_VERSION) {
+      logger.info('Evicting stale cached entry due to schema version mismatch', { key, cached: cached.schemaVersion, current: APP_SCHEMA_VERSION });
+      try {
+        await IdempotencyKey.deleteOne({ key });
+      } catch (err) {
+        logger.warn('Failed to evict stale idempotency record', { error: err.message });
+      }
+      return null;
+    }
     return {
       state: 'completed',
       requestFingerprint: cached.requestFingerprint || null,
@@ -155,6 +180,17 @@ async function getFull(key) {
 
   const record = await IdempotencyKey.findOne({ key }).lean();
   if (!record) return null;
+
+  // Check if stored version matches current schema version
+  if (record.schemaVersion && record.schemaVersion !== APP_SCHEMA_VERSION) {
+    logger.info('Evicting stale stored entry due to schema version mismatch', { key, stored: record.schemaVersion, current: APP_SCHEMA_VERSION });
+    try {
+      await IdempotencyKey.deleteOne({ key });
+    } catch (err) {
+      logger.warn('Failed to evict stale idempotency record', { error: err.message });
+    }
+    return null;
+  }
 
   return {
     state: record.state || 'completed',
@@ -254,6 +290,7 @@ async function complete(key, record) {
     requestFingerprint: record.fingerprint || null,
     responseStatus: record.responseStatus,
     responseBody: record.responseBody,
+    schemaVersion: APP_SCHEMA_VERSION,
   };
 
   await IdempotencyKey.findOneAndUpdate(

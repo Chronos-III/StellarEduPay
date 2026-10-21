@@ -21,8 +21,10 @@
 const { logger } = require('../utils/logger');
 const { httpRequestDurationSeconds } = require('../metrics');
 const { generateCorrelationId } = require('../utils/correlationId');
+const { REQUEST_LOG_REDACT_FIELDS } = require('../utils/redactConfig');
+const { hashIp, stripQueryString } = require('../utils/piiRedaction');
 
-const DEFAULT_REDACT_FIELDS = ['txHash', 'studentId', 'memo', 'senderAddress'];
+const DEFAULT_REDACT_FIELDS = REQUEST_LOG_REDACT_FIELDS;
 
 // Headers that must never appear in logs (auth/session/PII)
 const SENSITIVE_HEADERS = new Set([
@@ -86,12 +88,15 @@ function requestLogger() {
       req.socket?.remoteAddress ||
       'unknown';
 
+    // Hash IP for privacy - same IP produces same hash within this server session
+    const ipHash = hashIp(ip);
+
     const logData = {
       requestId,
       correlationId,
       method: req.method,
-      url: req.originalUrl,
-      ip,
+      url: stripQueryString(req.originalUrl), // Strip query strings to prevent token leakage
+      ipHash, // Use hashed IP instead of raw IP
       userAgent: req.headers['user-agent'] || '',
     };
 
@@ -115,10 +120,10 @@ function requestLogger() {
         requestId,
         correlationId,
         method: req.method,
-        url: req.originalUrl,
+        url: stripQueryString(req.originalUrl), // Strip query strings
         statusCode: res.statusCode,
         durationMs,
-        ip,
+        ipHash, // Use hashed IP
       });
 
       // Normalise to the matched route pattern (e.g. /api/payments/:id) so high-cardinality

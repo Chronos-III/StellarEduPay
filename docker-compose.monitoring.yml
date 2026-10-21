@@ -5,10 +5,15 @@ version: "3.8"
 # Usage:
 #   1. Set METRICS_TOKEN in backend/.env (generate with: openssl rand -hex 32)
 #   2. Copy that token into monitoring/prometheus.yml under authorization.credentials
-#   3. docker compose -f docker-compose.monitoring.yml up -d
+#   3. Set GRAFANA_PASSWORD to a strong password (required — no default):
+#        export GRAFANA_PASSWORD=$(openssl rand -hex 24)
+#   4. docker compose -f docker-compose.monitoring.yml up -d
 #
 # Prometheus: http://localhost:9090
-# Grafana:    http://localhost:3001  (admin / admin — change on first login)
+# Grafana:    http://localhost:3001  (admin / <GRAFANA_PASSWORD>)
+#
+# NOTE: GRAFANA_PASSWORD is a required environment variable. Docker Compose will
+# refuse to start the monitoring stack if it is not set.
 
 services:
   prometheus:
@@ -35,18 +40,72 @@ services:
   grafana:
     image: grafana/grafana:10.4.3
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?Error: GRAFANA_PASSWORD environment variable must be set. Generate one with: openssl rand -hex 24}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: "http://localhost:3001"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "3001:3000"
     depends_on:
       - prometheus
     networks:
       - monitoring
+
+  # ── Infrastructure exporters ──────────────────────────────────────────────
+
+  # Exports MongoDB metrics (connection pool, op counters, replication lag, etc.)
+  # Uses the percona/mongodb_exporter image which supports MongoDB 5+/6+/7+.
+  # Set MONGO_URI in your environment or .env file so the exporter can connect.
+  mongodb_exporter:
+    image: percona/mongodb_exporter:0.40
+    command:
+      - "--mongodb.uri=${MONGO_URI:-mongodb://root:password@host.docker.internal:27017/?authSource=admin&replicaSet=rs0}"
+      - "--collect-all"
+      - "--compatible-mode"
+    ports:
+      - "9216:9216"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Exports Redis metrics (memory usage, connected clients, hit/miss ratios, etc.)
+  redis_exporter:
+    image: oliver006/redis_exporter:v1.59.0
+    environment:
+      REDIS_ADDR: "redis://host.docker.internal:6379"
+      # Set REDIS_PASSWORD here if your Redis instance requires auth.
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+    ports:
+      - "9121:9121"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Exports host/container-level metrics (CPU, memory, disk, network I/O).
+  # Requires access to host proc/sys filesystems — run in read-only mode.
+  node_exporter:
+    image: prom/node-exporter:v1.7.0
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+    networks:
+      - monitoring
+    restart: unless-stopped
 
 networks:
   monitoring:

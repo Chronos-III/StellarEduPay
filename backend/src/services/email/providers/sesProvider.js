@@ -13,12 +13,17 @@ const config = require('../../../config');
 
 let _client = null;
 let _SendEmailCommand = null;
+let _SendRawEmailCommand = null;
 
 function getClient() {
   if (_client) return _client;
   let SESClient;
   try {
-    ({ SESClient, SendEmailCommand: _SendEmailCommand } = require('@aws-sdk/client-ses'));
+    ({
+      SESClient,
+      SendEmailCommand: _SendEmailCommand,
+      SendRawEmailCommand: _SendRawEmailCommand,
+    } = require('@aws-sdk/client-ses'));
   } catch (_) {
     throw new Error(
       'EMAIL_PROVIDER=ses requires the "@aws-sdk/client-ses" package to be installed'
@@ -28,11 +33,34 @@ function getClient() {
   return _client;
 }
 
+function buildRawMessage(message) {
+  const MailComposer = require('nodemailer/lib/mail-composer');
+  const mail = new MailComposer({
+    from: message.from || config.SMTP_FROM,
+    to: message.to,
+    subject: message.subject,
+    text: message.text || '',
+    ...(message.html && { html: message.html }),
+    headers: message.headers,
+  });
+  return mail.compile().build();
+}
+
 module.exports = {
   name: 'ses',
 
   async send(message) {
     const client = getClient();
+
+    // SES SendEmail cannot carry custom headers (e.g. RFC 8058
+    // List-Unsubscribe), so build the MIME message ourselves and use
+    // SendRawEmail whenever extra headers are supplied.
+    if (message.headers && Object.keys(message.headers).length > 0) {
+      const raw = await buildRawMessage(message);
+      const res = await client.send(new _SendRawEmailCommand({ RawMessage: { Data: raw } }));
+      return { messageId: res.MessageId };
+    }
+
     const command = new _SendEmailCommand({
       Source: message.from || config.SMTP_FROM,
       Destination: { ToAddresses: [message.to] },
@@ -60,5 +88,6 @@ module.exports = {
   _reset() {
     _client = null;
     _SendEmailCommand = null;
+    _SendRawEmailCommand = null;
   },
 };

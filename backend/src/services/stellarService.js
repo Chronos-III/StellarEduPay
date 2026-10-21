@@ -12,10 +12,17 @@ const Payment = require("../models/paymentModel");
 const Student = require("../models/studentModel");
 const PaymentIntent = require("../models/paymentIntentModel");
 const { validatePaymentAmount } = require("../utils/paymentLimits");
-const { toStroops, stroopsToNumber, compareAmounts } = require("../utils/stellarAmount");
+const { toStroops, stroopsToNumber } = require("../utils/stellarAmount");
+const { classifyFeePayment } = require("../utils/money");
+const {
+  SUPPORTED_MEMO_TYPES,
+  normalizeMemoType,
+  decodeMemoToCanonical,
+} = require("../utils/stellarMemo");
 const { withStellarRetry } = require("../utils/withStellarRetry");
 const { savePayment } = require("./transactionService");
 const { deriveCorrelationId } = require("../utils/correlationId");
+const lock = require("./distributedLock");
 const {
   CONFIRMATION_STATES,
   computeTargetState,
@@ -24,11 +31,51 @@ const {
   isConfirmedOrAbove,
 } = require("./paymentConfirmationStateMachine");
 const logger = require("../utils/logger").child("StellarService");
+const { getEngineForSchool } = require("./feeAdjustmentEngine");
+const { PAYMENT_TYPES } = require("./paymentService");
+
+// TTL for the per-student balance lock (#1026), shared with paymentController's
+// verifyPayment. Guards the read-aggregate-then-write sequence that computes
+// cumulativeTotal and writes it as an absolute Student.$set — unsafe to run
+// concurrently for the same student, whether the other writer is verifyPayment
+// or another syncPaymentsForSchool run.
+const STUDENT_BALANCE_LOCK_TTL_MS = parseInt(process.env.STUDENT_BALANCE_LOCK_TTL_MS || "15000", 10);
+
+/**
+ * Resolve the asset actually delivered to the destination of an operation.
+ * Path payments carry the delivered asset in `destination_asset_*` and the
+ * delivered amount in `destination_amount`; plain payments use `asset_*` and
+ * `amount`.
+ */
+function resolveDeliveredAsset(op) {
+  const isPathPayment =
+    op.type === "path_payment_strict_send" ||
+    op.type === "path_payment_strict_receive";
+  if (isPathPayment) {
+    const assetType = op.destination_asset_type;
+    const assetCode = assetType === "native" ? "XLM" : op.destination_asset_code;
+    const assetIssuer = assetType === "native" ? null : op.destination_asset_issuer;
+    return { assetType, assetCode, assetIssuer };
+  }
+  const assetType = op.asset_type;
+  const assetCode = assetType === "native" ? "XLM" : op.asset_code;
+  const assetIssuer = assetType === "native" ? null : op.asset_issuer;
+  return { assetType, assetCode, assetIssuer };
+}
+
+/**
+ * Amount credited to the destination for an operation. Path payments credit
+ * `destination_amount`; plain payments credit `amount`.
+ */
+function resolveCreditedAmount(op) {
+  const isPathPayment =
+    op.type === "path_payment_strict_send" ||
+    op.type === "path_payment_strict_receive";
+  return isPathPayment ? op.destination_amount : op.amount;
+}
 
 function detectAsset(payOp) {
-  const assetType = payOp.asset_type;
-  const assetCode = assetType === "native" ? "XLM" : payOp.asset_code;
-  const assetIssuer = assetType === "native" ? null : payOp.asset_issuer;
+  const { assetType, assetCode, assetIssuer } = resolveDeliveredAsset(payOp);
   // Pass the issuer so credit assets (USDC) are validated against the pinned
   // canonical issuer for the active network (#841). A fake "USDC" from any
   // other issuer is rejected here.
@@ -73,45 +120,98 @@ async function extractValidPayment(tx, walletAddress) {
   // truthy, so a failed-but-included tx (or one missing the flag) is rejected.
   if (tx.successful !== true) return null;
 
-  // Unwrap fee-bump transaction to get the inner transaction
-  const innerTx = tx.inner_transaction || tx;
+  // #1556 — Fee-bump transactions: Horizon exposes memo_type, memo and the
+  // operations() link on the TOP-LEVEL transaction record regardless of whether
+  // it is a fee-bump or a regular transaction. The inner_transaction sub-object
+  // only carries { hash, signatures, max_fee } — it does NOT have memo_type,
+  // memo, or operations(). Reading those from inner_transaction always yields
+  // undefined / TypeError, so fee-bumped payments were silently dropped.
+  // Fix: always use the top-level `tx` for memo/operations. The inner hash is
+  // preserved separately for traceability when it differs.
+  const isFeeBomp = Boolean(tx.inner_transaction);
+  const innerHash = isFeeBomp ? tx.inner_transaction.hash : null;
 
   // Check memo type and handle accordingly
-  const memoType = innerTx.memo_type || 'none';
+  const memoType = tx.memo_type || 'none';
   
   if (memoType === 'none') {
     // No memo provided
     return null;
   }
   
-  if (memoType !== 'text') {
-    // MEMO_ID, MEMO_HASH, or MEMO_RETURN — unsupported for student ID matching
+  if (!normalizeMemoType(memoType)) {
+    // MEMO_RETURN — no canonical encoding, so it cannot identify a payment.
     logger.warn('Transaction has unsupported memo type', {
       txHash: tx.hash,
+      innerHash,
       memoType,
-      memo: innerTx.memo,
+      memo: tx.memo,
     });
     return null;
   }
 
-  const memo = innerTx.memo ? innerTx.memo.trim() : null;
-  if (!memo) return null;
+  // MEMO_ID / MEMO_HASH decode back to the canonical intent memo (#1118).
+  const memo = decodeMemoToCanonical(tx.memo, memoType);
+  if (!memo) {
+    logger.warn('Transaction memo could not be decoded to a payment reference', {
+      txHash: tx.hash,
+      innerHash,
+      memoType,
+    });
+    return null;
+  }
 
-  const ops = await withStellarRetry(() => innerTx.operations(), {
-    label: "extractValidPayment.operations",
+  const ops = await fetchAllOperations(tx, "extractValidPayment.operations");
+  // #840 — only a successful payment/path-payment operation landing on the
+  // school wallet is creditable. detectAsset then enforces the asset/issuer
+  // (#841): a wrong-asset or fake-issuer operation yields null and is rejected.
+  // #1760 — every creditable operation is returned with its opIndex so each one
+  // is recorded as its own payment row.
+  const creditable = ops
+    .map((op, i) => ({ op, opIndex: i }))
+    .filter(({ op }) => PAYMENT_TYPES.includes(op.type) && op.to === walletAddress)
+    .map(({ op, opIndex }) => {
+      const asset = detectAsset(op);
+      if (!asset) return null;
+      return {
+        payOp: op,
+        opIndex,
+        amount: normalizeAmount(resolveCreditedAmount(op)),
+        asset,
+      };
+    })
+    .filter(Boolean);
+
+  if (!creditable.length) return null;
+
+  return { operations: creditable, memo, memoType, innerHash };
+}
+
+/**
+ * Fetch every operation of a transaction, following Horizon pagination.
+ * Horizon returns 10 records per page by default and a transaction may contain
+ * up to 100 operations (#1760) — a single `tx.operations()` call would silently
+ * drop everything past the first page.
+ *
+ * @param {object} tx - Horizon transaction record
+ * @param {string} label - retry label for logging
+ * @returns {Promise<Array>} all operation records in order
+ */
+async function fetchAllOperations(tx, label) {
+  let page = await withStellarRetry(() => tx.operations({ limit: 200 }), {
+    label,
+    context: `Transaction ${tx.hash} operations`,
   });
-  // #840 — only a successful `payment` operation landing on the school wallet
-  // is creditable. detectAsset then enforces the asset/issuer (#841): a
-  // wrong-asset or fake-issuer operation yields null and is rejected here.
-  const payOp = ops.records.find(
-    (op) => op.type === "payment" && op.to === walletAddress,
-  );
-  if (!payOp) return null;
-
-  const asset = detectAsset(payOp);
-  if (!asset) return null;
-
-  return { payOp, memo, asset, memoType };
+  const records = [...page.records];
+  while (page.records.length > 0 && typeof page.next === "function") {
+    page = await withStellarRetry(() => page.next(), {
+      label: `${label}.next`,
+      context: `Transaction ${tx.hash} operations page`,
+    });
+    if (!page || !page.records.length) break;
+    records.push(...page.records);
+  }
+  return records;
 }
 
 function validatePaymentAgainstFee(paymentAmount, expectedFee) {
@@ -141,6 +241,54 @@ function validatePaymentAgainstFee(paymentAmount, expectedFee) {
     excessAmount: 0,
     message: "Payment matches the required fee",
   };
+}
+
+/**
+ * Calculate adjusted fee using the DynamicFeeAdjustmentEngine and validate payment.
+ * Issue #1474: Wires the fee adjustment engine into the live payment validation path.
+ *
+ * @param {string} schoolId - School ID for tenant isolation
+ * @param {number} paymentAmount - The amount the student paid
+ * @param {number} baseFee - The base fee amount
+ * @param {Object} context - Fee calculation context (promoCode, isEarly, etc.)
+ * @returns {Object} Validation result with status, finalFee, and adjustments
+ */
+function validatePaymentWithDynamicFee(schoolId, paymentAmount, baseFee, context = {}) {
+  try {
+    const engine = getEngineForSchool(schoolId);
+    const feeCalculation = engine.calculateFee({
+      baseAmount: baseFee,
+      schoolId,
+      ...context,
+    });
+
+    const finalFee = feeCalculation.finalFee;
+    const validation = validatePaymentAgainstFee(paymentAmount, finalFee);
+
+    return {
+      ...validation,
+      baseFee,
+      finalFee,
+      adjustments: feeCalculation.adjustments,
+      effectiveRate: feeCalculation.effectiveRate,
+    };
+  } catch (err) {
+    logger.error('Fee adjustment engine error', {
+      schoolId,
+      paymentAmount,
+      baseFee,
+      error: err.message,
+    });
+
+    // Fallback to non-adjusted fee validation on engine error
+    return {
+      ...validatePaymentAgainstFee(paymentAmount, baseFee),
+      baseFee,
+      finalFee: baseFee,
+      adjustments: [],
+      fallbackToBaseFee: true,
+    };
+  }
 }
 
 async function getLatestLedgerSequence(label) {
@@ -200,6 +348,11 @@ async function determineConfirmationState(
  * Detect memo collision: same memo used by a different sender within 24h,
  * or payment amount is wildly outside the expected fee range.
  * Query is school-scoped via schoolId.
+ *
+ * The senderAddress predicate uses $nin to express "not this sender and not
+ * null" in a single operator, avoiding the duplicate-key bug that previously
+ * caused { $ne: senderAddress, $exists: true, $ne: null } to collapse to
+ * { $exists: true, $ne: null } at JS parse time (ESLint no-dupe-keys, #1271).
  */
 async function detectMemoCollision(
   memo,
@@ -215,9 +368,11 @@ async function detectMemoCollision(
   const recentFromOtherSender = await Payment.findOne({
     schoolId,
     memo,
-    senderAddress: { $ne: senderAddress, $exists: true, $ne: null },
+    // $nin expresses "not senderAddress AND not null" without a duplicate $ne key.
+    // $exists: true additionally excludes documents where the field is absent.
+    senderAddress: { $nin: [senderAddress, null], $exists: true },
     confirmedAt: { $gte: windowStart },
-    deletedAt: null,
+    deletedAt: { $in: [null, undefined] },
   });
 
   if (recentFromOtherSender) {
@@ -427,7 +582,7 @@ async function detectAbnormalPatterns(
 async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   const tx = await withStellarRetry(
     () => server.transactions().transaction(txHash).call(),
-    { label: "verifyTransaction" },
+    { label: "verifyTransaction", context: `Transaction ${txHash}` },
   );
 
   // 1. Validate transaction success
@@ -439,17 +594,19 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
     throw err;
   }
 
-  // Unwrap fee-bump transaction to get the inner transaction
-  const innerTx = tx.inner_transaction || tx;
+  // #1556 — Fee-bump transactions: memo_type, memo and operations() all live
+  // on the TOP-LEVEL tx record. inner_transaction only contains { hash,
+  // signatures, max_fee }. Preserve the inner hash for traceability but never
+  // read memo/operations from it.
+  const innerHash = tx.inner_transaction ? tx.inner_transaction.hash : null;
 
-  // 2. Find matching payment operation first (destination + asset checks before memo)
-  const ops = await withStellarRetry(() => innerTx.operations(), {
-    label: "verifyTransaction.operations",
-  });
-  const payOp = ops.records.find(
-    (op) => op.type === "payment" && op.to === walletAddress,
-  );
-  if (!payOp) {
+  // 2. Find matching payment operations first (destination + asset checks before memo)
+  // #1760 — collect every creditable operation with its opIndex, not just the first.
+  const ops = await fetchAllOperations(tx, "verifyTransaction.operations");
+  const creditable = ops
+    .map((op, i) => ({ op, opIndex: i }))
+    .filter(({ op }) => PAYMENT_TYPES.includes(op.type) && op.to === walletAddress);
+  if (!creditable.length) {
     const err = new Error(
       `No payment operation found targeting the school wallet (${walletAddress})`,
     );
@@ -457,20 +614,27 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
     throw err;
   }
 
-  const asset = detectAsset(payOp);
-  if (!asset) {
-    const assetCode =
-      payOp.asset_type === "native"
-        ? "XLM"
-        : payOp.asset_code || payOp.asset_type;
-    const err = new Error(`Unsupported asset: ${assetCode}`);
-    err.code = "UNSUPPORTED_ASSET";
-    err.assetCode = assetCode;
-    throw err;
+  const operations = [];
+  for (const { op, opIndex } of creditable) {
+    const asset = detectAsset(op);
+    if (!asset) {
+      const { assetType, assetCode: rawCode } = resolveDeliveredAsset(op);
+      const assetCode = assetType === "native" ? "XLM" : rawCode || assetType;
+      const err = new Error(`Unsupported asset: ${assetCode}`);
+      err.code = "UNSUPPORTED_ASSET";
+      err.assetCode = assetCode;
+      throw err;
+    }
+    operations.push({
+      opIndex,
+      amount: normalizeAmount(resolveCreditedAmount(op)),
+      asset,
+      senderAddress: op.from || null,
+    });
   }
 
   // 3. Check memo type (after destination/asset are validated)
-  const memoType = innerTx.memo_type || 'none';
+  const memoType = tx.memo_type || 'none';
 
   if (memoType === 'none') {
     const err = new Error(
@@ -480,17 +644,30 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
     throw err;
   }
 
-  if (memoType !== 'text') {
+  // MEMO_ID and MEMO_HASH are decoded back to the canonical intent memo (#1118)
+  // so wallets that cannot send free-text memos still match. MEMO_RETURN has no
+  // encoding and stays unsupported.
+  if (!normalizeMemoType(memoType)) {
     const err = new Error(
-      `Transaction memo type '${memoType}' is not supported. Only MEMO_TEXT is accepted for student ID matching.`,
+      `Transaction memo type '${memoType}' is not supported. Accepted types: ${SUPPORTED_MEMO_TYPES.join(', ')}.`,
     );
     err.code = "UNSUPPORTED_MEMO_TYPE";
     err.memoType = memoType;
     throw err;
   }
 
-  const memo = innerTx.memo ? innerTx.memo.trim() : null;
+  const memo = decodeMemoToCanonical(tx.memo, memoType);
   if (!memo) {
+    // A non-text memo that fails to decode carries no student identity — it is
+    // an unrecognised value rather than a missing one, so report it as such.
+    if (normalizeMemoType(memoType) !== 'MEMO_TEXT') {
+      const err = new Error(
+        `Transaction memo of type '${memoType}' could not be decoded to a payment reference.`,
+      );
+      err.code = "UNSUPPORTED_MEMO_TYPE";
+      err.memoType = memoType;
+      throw err;
+    }
     const err = new Error(
       "Transaction memo is missing or empty — cannot identify student",
     );
@@ -498,14 +675,28 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
     throw err;
   }
 
-  const amount = normalizeAmount(payOp.amount);
+  // #1760 — a single memo covers every operation in the transaction, so the
+  // credited amount is the sum of all creditable operations (attribution is
+  // per-transaction until per-operation memos/muxed accounts are supported).
+  const amount = parseFloat(
+    operations.reduce((sum, o) => sum + o.amount, 0).toFixed(7),
+  );
 
   // 5. Validate payment amount is within configured limits
-  const limitValidation = validatePaymentAmount(amount);
-  if (!limitValidation.valid) {
-    const err = new Error(limitValidation.error);
-    err.code = limitValidation.code;
-    throw err;
+  // #1555 — detectAsset returns { assetCode, assetType, assetIssuer }.
+  // The previous `asset?.code` was always undefined, causing every USDC
+  // payment to be validated against XLM limits. Use `assetCode` instead.
+  // #1760 — validate each operation's amount against its own asset's limits.
+  for (const o of operations) {
+    const limitValidation = await validatePaymentAmount(o.amount, {
+      schoolId,
+      asset: o.asset?.assetCode,
+    });
+    if (!limitValidation.valid) {
+      const err = new Error(limitValidation.error);
+      err.code = limitValidation.code;
+      throw err;
+    }
   }
 
   // 6. Look up student to validate fee. School-scope when schoolId is provided so
@@ -526,19 +717,30 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   // Extract network fee from transaction
   const networkFee = parseFloat(tx.fee_paid || "0") / 10000000; // Convert stroops to XLM
 
+  const primary = operations[0];
+
   return {
     hash: tx.hash,
+    innerHash,
     memo: memo,
     studentId: memo,
     amount: amount,
-    assetCode: asset.assetCode,
-    assetType: asset.assetType,
+    assetCode: primary.asset.assetCode,
+    assetType: primary.asset.assetType,
     feeAmount,
     feeValidation,
     networkFee,
     date: tx.created_at,
     ledger: tx.ledger_attr || tx.ledger || null,
-    senderAddress: payOp.from || null,
+    senderAddress: primary.senderAddress,
+    // #1760 — every creditable operation, each with its opIndex and amount.
+    operations: operations.map((o) => ({
+      opIndex: o.opIndex,
+      amount: o.amount,
+      assetCode: o.asset.assetCode,
+      assetType: o.asset.assetType,
+      senderAddress: o.senderAddress,
+    })),
   };
 }
 
@@ -576,7 +778,7 @@ async function syncPaymentsForSchool(school) {
         .order("desc")
         .limit(200)
         .call(),
-    { label: `syncPaymentsForSchool(${schoolId})` },
+    { label: `syncPaymentsForSchool(${schoolId})`, context: `Account ${stellarAddress} transactions` },
   );
 
   let done = false;
@@ -585,7 +787,7 @@ async function syncPaymentsForSchool(school) {
     for (const tx of page.records) {
       summary.found++;
 
-      const existing = await Payment.findOne({ txHash: tx.hash, deletedAt: null });
+      const existing = await Payment.findOne({ txHash: tx.hash, schoolId, deletedAt: null });
       if (existing) { summary.alreadyProcessed++; done = true; break; }
 
       summary.new++;
@@ -594,12 +796,11 @@ async function syncPaymentsForSchool(school) {
       if (!valid) {
         // Log if the tx was skipped due to wrong destination
         if (tx.successful) {
-          const ops = await withStellarRetry(
-            () => tx.operations(),
-            { label: 'syncPaymentsForSchool.destinationCheck' }
-          ).catch(() => ({ records: [] }));
+          const ops = await fetchAllOperations(tx, 'syncPaymentsForSchool.destinationCheck')
+            .then((records) => ({ records }))
+            .catch(() => ({ records: [] }));
           const wrongDest = ops.records.find(
-            op => op.type === 'payment' && op.to && op.to !== stellarAddress
+            op => PAYMENT_TYPES.includes(op.type) && op.to && op.to !== stellarAddress
           );
           if (wrongDest) {
             logger.warn('Transaction skipped — destination does not match school wallet', {
@@ -616,15 +817,19 @@ async function syncPaymentsForSchool(school) {
         continue;
       }
 
-      const { payOp, memo } = valid;
+      // #1760 — every creditable operation is credited individually, each with
+      // its own opIndex. A shared memo attributes the sum of the operations to
+      // the one student the memo identifies.
+      const { operations, memo } = valid;
 
       // Explicit destination check — defence-in-depth beyond extractValidPayment
-      if (payOp.to !== stellarAddress) {
+      const wrongDestOp = operations.find((o) => o.payOp.to !== stellarAddress);
+      if (wrongDestOp) {
         logger.warn('Transaction skipped — destination mismatch after extraction', {
-          txHash: tx.hash, schoolId, destination: payOp.to, expected: stellarAddress,
+          txHash: tx.hash, schoolId, destination: wrongDestOp.payOp.to, expected: stellarAddress,
         });
         summary.failed++;
-        summary.failedDetails.push({ txHash: tx.hash, reason: `INVALID_DESTINATION: payment sent to ${payOp.to}` });
+        summary.failedDetails.push({ txHash: tx.hash, reason: `INVALID_DESTINATION: payment sent to ${wrongDestOp.payOp.to}` });
         continue;
       }
 
@@ -639,20 +844,53 @@ async function syncPaymentsForSchool(school) {
       } else {
         student = await Student.findOne({ schoolId, studentId: memo });
       }
+
+      // A memo (or a still-pending intent) can point at a student who has since
+      // been soft-deleted (#77/#390). The funds already left the payer's wallet,
+      // so record them against the deleted student (studentDeleted=true) for the
+      // existing deleted-student payments audit view (getDeletedStudentPayments)
+      // instead of dropping them into the generic unmatched bucket, where they'd
+      // be indistinguishable from a mistyped memo and never surfaced for review.
+      let studentDeleted = false;
+      if (!student) {
+        const targetStudentId = intent ? intent.studentId : memo;
+        student = await Student.findOne({
+          schoolId,
+          studentId: targetStudentId,
+          deletedAt: { $ne: null },
+        });
+        studentDeleted = Boolean(student);
+        if (studentDeleted) {
+          logger.warn('Transaction matched a soft-deleted student — recording for manual review', {
+            txHash: tx.hash, schoolId, studentId: targetStudentId,
+          });
+        }
+      }
       if (!student) { summary.unmatched++; continue; }
 
       summary.matched++;
 
-      const paymentAmount = parseFloat(payOp.amount);
-
-      const limitValidation = validatePaymentAmount(paymentAmount);
-      if (!limitValidation.valid) {
+      // #1760 — validate each operation's amount against its own asset's limits.
+      let limitFailure = null;
+      for (const o of operations) {
+        const limitValidation = await validatePaymentAmount(o.amount, {
+          schoolId,
+          asset: o.asset?.assetCode,  // #1555: detectAsset returns assetCode, not code
+        });
+        if (!limitValidation.valid) { limitFailure = limitValidation; break; }
+      }
+      if (limitFailure) {
         summary.failed++;
-        summary.failedDetails.push({ txHash: tx.hash, reason: limitValidation.code });
+        summary.failedDetails.push({ txHash: tx.hash, reason: limitFailure.code });
         continue;
       }
 
-      const senderAddress = payOp.from || null;
+      // Total credited for this transaction: the sum of all creditable operations.
+      const paymentAmount = parseFloat(
+        operations.reduce((sum, o) => sum + o.amount, 0).toFixed(7),
+      );
+
+      const senderAddress = operations[0].payOp.from || null;
       const txDate = new Date(tx.created_at);
       const txLedger = tx.ledger_attr || tx.ledger || null;
 
@@ -687,6 +925,22 @@ async function syncPaymentsForSchool(school) {
       const feeAmountForRecord = intent ? intent.amount : student.feeAmount;
       const feeCategory = intent ? (intent.feeCategory || null) : null;
 
+      // Issue #1026 — the balance write below is a non-atomic read-aggregate-then-
+      // absolute-write. It races against another sync pass touching the same
+      // student, and against verifyPayment's equivalent section, unless both hold
+      // this shared per-student lock around it.
+      const studentLockKey = lock.studentBalanceLockKey(schoolId, studentId);
+      const studentLockInfo = await lock.acquire(studentLockKey, STUDENT_BALANCE_LOCK_TTL_MS);
+      if (!studentLockInfo) {
+        // A concurrent verify/sync is updating this student's balance right now.
+        // Skip this transaction for this pass — it will be picked up on the next
+        // sync run once the in-flight update releases the lock.
+        summary.failed++;
+        summary.failedDetails.push({ txHash: tx.hash, reason: 'STUDENT_BALANCE_LOCK_CONTENDED' });
+        continue;
+      }
+      const studentLockToken = studentLockInfo.token;
+
       const previousPayments = await Payment.aggregate([
         { $match: { schoolId, studentId, deletedAt: null } },
         { $group: { _id: null, total: { $sum: "$amount" } } },
@@ -699,47 +953,48 @@ async function syncPaymentsForSchool(school) {
       );
 
       // Partial payments are accepted in the sync path — cumulative total determines status.
-      // A single payment below the fee is recorded as 'partial' (credit toward remainingBalance).
-      // Compare in exact stroop space (#842) so an exact cumulative match is never
-      // mis-classified as partial/overpaid by a float rounding epsilon.
-      const cumulativeVsFee = compareAmounts(cumulativeTotal, student.feeAmount);
-      let cumulativeStatus;
-      if (cumulativeVsFee < 0) cumulativeStatus = "partial";
-      else if (cumulativeVsFee > 0) cumulativeStatus = "overpaid";
-      else cumulativeStatus = "valid";
-
-      const excessAmount =
-        cumulativeStatus === "overpaid"
-          ? stroopsToNumber(toStroops(cumulativeTotal) - toStroops(student.feeAmount))
-          : 0;
+      // Classification is delegated to the canonical classifyFeePayment helper (#1766)
+      // so the sync path, verify path and updateStudentBalance cannot diverge on the
+      // vocabulary used for a cumulative total below the fee.
+      const cumulativeClassification = classifyFeePayment(
+        cumulativeTotal,
+        student.feeAmount,
+      );
+      const cumulativeStatus = cumulativeClassification.status;
+      const excessAmount = cumulativeClassification.excessAmount;
 
       let session;
       try {
         session = await mongoose.connection.startSession();
         await session.withTransaction(async () => {
-          await savePayment({
-            schoolId,
-            studentId,
-            txHash: tx.hash,
-            correlationId: deriveCorrelationId(tx.hash),
-            amount: paymentAmount,
-            feeAmount: feeAmountForRecord,
-            feeCategory,
-            feeValidationStatus: cumulativeStatus,
-            excessAmount,
-            status: "SUCCESS",
-            memo,
-            senderAddress,
-            isSuspicious,
-            suspicionReason,
-            ledger: txLedger,
-            ledgerSequence: txLedger,
-            confirmationStatus,
-            confirmationState: confirmation.state,
-            confirmedAt: txDate,
-          }, { session });
+          // #1760 — one payment row per (schoolId, txHash, opIndex).
+          for (const o of operations) {
+            await savePayment({
+              schoolId,
+              studentId,
+              txHash: tx.hash,
+              opIndex: o.opIndex,
+              correlationId: deriveCorrelationId(tx.hash),
+              amount: o.amount,
+              feeAmount: feeAmountForRecord,
+              feeCategory,
+              feeValidationStatus: cumulativeStatus,
+              excessAmount,
+              status: "SUCCESS",
+              memo,
+              senderAddress: o.payOp.from || null,
+              isSuspicious,
+              suspicionReason,
+              ledger: txLedger,
+              ledgerSequence: txLedger,
+              confirmationStatus,
+              confirmationState: confirmation.state,
+              confirmedAt: txDate,
+              studentDeleted,
+            }, { session });
+          }
 
-          if (isConfirmed && !isSuspicious) {
+          if (isConfirmed && !isSuspicious && !studentDeleted) {
             const updateData = {
               totalPaid: cumulativeTotal,
               remainingBalance: parseFloat(Math.max(0, student.feeAmount - cumulativeTotal).toFixed(7)),
@@ -784,8 +1039,8 @@ async function syncPaymentsForSchool(school) {
           }
 
           if (intent) {
-            await PaymentIntent.findByIdAndUpdate(
-              intent._id,
+            await PaymentIntent.findOneAndUpdate(
+              { _id: intent._id, schoolId },
               { status: "completed" },
               { session }
             );
@@ -798,13 +1053,14 @@ async function syncPaymentsForSchool(school) {
           summary.new--;
           summary.alreadyProcessed++;
           if (intent) {
-            await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'completed' });
+            await PaymentIntent.findOneAndUpdate({ _id: intent._id, schoolId }, { status: 'completed' });
           }
           continue;
         }
         throw saveErr;
       } finally {
         if (session) await session.endSession();
+        await lock.release(studentLockKey, studentLockToken);
       }
       newPayments++;
 
@@ -812,6 +1068,7 @@ async function syncPaymentsForSchool(school) {
         txHash: tx.hash,
         schoolId,
         studentId,
+        operationCount: operations.length,
         amount: paymentAmount,
         feeValidationStatus: cumulativeStatus,
         isSuspicious,
@@ -869,7 +1126,7 @@ async function finalizeConfirmedPayments(schoolId) {
     if (!changed) continue;
 
     if (typeof Payment.findByIdAndUpdate === "function") {
-      await Payment.findByIdAndUpdate(payment._id, {
+      await Payment.findOneAndUpdate({ _id: payment._id, schoolId }, {
         confirmationState: nextState,
         confirmationStatus: deriveLegacyConfirmationStatus(nextState),
       });
@@ -951,39 +1208,35 @@ async function finalizeConfirmedPayments(schoolId) {
  * If walletAddress is provided, only payments to that wallet are included.
  */
 async function parseIncomingTransaction(txHash, walletAddress = null) {
-  let tx;
-  try {
-    tx = await withStellarRetry(
-      () => server.transactions().transaction(txHash).call(),
-      { label: "parseIncomingTransaction" },
-    );
-  } catch (err) {
-    throw classifyHorizonError(err, `Transaction ${txHash}`);
-  }
+  // withStellarRetry classifies any failure (404/429/5xx/network) into a
+  // structured error before it reaches here — see the design decision
+  // documented in withStellarRetry.js. No local try/catch needed.
+  const tx = await withStellarRetry(
+    () => server.transactions().transaction(txHash).call(),
+    { label: "parseIncomingTransaction", context: `Transaction ${txHash}` },
+  );
 
   const memo = tx.memo ? tx.memo.trim() : null;
 
-  let ops;
-  try {
-    ops = await withStellarRetry(() => tx.operations(), {
-      label: "parseIncomingTransaction.operations",
-    });
-  } catch (err) {
-    throw classifyHorizonError(err, "Transaction operations");
-  }
-  const payments = ops.records
+  const ops = await fetchAllOperations(tx, "parseIncomingTransaction.operations");
+  const payments = ops
+    .map((op, i) => ({ op, opIndex: i }))
     .filter(
-      (op) =>
-        op.type === "payment" && (!walletAddress || op.to === walletAddress),
+      ({ op }) =>
+        PAYMENT_TYPES.includes(op.type) && (!walletAddress || op.to === walletAddress),
     )
-    .map((op) => ({
-      from: op.from || null,
-      to: op.to,
-      amount: normalizeAmount(op.amount),
-      assetCode: op.asset_type === "native" ? "XLM" : op.asset_code,
-      assetType: op.asset_type,
-      assetIssuer: op.asset_issuer || null,
-    }));
+    .map(({ op, opIndex }) => {
+      const { assetType, assetCode, assetIssuer } = resolveDeliveredAsset(op);
+      return {
+        opIndex,
+        from: op.from || null,
+        to: op.to,
+        amount: normalizeAmount(resolveCreditedAmount(op)),
+        assetCode,
+        assetType,
+        assetIssuer,
+      };
+    });
 
   return {
     hash: tx.hash,
@@ -1000,9 +1253,11 @@ module.exports = {
   verifyTransaction,
   parseIncomingTransaction,
   validatePaymentAgainstFee,
+  validatePaymentWithDynamicFee,
   detectAsset,
   normalizeAmount,
   extractValidPayment,
+  fetchAllOperations,
   detectMemoCollision,
   detectCrossSchoolMemoCollision,
   detectAbnormalPatterns,

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Stellar amount utilities — exact, float-safe monetary math (#842).
+ * Stellar amount utilities — exact, float-safe monetary math (#842, #1559).
  *
  * Stellar represents every amount as a signed 64-bit integer count of
  * "stroops", where 1 unit (XLM or USDC — both use 7 decimal places) = 10,000,000
@@ -12,6 +12,17 @@
  * can be judged short or over by a rounding artifact. This module is the single
  * canonical place that converts to/from integer stroops (as BigInt) and compares
  * amounts in stroop space, so monetary decisions are always exact.
+ *
+ * #1559: persisted monetary values are stored as integer stroops under a
+ * `*Stroops` naming convention (e.g. `amountStroops`, `feeAmountStroops`).
+ * Use `toStroops`/`fromStroops` for conversion and `sumStroops` for exact
+ * aggregation so report totals equal the sum of their line items exactly.
+ *
+ * #1757: every incoming-amount path (verify, manual sync, poller) must parse
+ * Horizon decimal strings through `toStroops` — never `parseFloat` and never
+ * the private SDK `Operation._fromXDRAmount`. `parseAmount` is the single
+ * helper that returns both the exact stroops and the display amount derived
+ * from them, so all paths persist identical values for the same operation.
  */
 
 const DECIMALS = 7;
@@ -81,6 +92,40 @@ function stroopsToNumber(stroops) {
 }
 
 /**
+ * Convert integer stroops to a JS number suitable for persisting in a MongoDB
+ * `*Stroops` field. Stellar's int64 stroop range (max ~9.22e18) exceeds
+ * Number.MAX_SAFE_INTEGER (~9.0e15), so values outside the safe integer range
+ * are rejected rather than silently losing precision.
+ * @param {bigint|number|string} stroops
+ * @returns {number}
+ */
+function stroopsToSafeNumber(stroops) {
+  const b = BigInt(stroops);
+  if (b > BigInt(Number.MAX_SAFE_INTEGER) || b < BigInt(Number.MIN_SAFE_INTEGER)) {
+    throw new RangeError(`Stroop value ${b} exceeds Number.MAX_SAFE_INTEGER`);
+  }
+  return Number(b);
+}
+
+/**
+ * Sum a list of stroop values exactly, returning a BigInt. Accepts BigInt,
+ * number or numeric string entries; null/undefined entries are treated as 0.
+ * Use this instead of `$sum` on double fields so totals equal the sum of their
+ * line items exactly.
+ * @param {Array<bigint|number|string|null|undefined>} values
+ * @returns {bigint}
+ */
+function sumStroops(values) {
+  if (!Array.isArray(values)) return 0n;
+  let total = 0n;
+  for (const v of values) {
+    if (v === null || v === undefined || v === '') continue;
+    total += BigInt(v);
+  }
+  return total;
+}
+
+/**
  * Compare two decimal amounts exactly in stroop space.
  * @returns {number} -1 if a < b, 0 if equal, 1 if a > b
  */
@@ -112,13 +157,31 @@ function normalizeToNumber(rawAmount) {
   }
 }
 
+/**
+ * Parse a raw Horizon amount into the canonical persisted shape used by every
+ * incoming-amount path (#1757): the exact integer stroops plus the display
+ * amount derived from those stroops. This replaces the old `normalizeAmount`
+ * (which round-tripped through a float and the private SDK
+ * `Operation._fromXDRAmount`) and the inline `parseFloat` calls in sync.
+ *
+ * @param {string|number|bigint} rawAmount
+ * @returns {{ amountStroops: bigint, amount: number }}
+ */
+function parseAmount(rawAmount) {
+  const amountStroops = toStroops(rawAmount);
+  return { amountStroops, amount: stroopsToNumber(amountStroops) };
+}
+
 module.exports = {
   DECIMALS,
   STROOPS_PER_UNIT,
   toStroops,
   fromStroops,
   stroopsToNumber,
+  stroopsToSafeNumber,
+  sumStroops,
   compareAmounts,
   amountsEqual,
   normalizeToNumber,
+  parseAmount,
 };

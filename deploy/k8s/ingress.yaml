@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stellaredupay
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Enforce HTTPS by redirecting all HTTP traffic to HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Issue TLS certificate using cert-manager and Let's Encrypt
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  # TLS configuration — certificate termination at the Ingress
+  tls:
+    - hosts:
+        - stellaredupay.example.com
+      secretName: stellaredupay-tls
+  rules:
+    - host: YOUR_DOMAIN_HERE  # Replace with your domain name (e.g., stellaredupay.example.com)
+      http:
+        paths:
+          # API traffic goes directly to the backend; /api prefix is preserved
+          # so the backend's Express routes (which are all under /api/) match.
+          #
+          # Health endpoints (issue #1540): the backend's /health, /health/live
+          # and /health/ready are deliberately NOT routed here — only /api is
+          # forwarded to the backend, so they stay reachable solely on the
+          # in-cluster Service for kubelet probes. Do not add a /health path.
+          # Detailed diagnostics are at /api/admin/health/details (admin auth).
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 5000
+          # All other traffic is served by the Next.js frontend.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000

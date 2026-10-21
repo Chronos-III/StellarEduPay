@@ -1,15 +1,31 @@
 'use strict';
 
-const jwt = require('jsonwebtoken');
 const logger = require('../utils/logger').child('AuthMiddleware');
 const { logAudit } = require('../services/auditService');
 const { get, set } = require('../cache');
 const { sendAdminAlert } = require('../services/alertService');
+const { getRedisClient, isRedisReady } = require('../config/redisClient');
+const { hashIp } = require('../utils/piiRedaction');
+const tokenService = require('../services/tokenService');
+
+// ── IP failure tracking constants ──────────────────────────────────────────────
+const IP_FAIL_WINDOW = 300;  // 5 minutes (seconds)
+const IP_FAIL_THRESHOLD = 5; // block after 5 failures
+const IP_BLOCK_TTL = 900;    // 15 minutes (seconds)
+
+function ipFailKey(ip) {
+  return `ip_auth_fail:${ip}`;
+}
+
+function ipBlockKey(ip) {
+  return `ip_blocked:${ip}`;
+}
 
 // ── Shared failure handler (used by both middleware factories) ────────────────
 
 async function handleAuthFailure(req, res, ip, reason, code, { countTowardsBlock = true } = {}) {
-  logger.warn(`Failed auth attempt: ${reason} from ${ip}`, { endpoint: req.originalUrl, code });
+  const ipHash = hashIp(ip);
+  logger.warn(`Failed auth attempt: ${reason}`, { ipHash, endpoint: req.originalUrl, code });
 
   const schoolId = req.headers['x-school-id'] || 'system';
 
@@ -27,14 +43,40 @@ async function handleAuthFailure(req, res, ip, reason, code, { countTowardsBlock
   });
 
   if (countTowardsBlock) {
-    const failKey = `fail_count:${ip}`;
-    const blockKey = `blocked_ip:${ip}`;
-    const failCount = (get(failKey) || 0) + 1;
-    set(failKey, failCount, 300); // 5 min
+    const failKey = ipFailKey(ip);
+    const blockKey = ipBlockKey(ip);
 
-    if (failCount >= 5) {
-      set(blockKey, true, 900); // 15 min
-      await sendAdminAlert(`IP ${ip} blocked due to repeated auth failures`, { ip, endpoint: req.originalUrl });
+    // Try Redis first (cluster-wide counting), fall back to in-process cache
+    let failCount = 0;
+    const redis = getRedisClient();
+    if (redis && isRedisReady()) {
+      try {
+        failCount = await redis.incr(failKey);
+        if (failCount === 1) await redis.expire(failKey, IP_FAIL_WINDOW);
+
+        if (failCount >= IP_FAIL_THRESHOLD) {
+          await redis.set(blockKey, '1', 'EX', IP_BLOCK_TTL);
+          set(blockKey, true, IP_BLOCK_TTL); // also cache in-memory fallback
+          await sendAdminAlert(`IP ${ip} blocked due to repeated auth failures`, { ip, endpoint: req.originalUrl });
+        }
+      } catch (err) {
+        logger.warn('[AuthMiddleware] Redis error tracking IP failure', { error: err.message, ip });
+        // Fall through to in-process fallback
+        failCount = (get(failKey) || 0) + 1;
+        set(failKey, failCount, IP_FAIL_WINDOW);
+        if (failCount >= IP_FAIL_THRESHOLD) {
+          set(blockKey, true, IP_BLOCK_TTL);
+          await sendAdminAlert(`IP ${ip} blocked due to repeated auth failures`, { ip, endpoint: req.originalUrl });
+        }
+      }
+    } else {
+      // Redis not available, use in-process cache (per-replica, not cluster-wide)
+      failCount = (get(failKey) || 0) + 1;
+      set(failKey, failCount, IP_FAIL_WINDOW);
+      if (failCount >= IP_FAIL_THRESHOLD) {
+        set(blockKey, true, IP_BLOCK_TTL);
+        await sendAdminAlert(`IP ${ip} blocked due to repeated auth failures`, { ip, endpoint: req.originalUrl });
+      }
     }
   }
 
@@ -47,9 +89,23 @@ async function handleAuthFailure(req, res, ip, reason, code, { countTowardsBlock
 
 async function requireAdminAuth(req, res, next) {
   const ip = req.ip || req.connection?.remoteAddress || 'unknown';
-  const blockKey = `blocked_ip:${ip}`;
+  const blockKey = ipBlockKey(ip);
 
-  if (get(blockKey)) {
+  // Check Redis first for cluster-wide block, then local cache fallback
+  const redis = getRedisClient();
+  let isBlocked = false;
+  if (redis && isRedisReady()) {
+    try {
+      isBlocked = await redis.exists(blockKey);
+    } catch (err) {
+      logger.debug('[AuthMiddleware] Redis block check failed', { error: err.message, ip });
+      isBlocked = get(blockKey) ? 1 : 0;
+    }
+  } else {
+    isBlocked = get(blockKey) ? 1 : 0;
+  }
+
+  if (isBlocked) {
     return res.status(429).json({ error: 'Too many requests, IP temporarily blocked.', code: 'IP_BLOCKED' });
   }
 
@@ -71,12 +127,11 @@ async function requireAdminAuth(req, res, next) {
   }
 
   try {
-    const secret = process.env.JWT_SECRET;
-    if (!secret) {
-      return res.status(500).json({ error: 'Server misconfiguration: JWT_SECRET is not set.', code: 'AUTH_MISCONFIGURED' });
-    }
+    const decoded = tokenService.verify(token);
 
-    const decoded = jwt.verify(token, secret);
+    if (decoded.sid && await tokenService.isSessionRevoked(decoded.sid)) {
+      return handleAuthFailure(req, res, ip, 'Session has been revoked.', 'SESSION_REVOKED', { countTowardsBlock: false });
+    }
 
     // Accept the old role:'admin' shape AND the new roles:['super_admin'] shape
     const isSuperAdmin =
@@ -104,7 +159,7 @@ async function requireAdminAuth(req, res, next) {
 // Usage: router.get('/students', requireSchoolAuth(['owner', 'staff']), handler)
 //
 // Rules:
-//  • JWT must be valid and signed with JWT_SECRET.
+//  • JWT must be valid and signed with the pinned algorithm/issuer/audience.
 //  • Token schoolId must match X-School-ID request header (tenant isolation).
 //  • If allowedRoles is non-empty, the token's roles array must contain at least
 //    one of them.
@@ -114,9 +169,23 @@ async function requireAdminAuth(req, res, next) {
 function requireSchoolAuth(allowedRoles = []) {
   return async function schoolAuthMiddleware(req, res, next) {
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
-    const blockKey = `blocked_ip:${ip}`;
+    const blockKey = ipBlockKey(ip);
 
-    if (get(blockKey)) {
+    // Check Redis first for cluster-wide block, then local cache fallback
+    const redis = getRedisClient();
+    let isBlocked = false;
+    if (redis && isRedisReady()) {
+      try {
+        isBlocked = await redis.exists(blockKey);
+      } catch (err) {
+        logger.debug('[AuthMiddleware] Redis block check failed', { error: err.message, ip });
+        isBlocked = get(blockKey) ? 1 : 0;
+      }
+    } else {
+      isBlocked = get(blockKey) ? 1 : 0;
+    }
+
+    if (isBlocked) {
       return res.status(429).json({ error: 'Too many requests, IP temporarily blocked.', code: 'IP_BLOCKED' });
     }
 
@@ -136,11 +205,7 @@ function requireSchoolAuth(allowedRoles = []) {
 
     let decoded;
     try {
-      const secret = process.env.JWT_SECRET;
-      if (!secret) {
-        return res.status(500).json({ error: 'Server misconfiguration: JWT_SECRET is not set.', code: 'AUTH_MISCONFIGURED' });
-      }
-      decoded = jwt.verify(token, secret);
+      decoded = tokenService.verify(token);
     } catch (err) {
       if (err.name === 'TokenExpiredError') {
         return handleAuthFailure(req, res, ip, 'Token has expired.', 'TOKEN_EXPIRED', { countTowardsBlock: false });
@@ -148,38 +213,33 @@ function requireSchoolAuth(allowedRoles = []) {
       return handleAuthFailure(req, res, ip, 'Invalid token.', 'INVALID_AUTH_TOKEN');
     }
 
-    // Super-admin bypass — break-glass access to all tenants
-    const isSuperAdmin =
-      decoded.role === 'admin' ||
-      (Array.isArray(decoded.roles) && decoded.roles.includes('super_admin'));
+    if (decoded.sid && await tokenService.isSessionRevoked(decoded.sid)) {
+      return handleAuthFailure(req, res, ip, 'Session has been revoked.', 'SESSION_REVOKED', { countTowardsBlock: false });
+    }
 
-    if (!isSuperAdmin) {
-      // Tenant scope: token schoolId must match the requested school
-      const requestedSchoolId = req.headers['x-school-id'] || req.params?.schoolId;
-      if (requestedSchoolId && decoded.schoolId !== requestedSchoolId) {
-        return res.status(403).json({
-          error: 'Forbidden. Token schoolId does not match the requested school.',
-          code: 'TENANT_MISMATCH',
-        });
-      }
+    // Tenant isolation: token schoolId must match X-School-ID header
+    const headerSchoolId = req.headers['x-school-id'];
+    const isEnvSuperAdmin = decoded.role === 'admin';
+    if (!isEnvSuperAdmin && headerSchoolId && decoded.schoolId && String(decoded.schoolId) !== String(headerSchoolId)) {
+      return handleAuthFailure(req, res, ip, 'Token school does not match requested school.', 'TENANT_MISMATCH');
+    }
 
-      // Role check
-      if (allowedRoles.length > 0) {
-        const userRoles = Array.isArray(decoded.roles) ? decoded.roles : [];
-        const hasRole = allowedRoles.some((r) => userRoles.includes(r));
-        if (!hasRole) {
-          return res.status(403).json({
-            error: `Forbidden. Required role: ${allowedRoles.join(' or ')}.`,
-            code: 'INSUFFICIENT_ROLE',
-          });
-        }
+    // Role check
+    if (Array.isArray(allowedRoles) && allowedRoles.length > 0 && !isEnvSuperAdmin) {
+      const tokenRoles = Array.isArray(decoded.roles) ? decoded.roles : [];
+      const hasRole = tokenRoles.some((r) => allowedRoles.includes(r));
+      if (!hasRole) {
+        return res.status(403).json({ error: 'Forbidden. Insufficient role.', code: 'INSUFFICIENT_ROLE' });
       }
     }
 
     req.user = decoded;
-    req.admin = decoded; // alias so downstream code works regardless of which middleware ran
+    req.admin = decoded;
     next();
   };
 }
 
-module.exports = { requireAdminAuth, requireSchoolAuth };
+module.exports = {
+  requireAdminAuth,
+  requireSchoolAuth,
+};

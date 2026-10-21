@@ -1,18 +1,62 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { getReport } from "../services/api";
+import api from "../services/api";
 import { getErrorMessage } from "../utils/errorMessages";
 import {
   IconCalendar, IconDownload, IconBarChart, IconAlertTriangle,
-  IconCheck, IconTrendingUp,
+  IconCheck, IconTrendingUp, IconClock, IconX,
 } from "./Icons";
 import PageHero, { StatCard } from "./PageHero";
+import { useTranslation } from "react-i18next";
+// Issue #1585: import CSS module so the @keyframes spin is defined in the
+// stylesheet rather than injected as a global inline <style> block.
+import _styles from "../styles/ReportDownload.module.css"; // eslint-disable-line no-unused-vars
 
 export default function ReportDownload() {
+  const { t } = useTranslation();
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate]     = useState("");
+  const [className, setClassName] = useState("");
+  const [studentId, setStudentId] = useState("");
+  const [paymentStatus, setPaymentStatus] = useState("");
   const [report, setReport]       = useState(null);
   const [error, setError]         = useState("");
   const [loading, setLoading]     = useState(false);
+  const [csvLoading, setCsvLoading] = useState(false);
+  const [reportHistory, setReportHistory] = useState([]);
+  const [showHistory, setShowHistory] = useState(false);
+
+  useEffect(() => {
+    loadReportHistory();
+  }, []);
+
+  async function loadReportHistory() {
+    try {
+      const storedHistory = localStorage.getItem("reportHistory");
+      if (storedHistory) {
+        setReportHistory(JSON.parse(storedHistory));
+      }
+    } catch (err) {
+      console.error("Failed to load report history:", err);
+    }
+  }
+
+  function saveReportToHistory(reportData, params) {
+    const newEntry = {
+      id: Date.now(),
+      timestamp: new Date().toISOString(),
+      params,
+      summary: {
+        totals: reportData.summary.totals || {},
+        totalFiat: reportData.summary.totalFiat,
+        fiatCoverage: reportData.summary.fiatCoverage,
+        paymentCount: reportData.summary.paymentCount,
+      },
+    };
+    const updated = [newEntry, ...reportHistory.slice(0, 9)];
+    setReportHistory(updated);
+    localStorage.setItem("reportHistory", JSON.stringify(updated));
+  }
 
   async function handleGenerate(e) {
     e.preventDefault();
@@ -21,12 +65,16 @@ export default function ReportDownload() {
       const params = {};
       if (startDate) params.startDate = startDate;
       if (endDate)   params.endDate   = endDate;
+      if (className) params.className = className;
+      if (studentId) params.studentId = studentId;
+      if (paymentStatus) params.paymentStatus = paymentStatus;
       const { data } = await getReport(params);
       setReport(data);
+      saveReportToHistory(data, params);
     } catch (err) {
       setError(
         getErrorMessage(err.response?.data?.code, err.response?.data?.error) ||
-        "Failed to generate report."
+        t("reports.failedGenerate")
       );
     } finally {
       setLoading(false);
@@ -34,18 +82,26 @@ export default function ReportDownload() {
   }
 
   async function handleCsv() {
+    if (csvLoading) return;
     const params = {};
     if (startDate) params.startDate = startDate;
     if (endDate)   params.endDate   = endDate;
+    if (className) params.className = className;
+    if (studentId) params.studentId = studentId;
+    if (paymentStatus) params.paymentStatus = paymentStatus;
 
     try {
-      const query = new URLSearchParams({ ...params, format: "csv" }).toString();
-      const url = `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api"}/reports?${query}`;
-      const response = await fetch(url, {
-        credentials: "include",
+      setCsvLoading(true);
+      // Issue #1577 — use the shared axios instance so that:
+      //   1. The X-School-ID interceptor is applied (prevents MISSING_SCHOOL_CONTEXT)
+      //   2. The request goes through the Next.js /api/* rewrite proxy, keeping
+      //      SameSite=Strict auth cookies first-party in split-host deployments
+      //   3. Token refresh and error handling are consistent with all other calls
+      const response = await api.get("/reports", {
+        params: { ...params, format: "csv" },
+        responseType: "blob",
       });
-      if (!response.ok) throw new Error("Failed to download CSV");
-      const blob = await response.blob();
+      const blob = response.data;
       const blobUrl = URL.createObjectURL(blob);
       const filename =
         startDate && endDate
@@ -59,39 +115,65 @@ export default function ReportDownload() {
       document.body.removeChild(a);
       URL.revokeObjectURL(blobUrl);
     } catch (err) {
-      setError("Failed to download CSV: " + (err.message || "Unknown error"));
+      // Surface the backend error code when available (e.g. MISSING_SCHOOL_CONTEXT)
+      const backendCode  = err.response?.data?.code;
+      const backendError = err.response?.data?.error;
+      setError(
+        getErrorMessage(backendCode, backendError) ||
+        t("reports.failedCsvPrefix") + (err.message || t("reports.failedCsvUnknown"))
+      );
+    } finally {
+      setCsvLoading(false);
     }
   }
 
+  // Issue #1767: amounts of different assets must never be added together.
+  // Render one entry per asset (e.g. "1,000 XLM · 100 USDC") instead of a
+  // single meaningless combined total.
+  function formatTotals(totals) {
+    if (!totals || typeof totals !== "object") return "—";
+    const entries = Object.entries(totals).filter(([, v]) => v !== undefined && v !== null);
+    if (entries.length === 0) return "—";
+    return entries.map(([asset, amount]) => `${amount} ${asset}`).join(" · ");
+  }
+
+  function formatFiat(summary) {
+    if (summary.totalFiat === undefined || summary.totalFiat === null) return "—";
+    const coverage = summary.fiatCoverage;
+    return coverage === undefined || coverage === null
+      ? String(summary.totalFiat)
+      : `${summary.totalFiat} (${coverage}%)`;
+  }
+
   const TABLE_COLS = [
-    { key: "date",               label: "Date" },
-    { key: "totalAmount",        label: "Amount (XLM)" },
-    { key: "paymentCount",       label: "Payments" },
-    { key: "validCount",         label: "Valid",      color: "var(--success-text)" },
-    { key: "overpaidCount",      label: "Overpaid",   color: "var(--warning-text)" },
-    { key: "underpaidCount",     label: "Underpaid",  color: "var(--danger-text)" },
-    { key: "uniqueStudentCount", label: "Students" },
+    { key: "date",               label: "reports.colDate" },
+    { key: "totals",             label: "reports.colTotals" },
+    { key: "paymentCount",       label: "reports.colPayments" },
+    { key: "validCount",         label: "status.validation.valid", color: "var(--success-text)" },
+    { key: "overpaidCount",      label: "status.validation.overpaid", color: "var(--warning-text)" },
+    { key: "underpaidCount",     label: "status.validation.underpaid", color: "var(--danger-text)" },
+    { key: "uniqueStudentCount", label: "reports.colStudents" },
   ];
 
   return (
     <div className="page-wrap">
       <PageHero
-        eyebrow="Analytics"
-        title="Payment Reports"
-        subtitle="Generate an on-chain payment summary and daily breakdown for any date range."
+        eyebrow={t("reports.eyebrow")}
+        title={t("reports.title")}
+        subtitle={t("reports.subtitle")}
       />
 
       {/* Filter form */}
       <div className="card" style={{ marginBottom: "1.5rem" }}>
         <div className="card-header">
           <div className="card-title" style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-            <IconCalendar size={16} /> Date Range
+            <IconCalendar size={16} /> {t("reports.filtersTitle")}
           </div>
         </div>
         <div className="card-body">
           <form onSubmit={handleGenerate} style={{ display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-end" }}>
             <div className="form-group" style={{ marginBottom: 0 }}>
-              <label className="form-label">Start Date</label>
+              <label className="form-label">{t("reports.startDate")}</label>
               <input
                 type="date"
                 className="form-input"
@@ -101,7 +183,7 @@ export default function ReportDownload() {
               />
             </div>
             <div className="form-group" style={{ marginBottom: 0 }}>
-              <label className="form-label">End Date</label>
+              <label className="form-label">{t("reports.endDate")}</label>
               <input
                 type="date"
                 className="form-input"
@@ -110,17 +192,55 @@ export default function ReportDownload() {
                 onChange={e => setEndDate(e.target.value)}
               />
             </div>
+            <div className="form-group" style={{ marginBottom: 0 }}>
+              <label className="form-label">{t("reports.classOptional")}</label>
+              <input
+                type="text"
+                className="form-input"
+                style={{ width: "auto" }}
+                placeholder={t("reports.classPlaceholder")}
+                value={className}
+                onChange={e => setClassName(e.target.value)}
+              />
+            </div>
+            <div className="form-group" style={{ marginBottom: 0 }}>
+              <label className="form-label">{t("reports.studentIdOptional")}</label>
+              <input
+                type="text"
+                className="form-input"
+                style={{ width: "auto" }}
+                placeholder={t("reports.studentIdPlaceholder")}
+                value={studentId}
+                onChange={e => setStudentId(e.target.value)}
+              />
+            </div>
+            <div className="form-group" style={{ marginBottom: 0 }}>
+              <label className="form-label">{t("reports.paymentStatusOptional")}</label>
+              <select
+                className="form-input"
+                style={{ width: "auto" }}
+                value={paymentStatus}
+                onChange={e => setPaymentStatus(e.target.value)}
+              >
+                <option value="">{t("reports.all")}</option>
+                <option value="valid">{t("status.validation.valid")}</option>
+                <option value="overpaid">{t("status.validation.overpaid")}</option>
+                <option value="underpaid">{t("status.validation.underpaid")}</option>
+                <option value="confirmed">{t("status.payment.CONFIRMED")}</option>
+                <option value="pending">{t("status.payment.PENDING")}</option>
+              </select>
+            </div>
             <button type="submit" disabled={loading} className="btn btn-primary" style={{ alignSelf: "flex-end" }}>
-              {loading ? "Generating…" : "Generate Report"}
+              {loading ? t("reports.generating") : t("reports.generateReport")}
             </button>
-            {(startDate || endDate) && !loading && (
+            {(startDate || endDate || className || studentId || paymentStatus) && !loading && (
               <button
                 type="button"
                 className="btn btn-ghost"
                 style={{ alignSelf: "flex-end" }}
-                onClick={() => { setStartDate(""); setEndDate(""); setReport(null); }}
+                onClick={() => { setStartDate(""); setEndDate(""); setClassName(""); setStudentId(""); setPaymentStatus(""); setReport(null); }}
               >
-                Clear
+                {t("reports.clearAll")}
               </button>
             )}
           </form>
@@ -146,37 +266,157 @@ export default function ReportDownload() {
             gap: "0.5rem",
           }}>
             <p style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
-              Period: <strong>{report.period.startDate || "all time"}</strong>
+              {t("reports.period")} <strong>{report.period.startDate || t("reports.allTime")}</strong>
               {" → "}
-              <strong>{report.period.endDate || "all time"}</strong>
-              &nbsp;·&nbsp;Generated {new Date(report.generatedAt).toLocaleString()}
+              <strong>{report.period.endDate || t("reports.allTime")}</strong>
+              &nbsp;·&nbsp;{t("reports.generatedAt", { date: new Date(report.generatedAt).toLocaleString() })}
             </p>
-            <button
-              onClick={handleCsv}
-              className="btn btn-ghost btn-sm"
-              style={{ display: "flex", alignItems: "center", gap: "0.375rem" }}
-            >
-              <IconDownload size={14} /> Download CSV
-            </button>
+            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+              <button
+                onClick={handleCsv}
+                disabled={csvLoading}
+                className="btn btn-ghost btn-sm"
+                style={{ display: "flex", alignItems: "center", gap: "0.375rem" }}
+              >
+                {csvLoading ? (
+                  <>
+                    <div style={{
+                      width: "14px",
+                      height: "14px",
+                      border: "2px solid var(--text-muted)",
+                      borderTop: "2px solid var(--text-default)",
+                      borderRadius: "50%",
+                      animation: "spin 0.8s linear infinite",
+                    }} />
+                    <span>{t("reports.downloading")}</span>
+                  </>
+                ) : (
+                  <>
+                    <IconDownload size={14} /> {t("reports.downloadCsv")}
+                  </>
+                )}
+              </button>
+              {reportHistory.length > 0 && (
+                <button
+                  onClick={() => setShowHistory(!showHistory)}
+                  className="btn btn-ghost btn-sm"
+                  style={{ display: "flex", alignItems: "center", gap: "0.375rem" }}
+                >
+                  <IconClock size={14} /> {t("reports.history", { count: reportHistory.length })}
+                </button>
+              )}
+            </div>
           </div>
+
+          {showHistory && reportHistory.length > 0 && (
+            <div className="card" style={{ marginBottom: "1.5rem" }}>
+              <div className="card-header">
+                <div className="card-title">{t("reports.historyTitle")}</div>
+              </div>
+              <div style={{ overflowX: "auto" }}>
+                <table className="data-table" style={{ fontSize: "0.875rem" }}>
+                  <thead>
+                    <tr>
+                      <th>{t("reports.colGenerated")}</th>
+                      <th>{t("reports.colTotal")}</th>
+                      <th>{t("reports.colPayments")}</th>
+                      <th>{t("reports.colFilters")}</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {reportHistory.map(entry => (
+                      <tr key={entry.id}>
+                        <td style={{ whiteSpace: "nowrap" }}>
+                          {new Date(entry.timestamp).toLocaleString()}
+                        </td>
+                        <td>{formatTotals(entry.summary.totals)}</td>
+                        <td>{entry.summary.paymentCount}</td>
+                        <td style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                          {Object.keys(entry.params).length > 0
+                            ? Object.entries(entry.params)
+                              .map(([k, v]) => `${k}: ${v}`)
+                              .join(", ")
+                            : t("reports.none")}
+                        </td>
+                        <td>
+                          <button
+                            onClick={() => {
+                              setStartDate(entry.params.startDate || "");
+                              setEndDate(entry.params.endDate || "");
+                              setClassName(entry.params.className || "");
+                              setStudentId(entry.params.studentId || "");
+                              setPaymentStatus(entry.params.paymentStatus || "");
+                            }}
+                            className="btn btn-ghost btn-sm"
+                            style={{ padding: "0.25rem 0.5rem" }}
+                          >
+                            {t("reports.rerun")}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {/* Summary stats */}
           <div className="stat-grid" style={{ marginBottom: "1.5rem" }}>
-            <StatCard label="Total Collected" value={report.summary.totalAmount} sub="XLM" Icon={IconTrendingUp} color="violet" />
-            <StatCard label="Payments"        value={report.summary.paymentCount}                            Icon={IconBarChart}  color="cyan" />
-            <StatCard label="Valid"           value={report.summary.validCount}                              Icon={IconCheck}     color="green" />
-            <StatCard label="Overpaid"        value={report.summary.overpaidCount}                           Icon={IconAlertTriangle} color="amber" />
-            <StatCard label="Underpaid"       value={report.summary.underpaidCount}                          Icon={IconAlertTriangle} color="rose" />
-            <StatCard label="Paid Students"   value={report.summary.fullyPaidStudentCount}                   Icon={IconCheck}     color="indigo" />
+            <StatCard label={t("reports.statTotalCollected")} value={formatTotals(report.summary.totals)} Icon={IconTrendingUp} color="violet" />
+            <StatCard label={t("reports.statTotalFiat")} value={formatFiat(report.summary)} sub={t("reports.fiatCoverageHint")} Icon={IconTrendingUp} color="violet" />
+            <StatCard label={t("reports.statTotalPayments")}  value={report.summary.paymentCount}                            Icon={IconBarChart}  color="cyan" />
+            <StatCard label={t("status.validation.valid")}           value={report.summary.validCount}                              Icon={IconCheck}     color="green" />
+            <StatCard label={t("status.validation.overpaid")}        value={report.summary.overpaidCount}                           Icon={IconAlertTriangle} color="amber" />
+            <StatCard label={t("status.validation.underpaid")}       value={report.summary.underpaidCount}                          Icon={IconAlertTriangle} color="rose" />
+            <StatCard label={t("reports.statPaidStudents")}   value={report.summary.fullyPaidStudentCount}                   Icon={IconCheck}     color="indigo" />
           </div>
+
+          {/* By-class breakdown (if available) */}
+          {report.byClass && report.byClass.length > 0 && (
+            <div className="card" style={{ marginBottom: "1.5rem" }}>
+              <div className="card-header">
+                <div className="card-title">{t("reports.byClass")}</div>
+              </div>
+              <div style={{ overflowX: "auto" }}>
+                <table className="data-table" style={{ fontSize: "0.875rem" }}>
+                  <thead>
+                    <tr>
+                      <th>{t("reports.colClass")}</th>
+                      <th>{t("reports.colTotals")}</th>
+                      <th>{t("reports.colPayments")}</th>
+                      <th>{t("status.validation.valid")}</th>
+                      <th>{t("status.validation.overpaid")}</th>
+                      <th>{t("status.validation.underpaid")}</th>
+                      <th>{t("reports.colStudents")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.byClass.map(row => (
+                      <tr key={row.className}>
+                        <td style={{ fontWeight: 500 }}>{row.className}</td>
+                        <td style={{ fontVariantNumeric: "tabular-nums" }}>{formatTotals(row.totals)}</td>
+                        <td>{row.paymentCount}</td>
+                        <td style={{ color: "var(--success-text)", fontWeight: 600 }}>{row.validCount}</td>
+                        <td style={{ color: "var(--warning-text)", fontWeight: 600 }}>{row.overpaidCount}</td>
+                        <td style={{ color: "var(--danger-text)", fontWeight: 600 }}>{row.underpaidCount}</td>
+                        <td>{row.uniqueStudentCount}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {/* Daily breakdown table */}
           {report.byDate.length > 0 ? (
             <div className="card">
               <div className="card-header">
-                <div className="card-title">Daily Breakdown</div>
+                <div className="card-title">{t("reports.dailyBreakdown")}</div>
                 <span style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
-                  {report.byDate.length} days
+                  {t("reports.days", { count: report.byDate.length })}
                 </span>
               </div>
               <div style={{ overflowX: "auto" }}>
@@ -184,7 +424,7 @@ export default function ReportDownload() {
                   <thead>
                     <tr>
                       {TABLE_COLS.map(col => (
-                        <th key={col.key} scope="col">{col.label}</th>
+                        <th key={col.key} scope="col">{t(col.label)}</th>
                       ))}
                     </tr>
                   </thead>
@@ -192,7 +432,7 @@ export default function ReportDownload() {
                     {report.byDate.map(row => (
                       <tr key={row.date}>
                         <td style={{ whiteSpace: "nowrap", fontWeight: 500 }}>{row.date}</td>
-                        <td style={{ fontVariantNumeric: "tabular-nums" }}>{row.totalAmount}</td>
+                        <td style={{ fontVariantNumeric: "tabular-nums" }}>{formatTotals(row.totals)}</td>
                         <td>{row.paymentCount}</td>
                         <td style={{ color: "var(--success-text)", fontWeight: 600 }}>{row.validCount}</td>
                         <td style={{ color: "var(--warning-text)", fontWeight: 600 }}>{row.overpaidCount}</td>
@@ -206,7 +446,7 @@ export default function ReportDownload() {
             </div>
           ) : (
             <div style={{ textAlign: "center", padding: "3rem", color: "var(--text-muted)" }}>
-              <p style={{ fontWeight: 500 }}>No payments in this period</p>
+              <p style={{ fontWeight: 500 }}>{t("reports.noPaymentsInPeriod")}</p>
             </div>
           )}
         </>

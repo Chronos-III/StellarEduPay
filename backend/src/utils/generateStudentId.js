@@ -1,11 +1,14 @@
 'use strict';
 
+const crypto = require('crypto');
 const Student = require('../models/studentModel');
 const CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 async function generateStudentId(maxAttempts = 5, schoolId = null) {
   for (let i = 0; i < maxAttempts; i++) {
-    const suffix = Array.from({ length: 6 }, () => CHARS[Math.floor(Math.random() * 36)]).join('');
+    // Use crypto.randomInt (CSPRNG) instead of Math.random for security
+    // Increased suffix from 6 to 8 characters for better collision resistance
+    const suffix = Array.from({ length: 8 }, () => CHARS[crypto.randomInt(36)]).join('');
     const id = `STU-${suffix}`;
     const query = schoolId ? { schoolId, studentId: id } : { studentId: id };
     if (!await Student.exists(query)) return id;

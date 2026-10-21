@@ -13,15 +13,15 @@ const { auditContext } = require('../middleware/auditContext');
  * All routes require:
  *   1. resolveSchool — populates req.schoolId from the X-School-ID header
  *                      (or JWT claim).  Returns 400 if missing.
- *   2. requireAdminAuth — only school admins may manage source rules.
+ *   2. requireSchoolAuth(['owner']) — only school owners may manage source rules.
  *
  * Unmatched-sender default: ALLOW.
  * See sourceValidationRuleModel.js for full semantics.
  */
 router.use(resolveSchool);
 
-router.post('/',      requireAdminAuth, auditContext, createRule);
-router.get('/',       requireAdminAuth, getRules);
-router.delete('/:id', requireAdminAuth, auditContext, deleteRule);
+router.post('/',      requireSchoolAuth(['owner']), auditContext, createRule);
+router.get('/',       requireSchoolAuth(['owner', 'staff', 'read_only']), getRules);
+router.delete('/:id', requireSchoolAuth(['owner']), auditContext, deleteRule);
 
 module.exports = router;

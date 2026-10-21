@@ -23,7 +23,7 @@
 
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
 process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
-process.env.JWT_SECRET = 'test-secret-key-for-cross-tenant-tests';
+process.env.JWT_SECRET = 'test-jwt-secret-1234567890abcdef';
 
 const request = require('supertest');
 
@@ -185,12 +185,6 @@ jest.mock('../backend/src/services/retryService', () => ({
   startRetryWorker: jest.fn(),
   stopRetryWorker: jest.fn(),
   isRetryWorkerRunning: jest.fn().mockReturnValue(false),
-}));
-
-jest.mock('../backend/src/utils/memoEncryption', () => ({
-  encryptMemo: jest.fn(x => x),
-  decryptMemo: jest.fn(x => x),
-  isEncryptionEnabled: jest.fn(() => false),
 }));
 
 jest.mock('../backend/src/cache', () => {

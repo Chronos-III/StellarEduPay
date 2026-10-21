@@ -1,97 +1,136 @@
 /**
- * Currency conversion service for fetching XLM/USD rates
- * Uses CoinGecko public API with 5-minute client-side caching
+ * currencyService.js
+ *
+ * Front-end cache wrapper around the /payments/rates API endpoint.
+ *
+ * Each entry is keyed by fiat currency code (e.g. "USD") and is considered
+ * fresh for CACHE_TTL_MS milliseconds after it was fetched.
+ *
+ * ## Fix for issue #1213 — stale `cached` flag
+ *
+ * The root cause was computing the `cached` flag *after* the async fetch
+ * returned, by re-checking the timestamp at that point.  Because even a
+ * genuine network round-trip takes non-zero time, the freshness window could
+ * have expired by the time the flag was evaluated, making a live fetch look
+ * stale.
+ *
+ * Fix: capture `wasCached` as a boolean synchronously, *before* any I/O,
+ * by checking whether the cache holds a still-fresh entry at lookup time.
+ * That snapshot travels alongside the result and becomes the `cached` flag
+ * regardless of how long the subsequent fetch takes.
  */
 
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
-let priceCache = null;
-let lastFetchTime = null;
+import { getConversionRates } from './api';
+
+// How long a cached rate is considered fresh (5 minutes).
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
 /**
- * Fetch current XLM/USD price from CoinGecko API
- * @returns {Promise<number|null>} XLM price in USD, or null if unavailable
+ * @typedef {Object} CacheEntry
+ * @property {number} fetchedAt  - epoch ms when the rates were fetched
+ * @property {Object} rates      - the rates object from the API response
  */
-export async function fetchXlmPrice() {
-  // Return cached price if still valid
-  if (priceCache !== null && lastFetchTime && Date.now() - lastFetchTime < CACHE_DURATION) {
-    return priceCache;
-  }
 
-  try {
-    const response = await fetch(
-      'https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd',
-      {
-        headers: {
-          'Accept': 'application/json',
-        }
-      }
-    );
-    
-    if (!response.ok) {
-      console.warn('Failed to fetch XLM price:', response.status);
-      return priceCache; // Return stale cache if available
-    }
+/** @type {Map<string, CacheEntry>} */
+const _cache = new Map();
 
-    const data = await response.json();
-    const price = data?.stellar?.usd;
-
-    if (typeof price === 'number' && price > 0) {
-      priceCache = price;
-      lastFetchTime = Date.now();
-      return price;
-    }
-
-    console.warn('Invalid price data from CoinGecko');
-    return priceCache; // Return stale cache if available
-  } catch (error) {
-    console.error('Error fetching XLM price:', error);
-    return priceCache; // Return stale cache if available
-  }
+/**
+ * Returns true if the cache holds a non-expired entry for the given key.
+ *
+ * This is the ONLY place freshness is evaluated.  Callers that need to
+ * snapshot "was this already cached?" must call this *before* any await.
+ *
+ * @param {string} key
+ * @returns {boolean}
+ */
+function _isFresh(key) {
+  const entry = _cache.get(key);
+  if (!entry) return false;
+  return Date.now() - entry.fetchedAt < CACHE_TTL_MS;
 }
 
 /**
- * Convert XLM amount to USD
- * @param {number} xlmAmount - Amount in XLM
- * @returns {Promise<{usd: number|null, rate: number|null, cached: boolean}>}
+ * Fetches and caches conversion rates for the given fiat currency code.
+ *
+ * Returns an object with shape:
+ *   { rates: Object, cached: boolean, fetchedAt: number }
+ *
+ * `cached` is `true` when the result came from a non-expired in-memory entry
+ * and no network request was made; `false` when a live fetch was performed
+ * (whether or not the cache was warm before — a live fetch is never "cached").
+ *
+ * @param {string} [currency="USD"]
+ * @returns {Promise<{ rates: Object, cached: boolean, fetchedAt: number }>}
  */
-export async function convertXlmToUsd(xlmAmount) {
-  const wasCached = priceCache !== null && lastFetchTime && Date.now() - lastFetchTime < CACHE_DURATION;
-  const rate = await fetchXlmPrice();
-  
-  if (rate === null) {
-    return { usd: null, rate: null, cached: false };
+export async function getConversionRatesCached(currency = 'USD') {
+  const key = currency.toUpperCase();
+
+  // ── Snapshot freshness BEFORE any async work ──────────────────────────────
+  // This is the critical fix for #1213: the `cached` flag reflects whether the
+  // cache was fresh at the moment of the call, not at the moment the promise
+  // resolves.  A genuine live fetch always sets cached=false even if the fetch
+  // completes before the old TTL would have expired on a re-check.
+  const wasCached = _isFresh(key);
+
+  if (wasCached) {
+    const entry = _cache.get(key);
+    return {
+      rates: entry.rates,
+      cached: true,
+      fetchedAt: entry.fetchedAt,
+    };
   }
 
-  const isCached = wasCached || (lastFetchTime && Date.now() - lastFetchTime < CACHE_DURATION);
-  
+  // Cache miss or stale — perform a live network fetch.
+  const { data } = await getConversionRates();
+
+  // Normalise: the API may return { rates: { USD: 0.12 } } or { USD: 0.12 }.
+  const rates = data?.rates ?? data ?? {};
+
+  const fetchedAt = Date.now();
+  _cache.set(key, { fetchedAt, rates });
+
   return {
-    usd: parseFloat((xlmAmount * rate).toFixed(2)),
-    rate,
-    cached: isCached
+    rates,
+    cached: false,   // live fetch — never cached, regardless of timing
+    fetchedAt,
   };
 }
 
 /**
- * Get cache status for debugging
- * @returns {{price: number|null, age: number|null, valid: boolean}}
+ * Converts an XLM amount to the target fiat currency using cached rates.
+ *
+ * @param {number} xlmAmount
+ * @param {string} [currency="USD"]
+ * @returns {Promise<{ fiatAmount: number|null, rate: number|null, currency: string, cached: boolean }>}
  */
-export function getCacheStatus() {
-  if (!lastFetchTime) {
-    return { price: null, age: null, valid: false };
+export async function convertXlmToFiat(xlmAmount, currency = 'USD') {
+  const { rates, cached } = await getConversionRatesCached(currency);
+  const key = currency.toUpperCase();
+  const rate = rates?.[key] ?? rates?.USD ?? null;
+
+  if (rate == null || xlmAmount == null || xlmAmount < 0) {
+    return { fiatAmount: null, rate: null, currency: key, cached };
   }
 
-  const age = Date.now() - lastFetchTime;
-  return {
-    price: priceCache,
-    age,
-    valid: age < CACHE_DURATION
-  };
+  const fiatAmount = parseFloat((xlmAmount * rate).toFixed(2));
+  return { fiatAmount, rate, currency: key, cached };
 }
 
 /**
- * Clear the cache (useful for testing)
+ * Resets the in-memory cache.  Exposed for testing only.
  */
-export function clearCache() {
-  priceCache = null;
-  lastFetchTime = null;
+export function _resetCache() {
+  _cache.clear();
+}
+
+/**
+ * Returns a snapshot of the current cache.  Exposed for testing only.
+ */
+export function _getCacheSnapshot() {
+  const snapshot = {};
+  for (const [key, entry] of _cache.entries()) {
+    snapshot[key] = { ...entry };
+  }
+  return snapshot;
 }

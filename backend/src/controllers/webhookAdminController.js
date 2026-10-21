@@ -1,6 +1,9 @@
 'use strict';
 
 const WebhookRetry = require('../models/webhookRetryModel');
+const WebhookEndpoint = require('../models/webhookEndpointModel');
+const School = require('../models/schoolModel');
+const { parseV1Sunset, isV1Sunset } = require('../utils/webhookSignaturePolicy');
 const logger = require('../utils/logger');
 const { logAudit } = require('../services/auditService');
 
@@ -139,4 +142,143 @@ async function replayWebhook(req, res, next) {
   }
 }
 
-module.exports = { listDLQ, retryDLQEntry, replayWebhook };
+// ── V1 signature sunset — Issue #1539 ────────────────────────────────────────
+
+/**
+ * Build the report of active endpoints still configured to receive the
+ * deprecated V1 signature, grouped by school with the school's contact
+ * addresses (used to send the promised advance-notice emails).
+ */
+async function _buildV1Report() {
+  const endpoints = await WebhookEndpoint.find({ isActive: true, signatureVersions: 'v1' })
+    .select('_id schoolId url description signatureVersions createdAt')
+    .sort({ schoolId: 1, createdAt: 1 })
+    .lean();
+
+  const schoolIds = [...new Set(endpoints.map((e) => e.schoolId))];
+  const schools = schoolIds.length
+    ? await School.find({ schoolId: { $in: schoolIds } })
+      .select('schoolId name adminEmail contactEmail')
+      .lean()
+    : [];
+  const bySchool = new Map(schools.map((s) => [s.schoolId, s]));
+
+  const grouped = new Map();
+  for (const ep of endpoints) {
+    if (!grouped.has(ep.schoolId)) {
+      const school = bySchool.get(ep.schoolId) || {};
+      grouped.set(ep.schoolId, {
+        schoolId: ep.schoolId,
+        schoolName: school.name || null,
+        contactEmail: school.contactEmail || school.adminEmail || null,
+        endpoints: [],
+      });
+    }
+    grouped.get(ep.schoolId).endpoints.push({
+      id: String(ep._id),
+      url: ep.url,
+      description: ep.description || null,
+      signatureVersions: ep.signatureVersions,
+      createdAt: ep.createdAt,
+    });
+  }
+
+  const sunsetAt = parseV1Sunset();
+  return {
+    v1SunsetAt: sunsetAt.toISOString(),
+    v1Sunset: isV1Sunset(),
+    totalEndpoints: endpoints.length,
+    totalSchools: grouped.size,
+    schools: [...grouped.values()],
+  };
+}
+
+/**
+ * GET /api/admin/webhooks/v1-endpoints
+ * Lists active webhook endpoints still receiving the deprecated V1 signature.
+ */
+async function listV1Endpoints(req, res, next) {
+  try {
+    res.json(await _buildV1Report());
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/admin/webhooks/v1-endpoints/notify
+ * Emails each affected school's contact address an advance notice that V1
+ * signatures stop on the sunset date. Pass { "dryRun": true } to preview the
+ * recipients without sending.
+ */
+async function notifyV1Endpoints(req, res, next) {
+  try {
+    const dryRun = req.body?.dryRun === true;
+    const report = await _buildV1Report();
+    const sunsetDate = report.v1SunsetAt.slice(0, 10);
+    const { sendEmail } = require('../services/email');
+
+    const results = [];
+    for (const school of report.schools) {
+      if (!school.contactEmail) {
+        results.push({ schoolId: school.schoolId, status: 'skipped', reason: 'NO_CONTACT_EMAIL' });
+        continue;
+      }
+      if (dryRun) {
+        results.push({ schoolId: school.schoolId, status: 'dry_run', to: school.contactEmail });
+        continue;
+      }
+
+      const urls = school.endpoints.map((e) => `  - ${e.url} (endpoint ${e.id})`).join('\n');
+      try {
+        await sendEmail({
+          to: school.contactEmail,
+          subject: `Action required: StellarEduPay V1 webhook signatures end after ${sunsetDate}`,
+          category: 'webhook_v1_sunset_notice',
+          text: [
+            `Hello${school.schoolName ? ` ${school.schoolName}` : ''},`,
+            '',
+            'The following webhook endpoints still receive the deprecated V1 signature header',
+            '(X-StellarEduPay-Signature):',
+            '',
+            urls,
+            '',
+            `V1 signatures will no longer be sent after ${sunsetDate}. Please verify the`,
+            'X-StellarEduPay-Signature-V2 header instead (see docs/WEBHOOK_INTEGRATION.md),',
+            'then opt out of V1 early with:',
+            '',
+            '  PUT /api/webhook-endpoints/:id  { "signatureVersions": ["v2"] }',
+          ].join('\n'),
+        });
+        results.push({ schoolId: school.schoolId, status: 'sent', to: school.contactEmail });
+      } catch (err) {
+        logger.error('Failed to send V1 sunset notice', { schoolId: school.schoolId, error: err.message });
+        results.push({ schoolId: school.schoolId, status: 'failed', reason: 'SEND_FAILED' });
+      }
+    }
+
+    await logAudit({
+      schoolId: 'system',
+      action: 'webhook_v1_sunset_notice',
+      performedBy: req.auditContext?.performedBy || 'unknown',
+      targetId: 'webhook_v1_sunset',
+      targetType: 'school',
+      details: {
+        dryRun,
+        v1SunsetAt: report.v1SunsetAt,
+        sent: results.filter((r) => r.status === 'sent').length,
+        failed: results.filter((r) => r.status === 'failed').length,
+        skipped: results.filter((r) => r.status === 'skipped').length,
+      },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.json({ dryRun, v1SunsetAt: report.v1SunsetAt, results });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { listDLQ, retryDLQEntry, replayWebhook, listV1Endpoints, notifyV1Endpoints };

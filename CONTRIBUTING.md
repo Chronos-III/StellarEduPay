@@ -293,22 +293,22 @@ const calc = (sid, fid) => {
 ```
 
 ---
-
 ## 🧪 Testing Requirements
 
-### Running Tests
+### Where tests live
 
-#### 1. Install root dependencies (first time only)
+| Location | Purpose |
+|----------|---------|
+| `backend/tests/` | Backend unit / service / controller tests |
+| `tests/` | Root cross-cutting suites only (e2e, integration, helpers) |
+| `frontend/` | Frontend tests (own package scripts) |
+
+**Rule:** never put the same filename under both `tests/` and `backend/tests/`.
+
+### Running tests
 
 ```bash
-# From the project root
-npm install
-```
-
-#### 2. Run the full test suite
-
-```bash
-# From the project root
+# Root suite (tests/ only — not backend/tests)
 npm test
 ```
 
@@ -338,10 +338,22 @@ npm test -- tests/payment-limits.test.js
 #### 4. Check code coverage
 
 ```bash
+# Backend (root Jest config → backend/src)
+npm run coverage
+
+# Frontend (frontend/jest.config.js → frontend/src)
+npm run coverage:frontend
+
+# Equivalent one-off form (works for either package):
 npm test -- --coverage
 ```
 
-Jest will print a per-file coverage table and write a full HTML report to `coverage/lcov-report/index.html`.
+Jest will print a per-file coverage table (lines, statements, **functions and branches**) and write a full report to:
+
+- `coverage/backend/` — backend source (`backend/src`)
+- `coverage/frontend/` — frontend source (`frontend/src`)
+
+Each directory contains `lcov-report/index.html` (browsable), `lcov.info`, `coverage-summary.json` and `cobertura-coverage.xml`. See [Test Coverage](#-test-coverage) for the measured baseline, thresholds, and the expectation for new code.
 
 #### Test files and what they cover
 
@@ -371,7 +383,8 @@ The backend tests also use mocks; no live MongoDB or Stellar Horizon connection 
 
 ### Writing Tests
 
-We use **Jest** as our testing framework. Tests should:
+# Backend suite only
+npm run test:backend
 
 - Be isolated and not depend on external services
 - Mock Stellar SDK calls to avoid hitting the network
@@ -395,6 +408,65 @@ describe('Payment Validation', () => {
   });
 });
 ```
+
+---
+
+## 📊 Test Coverage
+
+StellarEduPay measures test coverage on every pull request (see issue #1288). Coverage is collected with Jest's instrumentation for **`backend/src`** (root Jest config) and **`frontend/src`** (frontend Jest config). The CI `coverage` job runs both and uploads the reports as downloadable artefacts on every PR, so reviewers can inspect exactly which code paths a change exercises.
+
+### What is measured
+
+Coverage is reported for **four metrics** — lines, statements, functions, and **branches** — and branch coverage is tracked and reported separately from line coverage. Every defect enumerated in #1288 is an *unexecuted branch* inside a function whose other branches are tested, so branch coverage is the signal that would have surfaced them; line coverage alone would have partially masked them.
+
+### Running it locally
+
+| Command | Scope |
+|---------|-------|
+| `npm run coverage` | backend (`backend/src`) |
+| `npm run coverage:frontend` | frontend (`frontend/src`) |
+| `npm test -- --coverage` | whichever package you run it in |
+
+Reports land in `coverage/backend` and `coverage/frontend` (`lcov-report/index.html`, `lcov.info`, `coverage-summary.json`, `cobertura-coverage.xml`).
+
+### Measured baseline
+
+The baseline below was captured from `main` and is recorded here and in issue #1288. **It is preliminary**: ~64 of 219 suites are currently failing (the blocked prerequisite in #1288), so the numbers understate real coverage. They will be re-measured and the floors raised once the suite is green.
+
+| Area | Lines | Branches | Functions | Statements |
+|------|-------|----------|-----------|------------|
+| `backend/src` | 49.45% | 43.12% | 44.34% | 48.77% |
+| `frontend/src` | 39.37% | 47.27% | 23% | 38.2% |
+
+The no-regression floors configured in the Jest configs (set at the measured baseline, with a small margin for run-to-run variance) are:
+
+| Scope | Lines | Branches | Functions | Statements |
+|-------|-------|----------|-----------|------------|
+| global — all of `backend/src` **except** `services/`, `middleware/`, `controllers/` | 51% | 46% | 37% | 51% |
+| `backend/src/services/` | 53% | 45% | 51% | 52% |
+| `backend/src/middleware/` | 52% | 45% | 42% | 50% |
+| `backend/src/controllers/` | 37% | 32% | 32% | 36% |
+| `frontend/src` (global) | 39% | 47% | 22% | 38% |
+
+### Thresholds (no-regression floor)
+
+A `coverageThreshold` is set in each Jest config at (or slightly below) the measured baseline, so coverage **cannot regress** from the numbers above:
+
+- **Global floor** — applies repo-wide. A PR that drops overall coverage below the baseline fails the coverage check.
+- **Per-directory floors** for `backend/src/services/`, `backend/src/middleware/` and `backend/src/controllers/` — the money, auth and tenant-isolation code. These carry the same starting floor today, but are the areas intended to be held to a *much higher* bar (target ≥ 70%) once the suite is green, because error-handling and failover paths there are exactly what a payments platform depends on.
+
+> The CI `coverage` job is intentionally **non-gating** for now: with the suite red, a low baseline must not block merges. The thresholds still enforce "no further regression." When the suite is green, promote the job to a required check and raise the per-directory floors.
+
+### Expectation for new code
+
+- New features and bug fixes **must** ship with tests (regression tests for fixes).
+- Cover the **error-handling and failover branches**, not just the happy path — that is where the highest-risk, least-tested code lives.
+- A PR should not reduce coverage below the global floor, and should aim to meet or exceed the threshold for the directory it touches.
+- Coverage on changed lines is the primary review signal; treat a drop there as a request to add tests.
+
+### Follow-up backlog
+
+The ten lowest-covered modules under `backend/src/services/` are tracked in follow-up issue **#1303** — the concrete backlog this measurement produces.
 
 ---
 
@@ -470,6 +542,23 @@ Your PR must meet these criteria before merging:
 - [ ] **Documentation updated** - Relevant docs reflect your changes
 - [ ] **Follows conventions** - Branch naming, commit messages, code style
 - [ ] **No sensitive data** - No secrets, API keys, or PII in code
+
+### Documentation Rules
+
+- **PR descriptions belong in the PR, not in `docs/`.** Do not commit
+  `PR_DESCRIPTION.md`, `IMPLEMENTATION_SUMMARY.md` or other notes about what a
+  change did. Those go stale as soon as they are merged.
+- **Update the living doc instead.** If your change alters behaviour, edit the
+  document that describes that area (see [docs/README.md](docs/README.md)) in
+  the same PR.
+- **New documents must be indexed.** Add a row to `docs/README.md` with an
+  owner and a "last reviewed" date.
+- **Design decisions** go in `docs/adr/NNNN-short-title.md` as dated, immutable
+  decision records (context, decision, consequences).
+- **API changes** must update `backend/openapi.json`: run
+  `node scripts/openapi/generate.js` and commit the result (add summaries,
+  request bodies and responses by hand in that file). CI fails if a route is
+  missing from it, or if the frontend or docs call a path that doesn't exist.
 
 ### Review Process
 
@@ -563,7 +652,6 @@ As a blockchain-based payment system, security is paramount:
 
 ### Data Privacy
 - Never log sensitive information (passwords, secret keys, PII)
-- Use memo encryption when handling student IDs (see `MEMO_ENCRYPTION_KEY`)
 - Follow GDPR principles for data handling
 
 ---

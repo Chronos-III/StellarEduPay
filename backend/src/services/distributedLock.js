@@ -22,6 +22,19 @@
  *     cause issues. Keep critical sections short relative to TTL.
  *   - Clock drift between Redis server and client nodes can affect TTL accuracy.
  *
+ * In-Process Fallback Limitations (Issue #1406):
+ *   When Redis is unavailable (REDIS_HOST not set), this module falls back to an
+ *   in-process Map. This fallback is safe ONLY in single-instance deployments
+ *   (REPLICA_COUNT=1 or unset). In multi-instance deployments, the fallback
+ *   provides NO cross-replica exclusion and undermines distributed safety:
+ *   - Two concurrent operations on the same resource may both acquire "the lock"
+ *     on their respective replicas, leading to race conditions and data corruption.
+ *   - If a lock holder runs past its TTL expiration (e.g. due to a long async
+ *     operation), a second caller can acquire the same lock while the first is
+ *     still writing, breaking mutual exclusion entirely.
+ *   Do not rely on the in-process fallback for production multi-instance workloads.
+ *   Always configure REDIS_HOST in production.
+ *
  * Semantics:
  *   acquire(key, ttlMs) -> { token, fencingToken } | null
  *     Atomically takes the lock via SET NX PX. Increments the fencing token counter.
@@ -37,25 +50,28 @@
 
 const crypto = require('crypto');
 const logger = require('../utils/logger').child('DistributedLock');
-const { getRedisConnectionOptions } = require('../config/redisClient');
+const { getRedisClient } = require('../config/redisClient');
 
 const redisEnabled = Boolean(process.env.REDIS_HOST);
 
-// Share the central reconnection policy (Issue #83) so the lock client backs off
-// and treats transient errors identically to every other Redis consumer.
-// maxRetriesPerRequest: null lets a command wait through a reconnect rather than
-// erroring immediately, so a brief blip doesn't spuriously deny every lock.
-const redisConfig = getRedisConnectionOptions({ maxRetriesPerRequest: null });
+const client = redisEnabled ? getRedisClient() : null;
 
-let client = null;
-
-if (redisEnabled) {
-  const Redis = require('ioredis');
-  client = new Redis(redisConfig);
-  client.on('error', (err) => logger.error('Redis lock client error', { error: err.message }));
-  client.connect().catch((err) =>
-    logger.error('Redis lock client connect failed', { error: err.message })
-  );
+if (!redisEnabled) {
+  // Issue #1043: Warn loudly if Redis is not configured in a multi-instance deployment.
+  // In single-instance deployments (REPLICA_COUNT=1 or unset), the fallback is safe.
+  // In multi-instance deployments, the in-process fallback provides no cross-replica
+  // exclusion and undermines the safety guarantees that depend on this module.
+  const replicaCount = parseInt(process.env.REPLICA_COUNT || '1', 10);
+  if (replicaCount > 1) {
+    logger.warn(
+      '[CRITICAL] DistributedLock: REDIS_HOST is not configured, but REPLICA_COUNT > 1. ' +
+      'Falling back to in-process locks with NO cross-replica exclusion. ' +
+      'Features depending on distributed locks (per-school payment sync, per-transaction verify lock) ' +
+      'will lose their concurrency guarantees and may experience race conditions, data corruption, or ' +
+      'duplicate transaction processing. Set REDIS_HOST immediately for production deployments with ' +
+      'multiple replicas.'
+    );
+  }
 }
 
 // In-process fallback store: key -> { token, fencingToken, expiresAt }
@@ -98,6 +114,19 @@ function newToken() {
 }
 
 /**
+ * Canonical lock key for the read-aggregate-then-write balance section that
+ * both verifyPayment (paymentController) and syncPaymentsForSchool
+ * (stellarService) run for a given student. Shared here so the two call
+ * sites can never drift into different key formats and silently stop
+ * contending with each other (#1026).
+ * @param {string} schoolId
+ * @param {string} studentId
+ */
+function studentBalanceLockKey(schoolId, studentId) {
+  return `sync:lock:${schoolId}:student:${studentId}`;
+}
+
+/**
  * Get fencing token counter key for a lock key.
  */
 function getFenceKey(key) {
@@ -134,6 +163,7 @@ async function acquire(key, ttlMs) {
   }
 
   // In-process fallback.
+  logger.warn('[Issue #1406] Distributed lock acquired via in-process fallback (Redis unavailable)', { key, ttlMs });
   const now = Date.now();
   const existing = localLocks.get(key);
   if (existing && existing.expiresAt > now) return null;
@@ -280,11 +310,7 @@ async function getCurrentFence(key) {
 }
 
 async function close() {
-  try {
-    if (client) await client.quit();
-  } catch (err) {
-    logger.error('Error closing Redis lock client', { error: err.message });
-  }
+  // The shared client is closed by config/redisClient during process shutdown.
 }
 
 module.exports = {
@@ -294,6 +320,7 @@ module.exports = {
   withLock,
   getCurrentFence,
   startWatchdog,
+  studentBalanceLockKey,
   close,
   _isRedisEnabled: () => Boolean(client),
   _getFenceKey: getFenceKey,

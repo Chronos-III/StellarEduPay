@@ -1,28 +1,108 @@
 'use strict';
 
 const svc = require('../services/bullMQRetryService');
+const { asyncHandler } = require('../middleware/errorHandler');
+const { logAudit } = require('../services/auditService');
 
-const wrap = (fn) => async (req, res) => {
-  try { res.json({ success: true, data: await fn(req) }); }
-  catch (err) { res.status(500).json({ success: false, error: err.message }); }
-};
+const getStats = asyncHandler(async (req, res) => {
+  const data = await svc.getRetryQueueStats();
+  res.json({ success: true, data });
+});
 
-const getStats    = wrap(() => svc.getRetryQueueStats());
-const getHealth   = async (req, res) => { try { const h = await svc.getHealthStatus(); res.status(h.healthy ? 200 : 503).json({ success: true, data: h }); } catch (err) { res.status(500).json({ success: false, error: err.message }); } };
-const getJob      = wrap((req) => svc.getJobDetails(req.params.jobId));
-const getJobs     = wrap((req) => svc.getJobsByState(req.params.state, parseInt(req.query.limit) || 50).then((jobs) => ({ state: req.params.state, count: jobs.length, jobs })));
-const manualRetry = wrap((req) => svc.retryJobImmediately(req.params.jobId));
-const deleteJob   = wrap((req) => svc.removeJob(req.params.jobId));
-const pause       = wrap(() => svc.pauseQueue());
-const resume      = wrap(() => svc.resumeQueue());
+const getHealth = asyncHandler(async (req, res) => {
+  const h = await svc.getHealthStatus();
+  res.status(h.healthy ? 200 : 503).json({ success: true, data: h });
+});
 
-async function queueTransaction(req, res) {
+const getJob = asyncHandler(async (req, res) => {
+  const data = await svc.getJobDetails(req.params.jobId);
+  res.json({ success: true, data });
+});
+
+const getJobs = asyncHandler(async (req, res) => {
+  const jobs = await svc.getJobsByState(req.params.state, parseInt(req.query.limit) || 50);
+  res.json({ success: true, data: { state: req.params.state, count: jobs.length, jobs } });
+});
+
+const manualRetry = asyncHandler(async (req, res) => {
+  const data = await svc.retryJobImmediately(req.params.jobId);
+  await logAudit({
+    schoolId: req.schoolId || 'system',
+    action: 'RETRY_QUEUE_JOB_RETRIED',
+    performedBy: req.auditContext?.performedBy,
+    ipAddress: req.auditContext?.ipAddress,
+    userAgent: req.auditContext?.userAgent,
+    targetId: req.params.jobId,
+    targetType: 'retryJob',
+    details: data,
+  });
+  res.json({ success: true, data });
+});
+
+const deleteJob = asyncHandler(async (req, res) => {
+  const data = await svc.removeJob(req.params.jobId);
+  await logAudit({
+    schoolId: req.schoolId || 'system',
+    action: 'RETRY_QUEUE_JOB_DELETED',
+    performedBy: req.auditContext?.performedBy,
+    ipAddress: req.auditContext?.ipAddress,
+    userAgent: req.auditContext?.userAgent,
+    targetId: req.params.jobId,
+    targetType: 'retryJob',
+    details: data,
+  });
+  res.json({ success: true, data });
+});
+
+const pause = asyncHandler(async (req, res) => {
+  const data = await svc.pauseQueue();
+  await logAudit({
+    schoolId: req.schoolId || 'system',
+    action: 'RETRY_QUEUE_PAUSED',
+    performedBy: req.auditContext?.performedBy,
+    ipAddress: req.auditContext?.ipAddress,
+    userAgent: req.auditContext?.userAgent,
+    targetType: 'retryQueue',
+    details: data,
+  });
+  res.json({ success: true, data });
+});
+
+const resume = asyncHandler(async (req, res) => {
+  const data = await svc.resumeQueue();
+  await logAudit({
+    schoolId: req.schoolId || 'system',
+    action: 'RETRY_QUEUE_RESUMED',
+    performedBy: req.auditContext?.performedBy,
+    ipAddress: req.auditContext?.ipAddress,
+    userAgent: req.auditContext?.userAgent,
+    targetType: 'retryQueue',
+    details: data,
+  });
+  res.json({ success: true, data });
+});
+
+const queueTransaction = asyncHandler(async (req, res) => {
   const { transactionHash, studentId, memo, error, metadata } = req.body;
-  if (!transactionHash) return res.status(400).json({ success: false, error: 'transactionHash is required' });
-  try {
-    const data = await svc.queueFailedTransaction(transactionHash, { studentId, memo, error: error ? new Error(error.message) : null, metadata });
-    res.json({ success: true, data });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
-}
+  if (!transactionHash) {
+    const err = new Error('transactionHash is required');
+    err.code = 'VALIDATION_ERROR';
+    throw err;
+  }
+  const data = await svc.queueFailedTransaction(transactionHash, {
+    studentId, memo, error: error ? new Error(error.message) : null, metadata,
+  });
+  await logAudit({
+    schoolId: req.schoolId || 'system',
+    action: 'RETRY_QUEUE_TRANSACTION_QUEUED',
+    performedBy: req.auditContext?.performedBy,
+    ipAddress: req.auditContext?.ipAddress,
+    userAgent: req.auditContext?.userAgent,
+    targetId: transactionHash,
+    targetType: 'transaction',
+    details: { studentId, memo, metadata },
+  });
+  res.json({ success: true, data });
+});
 
 module.exports = { getStats, getHealth, getJob, getJobs, manualRetry, deleteJob, pause, resume, queueTransaction };

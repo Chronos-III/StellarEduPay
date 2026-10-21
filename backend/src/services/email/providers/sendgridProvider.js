@@ -42,6 +42,7 @@ module.exports = {
       subject: message.subject,
       text: message.text,
       html: message.html,
+      ...(message.headers && { headers: message.headers }),
     });
     return { messageId: res?.headers?.['x-message-id'] || res?.headers?.['x-message-id'.toUpperCase()] };
   },

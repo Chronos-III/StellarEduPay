@@ -28,7 +28,15 @@ async function resolveSchool(req, res, next) {
     const schoolId   = req.headers['x-school-id'];
     const schoolSlug = req.headers['x-school-slug'];
 
-    if (!schoolId && !schoolSlug) {
+    // Issue #1574 — EventSource cannot send custom headers, so the SSE
+    // /payments/events endpoint passes schoolId as a query parameter.
+    // Accept req.query.schoolId as a fallback *only* for that route so
+    // every other route continues to enforce the header requirement.
+    const querySid = req.query.schoolId;
+    const isSSERoute = req.path === '/events' || req.path.endsWith('/payments/events');
+    const effectiveId = schoolId || (isSSERoute && querySid ? querySid : null);
+
+    if (!effectiveId && !schoolSlug) {
       res.set('Cache-Control', 'no-store');
       return res.status(400).json({
         error: 'School context is required. Provide X-School-ID or X-School-Slug header.',
@@ -36,48 +44,23 @@ async function resolveSchool(req, res, next) {
       });
     }
 
-    let school;
-    let cacheKey;
+    const lookupKey = effectiveId ? effectiveId : schoolSlug.toLowerCase().trim();
+    const cacheKey = cache.KEYS.school ? cache.KEYS.school(lookupKey) : `school:${lookupKey}`;
 
-    if (schoolId) {
-      cacheKey = cache.KEYS.school ? cache.KEYS.school(schoolId) : `school:${schoolId}`;
-      school = cache.get(cacheKey);
+    let school = cache.get(cacheKey);
 
-      if (school) {
-        // Re-confirm isActive from DB on every cache hit to prevent stale entries
-        // from bypassing deactivation (e.g. when isActive is flipped outside the
-        // normal controller path or before the cache TTL expires).
-        const live = await School.findOne({ schoolId }, { isActive: 1 }).lean();
-        if (!live || !live.isActive) {
-          cache.del(cacheKey);
-          school = null;
+    if (!school) {
+      const query = effectiveId ? { schoolId: effectiveId } : { slug: lookupKey };
+      school = await School.findOne(query).lean();
+      if (school && school.isActive) {
+        const ttl = cache.TTL.SCHOOL || 300;
+        if (school.schoolId) {
+          const idKey = cache.KEYS.school ? cache.KEYS.school(school.schoolId) : `school:${school.schoolId}`;
+          cache.set(idKey, school, ttl);
         }
-      }
-
-      if (!school) {
-        school = await School.findOne({ schoolId }).lean();
-        if (school && school.isActive) {
-          cache.set(cacheKey, school, cache.TTL.SCHOOL || 300);
-        }
-      }
-    } else {
-      const slug = schoolSlug.toLowerCase().trim();
-      cacheKey = cache.KEYS.school ? cache.KEYS.school(slug) : `school:${slug}`;
-      school = cache.get(cacheKey);
-
-      if (school) {
-        // Re-confirm isActive from DB on every cache hit.
-        const live = await School.findOne({ slug }, { isActive: 1 }).lean();
-        if (!live || !live.isActive) {
-          cache.del(cacheKey);
-          school = null;
-        }
-      }
-
-      if (!school) {
-        school = await School.findOne({ slug }).lean();
-        if (school && school.isActive) {
-          cache.set(cacheKey, school, cache.TTL.SCHOOL || 300);
+        if (school.slug) {
+          const slugKey = cache.KEYS.school ? cache.KEYS.school(school.slug) : `school:${school.slug}`;
+          cache.set(slugKey, school, ttl);
         }
       }
     }
@@ -101,48 +84,45 @@ async function resolveSchool(req, res, next) {
     // ── Tenant binding: check JWT schoolId matches resolved school ────────────
     // Extract token from Authorization header or cookie (no hard failure if absent
     // — unauthenticated requests are handled by subsequent auth middleware).
-    const secret = process.env.JWT_SECRET;
-    if (secret) {
-      const authHeader = req.headers['authorization'];
-      const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-      const cookieToken = req.cookies?.admin_token || null;
-      const rawToken = cookieToken || bearerToken;
+    const authHeader = req.headers['authorization'];
+    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const cookieToken = req.cookies?.admin_token || null;
+    const rawToken = cookieToken || bearerToken;
 
-      if (rawToken) {
-        try {
-          const decoded = jwt.verify(rawToken, secret);
-          const isSuperAdmin =
-            decoded.role === 'admin' ||
-            (Array.isArray(decoded.roles) && decoded.roles.includes('super_admin'));
+    if (rawToken) {
+      try {
+        const decoded = jwt.verify(rawToken, process.env.JWT_SECRET);
+        const isSuperAdmin =
+          decoded.role === 'admin' ||
+          (Array.isArray(decoded.roles) && decoded.roles.includes('super_admin'));
 
-          if (isSuperAdmin) {
-            // Super-admin override is permitted — audit every cross-tenant use.
-            if (decoded.schoolId && decoded.schoolId !== school.schoolId) {
-              const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-                req.socket?.remoteAddress || 'unknown';
-              await logAudit({
-                schoolId: school.schoolId,
-                action: 'super_admin_school_override',
-                performedBy: decoded.sub || decoded.id || 'super_admin',
-                targetId: school.schoolId,
-                targetType: 'school',
-                details: { tokenSchoolId: decoded.schoolId, requestedSchoolId: school.schoolId, ip },
-                result: 'success',
-                ipAddress: ip,
-                userAgent: req.headers?.['user-agent'],
-              });
-            }
-          } else if (decoded.schoolId && decoded.schoolId !== school.schoolId) {
-            // Non-super-admin token for a different tenant — reject immediately.
-            res.set('Cache-Control', 'no-store');
-            return res.status(403).json({
-              error: 'Forbidden. Token schoolId does not match the requested school.',
-              code: 'TENANT_MISMATCH',
+        if (isSuperAdmin) {
+          // Super-admin override is permitted — audit every cross-tenant use.
+          if (decoded.schoolId && decoded.schoolId !== school.schoolId) {
+            const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+              req.socket?.remoteAddress || 'unknown';
+            await logAudit({
+              schoolId: school.schoolId,
+              action: 'super_admin_school_override',
+              performedBy: decoded.sub || decoded.id || 'super_admin',
+              targetId: school.schoolId,
+              targetType: 'school',
+              details: { tokenSchoolId: decoded.schoolId, requestedSchoolId: school.schoolId, ip },
+              result: 'success',
+              ipAddress: ip,
+              userAgent: req.headers?.['user-agent'],
             });
           }
-        } catch (_) {
-          // Malformed/expired token — let the auth middleware handle it downstream.
+        } else if (decoded.schoolId && decoded.schoolId !== school.schoolId) {
+          // Non-super-admin token for a different tenant — reject immediately.
+          res.set('Cache-Control', 'no-store');
+          return res.status(403).json({
+            error: 'Forbidden. Token schoolId does not match the requested school.',
+            code: 'TENANT_MISMATCH',
+          });
         }
+      } catch {
+        // Malformed/expired token — let the auth middleware handle it downstream.
       }
     }
 

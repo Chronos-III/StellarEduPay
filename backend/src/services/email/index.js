@@ -44,6 +44,8 @@ function backoff(attempt) {
  * @param {string} [message.html]
  * @param {string} [message.from]
  * @param {string} [message.category]   - logical type, e.g. 'receipt'|'reminder'
+ * @param {Object<string,string>} [message.headers] - extra MIME headers
+ *   (e.g. RFC 8058 List-Unsubscribe / List-Unsubscribe-Post)
  * @returns {Promise<{sent:boolean, skipped?:boolean, suppressed?:boolean,
  *   messageId?:string, attempts?:number, provider?:string, error?:string}>}
  */

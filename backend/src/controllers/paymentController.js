@@ -15,21 +15,50 @@ const {
   verifyTransaction,
   recordPayment,
   validatePaymentWithDynamicFee,
+  determineConfirmationState,
 } = require('../services/stellarService');
 const { queueForRetry } = require('../services/retryService');
 const { server } = require('../config/stellarConfig');
 const { ACCEPTED_ASSETS } = require('../config/stellarConfig');
 const { validateTransactionHash } = require('../utils/hashValidator');
 const { getPaymentLimits, validatePaymentAmount } = require('../utils/paymentLimits');
+const { SUPPORTED_MEMO_TYPES } = require('../utils/stellarMemo');
 const { convertToLocalCurrency } = require('../services/currencyConversionService');
 const { withStellarRetry } = require('../utils/withStellarRetry');
 const { makePaymentAuditLogger } = require('../utils/paymentAuditLogger');
 const lock = require('../services/distributedLock');
 const logger = require('../utils/logger');
+const { toMoney, decimalFromMongo, classifyFeePayment } = require('../utils/money');
+const { Decimal } = require('decimal.js');
+
+/**
+ * Compute the outstanding balance for a fee category (#1759).
+ * `remainingBalance || amount` treated a fully-paid category (0) as "missing"
+ * and reported the full amount as still owed. Prefer the stored value when it
+ * is a real number, otherwise derive it as max(0, amount - totalPaid) in exact
+ * Decimal space so a fully-paid category always reports 0.
+ */
+function computeRemainingBalance(fee) {
+  if (fee.remainingBalance !== undefined && fee.remainingBalance !== null) {
+    return toMoneyNumber(toMoney(fee.remainingBalance));
+  }
+  const remaining = Decimal.max(0, toMoney(fee.amount).minus(toMoney(fee.totalPaid || 0)));
+  return toMoneyNumber(remaining);
+}
+
+function toMoneyNumber(value) {
+  return Number(value.toString());
+}
 
 // TTL for the per-school distributed verify lock.  Verify is a fast Horizon
 // round-trip; 30 s is more than enough while still auto-expiring on crash.
 const VERIFY_LOCK_TTL_MS = parseInt(process.env.VERIFY_LOCK_TTL_MS || '30000', 10);
+
+// TTL for the per-student balance lock (#1026). Guards the read-aggregate-then-write
+// sequence that computes cumulativeTotal and writes it as an absolute Student.$set,
+// which is not safe to run concurrently for the same student — whether the second
+// writer is another verifyPayment call or syncPaymentsForSchool.
+const STUDENT_BALANCE_LOCK_TTL_MS = parseInt(process.env.STUDENT_BALANCE_LOCK_TTL_MS || '15000', 10);
 
 // Permanent error codes that should NOT be retried
 const PERMANENT_FAIL_CODES = [
@@ -41,6 +70,32 @@ const PERMANENT_FAIL_CODES = [
   'AMOUNT_TOO_HIGH',
   'UNDERPAID',
 ];
+
+/**
+ * Persist a verification failure for audit/support (#1761).
+ * Failures are recorded outside the `payments` collection so they never appear
+ * in payment lists, never block sync/poller duplicate checks and never prevent
+ * a later re-verification from crediting the real payment.
+ */
+async function recordVerificationAttempt({ schoolId, txHash, code, message }) {
+  try {
+    const PaymentVerificationAttempt = require('../models/paymentVerificationAttemptModel');
+    await PaymentVerificationAttempt.create({
+      schoolId,
+      txHash,
+      code,
+      message,
+      attemptedAt: new Date(),
+    });
+  } catch (err) {
+    logger.error('[PaymentController] failed to persist verification attempt', {
+      txHash,
+      schoolId,
+      code,
+      error: err.message,
+    });
+  }
+}
 
 function getExplorerUrl(txHash) {
   if (!txHash) return null;
@@ -59,7 +114,6 @@ function wrapStellarError(err) {
 // ====================== PAYMENT INSTRUCTIONS ======================
 async function getPaymentInstructions(req, res, next) {
   try {
-    const limits = getPaymentLimits();
     const targetCurrency = req.school.localCurrency || 'USD';
     const { feeCategory, asset } = req.query;
 
@@ -71,6 +125,12 @@ async function getPaymentInstructions(req, res, next) {
       }
     }
 
+    // Resolved after the asset is known so per-asset limits apply (#1117).
+    const limits = await getPaymentLimits({
+      schoolId: req.schoolId,
+      asset: asset ? asset.split(':')[0] : undefined,
+    });
+
     const student = await Student.findOne({ schoolId: req.schoolId, studentId: req.params.studentId });
 
     let feeAmount = student ? student.feeAmount : null;
@@ -81,7 +141,7 @@ async function getPaymentInstructions(req, res, next) {
       const fee = student.fees.find((f) => f.category === feeCategory);
       if (fee) {
         feeAmount = fee.amount;
-        categoryInfo = { category: fee.category, amount: fee.amount, paid: fee.paid, totalPaid: fee.totalPaid || 0, remainingBalance: fee.remainingBalance || fee.amount };
+        categoryInfo = { category: fee.category, amount: fee.amount, paid: fee.paid, totalPaid: fee.totalPaid || 0, remainingBalance: computeRemainingBalance(fee) };
       }
     }
 
@@ -90,7 +150,7 @@ async function getPaymentInstructions(req, res, next) {
     }
 
     const fees = student?.fees?.length > 0
-      ? student.fees.map((f) => ({ category: f.category, amount: f.amount, paid: f.paid, totalPaid: f.totalPaid || 0, remainingBalance: f.remainingBalance || f.amount }))
+      ? student.fees.map((f) => ({ category: f.category, amount: f.amount, paid: f.paid, totalPaid: f.totalPaid || 0, remainingBalance: computeRemainingBalance(f) }))
       : [];
 
     res.json({
@@ -98,6 +158,8 @@ async function getPaymentInstructions(req, res, next) {
       memo: req.params.studentId,
       acceptedAssets: Object.values(ACCEPTED_ASSETS).map((a) => ({ code: a.code, type: a.type, displayName: a.displayName, issuer: a.issuer ?? null })),
       paymentLimits: { min: limits.min, max: limits.max },
+      minAmount: limits.min,
+      maxAmount: limits.max,
       feeAmount,
       feeCategory: feeCategory || null,
       categoryInfo,
@@ -105,8 +167,12 @@ async function getPaymentInstructions(req, res, next) {
       feeLocalEquivalent: feeConversion?.available
         ? { amount: feeConversion.localAmount, currency: feeConversion.currency, rate: feeConversion.rate, rateTimestamp: feeConversion.rateTimestamp }
         : null,
-      note: 'Include the payment intent memo exactly when sending payment. The memo must be sent as a text memo (MEMO_TEXT). Other memo types (MEMO_ID, MEMO_HASH, MEMO_RETURN) will not be recognised and your payment will not be matched.',
+      note: 'Include the payment intent memo exactly when sending payment. MEMO_TEXT is recommended; wallets that cannot send text memos may use MEMO_ID or MEMO_HASH with the encoded form of the same reference. MEMO_RETURN is not recognised and such payments will not be matched.',
+      // `memoType` keeps its original 'text' spelling — it is part of the
+      // published API response and existing clients compare against it
+      // directly. New clients should read `supportedMemoTypes` (#1118).
       memoType: 'text',
+      supportedMemoTypes: SUPPORTED_MEMO_TYPES,
     });
   } catch (err) {
     next(err);
@@ -129,10 +195,10 @@ async function createPaymentIntent(req, res, next) {
       const fee = student.fees.find((f) => f.category === feeCategory);
       if (!fee) return res.status(400).json({ error: `Fee category '${feeCategory}' not found for student`, code: 'INVALID_FEE_CATEGORY' });
       feeAmount = fee.amount;
-      categoryInfo = { category: fee.category, amount: fee.amount, paid: fee.paid, totalPaid: fee.totalPaid || 0, remainingBalance: fee.remainingBalance || fee.amount };
+      categoryInfo = { category: fee.category, amount: fee.amount, paid: fee.paid, totalPaid: fee.totalPaid || 0, remainingBalance: computeRemainingBalance(fee) };
     }
 
-    const limitValidation = validatePaymentAmount(feeAmount);
+    const limitValidation = await validatePaymentAmount(feeAmount, { schoolId });
     if (!limitValidation.valid) return res.status(400).json({ error: limitValidation.error, code: limitValidation.code });
 
     const memo = crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -149,8 +215,18 @@ async function createPaymentIntent(req, res, next) {
       startedAt: new Date(),
     });
 
-    res.status(201).json({ ...intent.toObject(), categoryInfo });
+    const intentObj = intent.toObject();
+    res.status(201).json({
+      ...intentObj,
+      // Issue #1035: Include intentId in response so client can pass it back in submitTransaction
+      // to ensure the submission is matched to the correct PENDING record
+      intentId: intent._id.toString(),
+      categoryInfo,
+    });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'A payment intent with that memo already exists for this school', code: 'DUPLICATE_PAYMENT_INTENT' });
+    }
     next(err);
   }
 }
@@ -158,7 +234,7 @@ async function createPaymentIntent(req, res, next) {
 // ====================== SUBMIT XDR TRANSACTION ======================
 async function submitTransaction(req, res, next) {
   try {
-    const { xdr } = req.body;
+    const { xdr, paymentIntentId } = req.body;
     if (!xdr) return res.status(400).json({ error: 'Missing xdr parameter' });
 
     const tx = new StellarSdk.Transaction(xdr, require('../config/stellarConfig').networkPassphrase);
@@ -175,7 +251,34 @@ async function submitTransaction(req, res, next) {
     const memo = tx.memo.value ? tx.memo.value.toString() : null;
     if (!memo) return res.status(400).json({ error: 'Transaction must include the student ID as a memo' });
 
-    let paymentRecord = await Payment.findOne({ schoolId: req.schoolId, memo, status: 'PENDING' }).sort({ createdAt: -1 });
+    // Issue #1035: Match the specific PENDING record via paymentIntentId when provided
+    // to avoid misattribution if multiple PENDING records exist for the same memo.
+    // When paymentIntentId is not provided, fall back to matching by memo (backward compatibility).
+    let paymentRecord;
+    if (paymentIntentId) {
+      const intent = await PaymentIntent.findOne({ _id: paymentIntentId, schoolId: req.schoolId });
+      if (!intent) {
+        return res.status(404).json({ error: 'Payment intent not found', code: 'INTENT_NOT_FOUND' });
+      }
+      if (intent.schoolId !== req.schoolId) {
+        return res.status(403).json({ error: 'Payment intent does not belong to this school', code: 'INTENT_MISMATCH' });
+      }
+      if (intent.status !== 'pending') {
+        return res.status(400).json({ error: `Payment intent is not in pending status (status: ${intent.status})`, code: 'INTENT_NOT_PENDING' });
+      }
+
+      // Look for a PENDING payment record that corresponds to this intent
+      paymentRecord = await Payment.findOne({
+        schoolId: req.schoolId,
+        studentId: intent.studentId,
+        memo: intent.memo,
+        status: 'PENDING',
+      });
+    } else {
+      // Backward compatibility: match by memo alone (highest risk path)
+      paymentRecord = await Payment.findOne({ schoolId: req.schoolId, memo, status: 'PENDING' }).sort({ createdAt: -1 });
+    }
+
     if (!paymentRecord) {
       const studentObj = await Student.findOne({ schoolId: req.schoolId, studentId: memo });
       if (!studentObj) return res.status(404).json({ error: 'Associated student not found in the database. Cannot process transaction.' });
@@ -209,6 +312,21 @@ async function submitTransaction(req, res, next) {
     paymentRecord.confirmedAt = new Date();
     paymentRecord.ledgerSequence = txResponse.ledger;
     await paymentRecord.save();
+
+    // Issue #1034: Update student balance fields using the unified balance updater.
+    // This ensures submitTransaction produces the same Student state updates as
+    // verifyPayment and syncPaymentsForSchool, eliminating divergence.
+    const { updateStudentBalance } = require('../utils/studentBalanceUpdater');
+    try {
+      await updateStudentBalance(req.schoolId, paymentRecord.studentId, {});
+    } catch (balanceErr) {
+      logger.error('Failed to update student balance after submitTransaction', {
+        schoolId: req.schoolId,
+        studentId: paymentRecord.studentId,
+        txHash: normalizedHash,
+        error: balanceErr.message,
+      });
+    }
 
     const network = process.env.STELLAR_NETWORK === 'mainnet' ? 'public' : 'testnet';
     res.json({
@@ -249,8 +367,12 @@ async function verifyPayment(req, res, next) {
     const normalizedHash = hashValidation.normalized;
     const audit = makePaymentAuditLogger(req, schoolId, normalizedHash);
 
-    // Idempotency — return cached result if already recorded
-    const existing = await Payment.findOne({ schoolId, txHash: normalizedHash });
+    // Idempotency — return cached result if already recorded.
+    // REJECTED markers (#1761) are verification-failure placeholders, not
+    // payments: they must never short-circuit a re-verification, otherwise a
+    // transaction rejected for config-dependent limits could never be credited
+    // after the configuration changes.
+    const existing = await Payment.findOne({ schoolId, txHash: normalizedHash, status: { $ne: 'REJECTED' } });
     if (existing) {
       await audit.success({ txHash: normalizedHash, cached: true, studentId: existing.studentId, amount: existing.amount });
 
@@ -307,7 +429,16 @@ async function verifyPayment(req, res, next) {
       } catch (stellarErr) {
         if (PERMANENT_FAIL_CODES.includes(stellarErr.code)) {
           await audit.failure(stellarErr.message, { txHash: normalizedHash, errorCode: stellarErr.code });
-          await Payment.create({ schoolId, studentId: 'unknown', txHash: normalizedHash, amount: 0, status: 'FAILED', feeValidationStatus: 'unknown' }).catch(err => logger.error('[PaymentController] failed to persist permanent failure record', { txHash: normalizedHash, error: err.message }));
+          // #1761: do NOT write a placeholder into `payments`. Several of these
+          // "permanent" outcomes are configuration-dependent (limits, accepted
+          // assets, wrong-school destination) and must remain re-verifiable.
+          // Record the attempt in the dedicated audit collection instead.
+          await recordVerificationAttempt({
+            schoolId,
+            txHash: normalizedHash,
+            code: stellarErr.code,
+            message: stellarErr.message,
+          });
           return next(stellarErr);
         }
 
@@ -336,83 +467,115 @@ async function verifyPayment(req, res, next) {
       // Mark it expired for bookkeeping but continue to record the payment.
       const intent = await PaymentIntent.findOne({ memo: result.memo, schoolId });
       if (intent?.expiresAt && intent.expiresAt < new Date()) {
-        await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'expired' });
+        await PaymentIntent.findOneAndUpdate({ _id: intent._id, schoolId }, { status: 'expired' });
       }
 
-      // Determine cumulative feeValidationStatus (#846).
-      // Partial payments (amount < fee) are accepted — money is already on-chain.
-      // The cumulative total drives the status; per-payment underpaid rejection
-      // is not applied here because a parent may be paying in installments.
-      const prevAgg = await Payment.aggregate([
-        { $match: { schoolId, studentId: studentStrId, deletedAt: null, status: 'SUCCESS' } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]);
-      const prevTotal = prevAgg.length ? prevAgg[0].total : 0;
-      const cumulativeTotal = parseFloat((prevTotal + result.amount).toFixed(7));
+      // Issue #1026 — the tx-hash lock above only prevents two calls for the SAME
+      // transaction from racing; two DIFFERENT transactions for the same student
+      // can still verify concurrently. The balance write below is a non-atomic
+      // read-aggregate-then-absolute-write, so it also needs a lock scoped to the
+      // student, shared with syncPaymentsForSchool's equivalent section so the two
+      // code paths serialize against each other too.
+      const studentLockKey = lock.studentBalanceLockKey(schoolId, studentStrId);
+      const studentLockInfo = await lock.acquire(studentLockKey, STUDENT_BALANCE_LOCK_TTL_MS);
+      if (!studentLockInfo) {
+        return res.status(409).json({ error: 'Sync already in progress', code: 'SYNC_IN_PROGRESS' });
+      }
+      const studentLockToken = studentLockInfo.token;
+
+      let cumulativeTotal;
       let feeValidationStatus;
-      if (cumulativeTotal < studentObj.feeAmount) feeValidationStatus = 'partial';
-      else if (cumulativeTotal > studentObj.feeAmount) feeValidationStatus = 'overpaid';
-      else feeValidationStatus = 'valid';
-      const computedExcessAmount = feeValidationStatus === 'overpaid'
-        ? parseFloat((cumulativeTotal - studentObj.feeAmount).toFixed(7))
-        : 0;
-
-      const now = new Date();
+      let computedExcessAmount;
+      let remainingBalance;
+      let now;
       try {
-        await recordPayment({
-          schoolId,
-          studentId: studentStrId,
-          txHash: result.hash,
-          amount: result.amount,
-          feeAmount: result.feeAmount || studentObj.feeAmount,
-          feeValidationStatus,
-          excessAmount: computedExcessAmount,
-          networkFee: result.networkFee,
-          status: 'SUCCESS',
-          memo: result.memo,
-          senderAddress: result.senderAddress || null,
-          ledgerSequence: result.ledger || null,
-          confirmationStatus: 'confirmed',
-          confirmedAt: result.date ? new Date(result.date) : now,
-          verifiedAt: now,
-        });
-      } catch (dupErr) {
-        if (dupErr.code === 'DUPLICATE_TX') {
-          // Concurrent path (poller or another verify call) already recorded this tx.
-          // Fetch and return the existing record as a cache hit.
-          const cached = await Payment.findOne({ schoolId, txHash: normalizedHash });
-          if (cached) {
-            await audit.success({ txHash: normalizedHash, cached: true, studentId: studentStrId, amount: cached.amount });
-            const targetCurrency = req.school.localCurrency || 'USD';
-            const cachedConv = await convertToLocalCurrency(cached.amount, cached.assetCode || 'XLM', targetCurrency);
-            return res.json({
-              verified: true, cached: true, hash: cached.txHash,
-              stellarExplorerUrl: getExplorerUrl(cached.txHash), explorerUrl: getExplorerUrl(cached.txHash),
-              memo: cached.memo, studentId: cached.studentId, amount: cached.amount,
-              assetCode: cached.assetCode, feeAmount: cached.feeAmount,
-              feeValidation: { status: cached.feeValidationStatus, excessAmount: cached.excessAmount },
-              date: cached.confirmedAt || cached.createdAt, status: cached.status,
-              localCurrency: {
-                amount: cachedConv.available ? cachedConv.localAmount : null,
-                currency: cachedConv.currency, rate: cachedConv.rate,
-                rateTimestamp: cachedConv.rateTimestamp, available: cachedConv.available,
-              },
-            });
-          }
-        }
-        throw dupErr;
-      }
+        // Determine cumulative feeValidationStatus (#846).
+        // Partial payments (amount < fee) are accepted — money is already on-chain.
+        // The cumulative total drives the status; per-payment underpaid rejection
+        // is not applied here because a parent may be paying in installments.
+        //
+        // Summed via $toDecimal (#1123 money-representation fix) so the addition
+        // happens in exact Decimal128 space inside MongoDB — a plain `$sum` over
+        // the `amount` doubles would accumulate float error server-side, before
+        // the result ever reaches this function, and toFixed(7) cannot repair
+        // that afterwards. classifyFeePayment then compares in exact Decimal
+        // space, so an installment plan that sums exactly to the fee is never
+        // misclassified by a float epsilon.
+        const prevAgg = await Payment.aggregate([
+          { $match: { schoolId, studentId: studentStrId, deletedAt: null, status: 'SUCCESS' } },
+          { $group: { _id: null, total: { $sum: { $toDecimal: '$amount' } } } },
+        ]);
+        const prevTotal = prevAgg.length ? decimalFromMongo(prevAgg[0].total) : toMoney(0);
+        const classification = classifyFeePayment(prevTotal.plus(toMoney(result.amount)), studentObj.feeAmount);
+        cumulativeTotal = classification.cumulativeTotal;
+        feeValidationStatus = classification.status;
+        computedExcessAmount = classification.excessAmount;
+        remainingBalance = classification.remainingBalance;
 
-      // Update student record immediately after recording (#846) — sync path also does
-      // this, but the verify path never did, leaving totalPaid/remainingBalance stale.
-      await Student.findOneAndUpdate(
-        { schoolId, studentId: studentStrId },
-        {
-          totalPaid: cumulativeTotal,
-          remainingBalance: parseFloat(Math.max(0, studentObj.feeAmount - cumulativeTotal).toFixed(7)),
-          feePaid: cumulativeTotal >= studentObj.feeAmount,
-        },
-      );
+        now = new Date();
+
+        // Issue #1027: Compute confirmationState using the same logic as syncPaymentsForSchool
+        // to ensure manual verify produces consistent state machine values
+        const confirmation = await determineConfirmationState(
+          result.ledger || null,
+          undefined,
+          false,
+        );
+
+        try {
+          await recordPayment({
+            schoolId,
+            studentId: studentStrId,
+            txHash: result.hash,
+            amount: result.amount,
+            feeAmount: result.feeAmount || studentObj.feeAmount,
+            feeValidationStatus,
+            excessAmount: computedExcessAmount,
+            networkFee: result.networkFee,
+            status: 'SUCCESS',
+            memo: result.memo,
+            senderAddress: result.senderAddress || null,
+            ledgerSequence: result.ledger || null,
+            confirmationStatus: confirmation.confirmationStatus,
+            confirmationState: confirmation.state,
+            confirmedAt: result.date ? new Date(result.date) : now,
+            verifiedAt: now,
+          });
+        } catch (dupErr) {
+          if (dupErr.code === 'DUPLICATE_TX') {
+            // Concurrent path (poller or another verify call) already recorded this tx.
+            // Fetch and return the existing record as a cache hit.
+            const cached = await Payment.findOne({ schoolId, txHash: normalizedHash, status: { $ne: 'REJECTED' } });
+            if (cached) {
+              await audit.success({ txHash: normalizedHash, cached: true, studentId: studentStrId, amount: cached.amount });
+              const targetCurrency = req.school.localCurrency || 'USD';
+              const cachedConv = await convertToLocalCurrency(cached.amount, cached.assetCode || 'XLM', targetCurrency);
+              return res.json({
+                verified: true, cached: true, hash: cached.txHash,
+                stellarExplorerUrl: getExplorerUrl(cached.txHash), explorerUrl: getExplorerUrl(cached.txHash),
+                memo: cached.memo, studentId: cached.studentId, amount: cached.amount,
+                assetCode: cached.assetCode, feeAmount: cached.feeAmount,
+                feeValidation: { status: cached.feeValidationStatus, excessAmount: cached.excessAmount },
+                date: cached.confirmedAt || cached.createdAt, status: cached.status,
+                localCurrency: {
+                  amount: cachedConv.available ? cachedConv.localAmount : null,
+                  currency: cachedConv.currency, rate: cachedConv.rate,
+                  rateTimestamp: cachedConv.rateTimestamp, available: cachedConv.available,
+                },
+              });
+            }
+          }
+          throw dupErr;
+        }
+
+        // Issue #1034: Update student balance using the unified balance updater.
+        // This ensures verifyPayment, submitTransaction, and syncPaymentsForSchool
+        // all use the same balance computation logic.
+        const { updateStudentBalance } = require('../utils/studentBalanceUpdater');
+        await updateStudentBalance(schoolId, studentStrId, {});
+      } finally {
+        await lock.release(studentLockKey, studentLockToken);
+      }
 
       await audit.success({
         txHash: normalizedHash,
@@ -457,7 +620,6 @@ async function verifyPayment(req, res, next) {
       const targetCurrency = req.school.localCurrency || 'USD';
       const conversion = await convertToLocalCurrency(result.amount, result.assetCode || 'XLM', targetCurrency);
       const stellarExplorerUrl = getExplorerUrl(result.hash);
-      const remainingBalance = parseFloat(Math.max(0, studentObj.feeAmount - cumulativeTotal).toFixed(7));
 
       res.json({
         verified: true,
@@ -523,6 +685,8 @@ module.exports = {
   verifyTransactionHash,
   getExplorerUrl,
   wrapStellarError,
+  computeRemainingBalance,
+  recordVerificationAttempt,
   // Re-export from split controllers so tests importing paymentController still work
   ...require('./paymentQueryController'),
   ...require('./paymentAdminController'),

@@ -30,6 +30,12 @@ const userSchema = new mongoose.Schema(
         used: { type: Boolean, default: false },
       },
     ],
+    // Invitation flow
+    invitationToken: { type: String, default: null },
+    invitationExpires: { type: Date, default: null },
+    // Password reset flow
+    resetToken: { type: String, default: null },
+    resetExpires: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -39,6 +45,8 @@ userSchema.set('toJSON', {
     delete ret.passwordHash;
     delete ret.mfaSecret;
     delete ret.mfaBackupCodes;
+    delete ret.invitationToken;
+    delete ret.resetToken;
     return ret;
   },
 });

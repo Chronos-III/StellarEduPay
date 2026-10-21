@@ -1,10 +1,13 @@
 'use strict';
 
+const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const speakeasy = require('speakeasy');
 const School = require('../models/schoolModel');
 const { logAudit } = require('../services/auditService');
 const logger = require('../utils/logger');
+const schoolCache = require('../services/schoolCacheInvalidator');
+const { revokeAllUserSessions } = require('../services/sessionStore');
 
 // ── MFA secret encryption (AES-256-GCM) ──────────────────────────────────────
 // Key is derived from JWT_SECRET so no extra env var is needed.
@@ -99,6 +102,16 @@ async function setupMfa(req, res) {
       return res.status(404).json({ error: 'School not found.', code: 'SCHOOL_NOT_FOUND' });
     }
 
+    // #1180 — Refuse to overwrite credentials when MFA is already active.
+    // An authenticated admin must call /mfa/disable (with a valid TOTP code)
+    // before re-issuing a new secret, preventing silent credential overwrites.
+    if (school.mfaEnabled) {
+      return res.status(400).json({
+        error: 'MFA is already active for this school. Disable MFA before setting it up again.',
+        code: 'MFA_ALREADY_ACTIVE',
+      });
+    }
+
     const generated = speakeasy.generateSecret({
       name: `StellarEduPay (${school.name || slug})`,
       issuer: 'StellarEduPay',
@@ -113,6 +126,19 @@ async function setupMfa(req, res) {
     school.mfaSecret = encryptMfaSecret(totpSecret);
     school.mfaBackupCodes = backupCodes.map((c) => ({ hash: hashBackupCode(c), used: false }));
     await school.save();
+    schoolCache.invalidate(school);
+
+    // #1180 — Audit credential generation so every setup attempt is traceable.
+    await logAudit({
+      schoolId: school.schoolId || slug,
+      action: 'MFA_SECRET_GENERATED',
+      performedBy: req.admin?.username || req.user?.userId || req.admin?.email || req.user?.email || 'admin',
+      targetId: school._id?.toString() || slug,
+      targetType: 'school',
+      details: { slug },
+      result: 'success',
+      severity: 'high',
+    });
 
     return res.json({
       secret: totpSecret,
@@ -169,15 +195,17 @@ async function verifyAndEnableMfa(req, res) {
       return res.status(400).json({ error: 'Invalid TOTP code.', code: 'INVALID_MFA_CODE' });
     }
 
-    await School.findOneAndUpdate(
+    const updatedSchool = await School.findOneAndUpdate(
       { slug },
       {
         $set: {
           mfaEnabled: true,
           mfaSecret: encryptMfaSecret(verifySecret),
         },
-      }
+      },
+      { new: true }
     );
+    if (updatedSchool) schoolCache.invalidate(updatedSchool);
 
     await logAudit({
       schoolId: school.schoolId || slug,
@@ -233,10 +261,12 @@ async function disableMfa(req, res) {
       return res.status(400).json({ error: 'Invalid TOTP code.', code: 'INVALID_MFA_CODE' });
     }
 
-    await School.findOneAndUpdate(
+    const updatedSchool = await School.findOneAndUpdate(
       { slug },
-      { $set: { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: [] } }
+      { $set: { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: [] } },
+      { new: true }
     );
+    if (updatedSchool) schoolCache.invalidate(updatedSchool);
 
     await logAudit({
       schoolId: school.schoolId || slug,
@@ -295,6 +325,17 @@ async function setupUserMfa(req, res) {
     user.mfaSecret = encryptMfaSecret(totpSecret);
     user.mfaBackupCodes = backupCodes.map((c) => ({ hash: hashBackupCode(c), used: false }));
     await user.save();
+
+    await logAudit({
+      schoolId: user.schoolId || 'system',
+      action: 'USER_MFA_SETUP_INITIATED',
+      performedBy: req.auditContext?.performedBy || user.email,
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+      targetId: String(userId),
+      targetType: 'user',
+      details: { mfaEnabled: false, setupStarted: true },
+    });
 
     return res.json({ secret: totpSecret, qrCode, backupCodes });
   } catch (err) {
@@ -364,10 +405,143 @@ async function verifyAndEnableUserMfa(req, res) {
       severity: 'high',
     });
 
+    // #1356 — REQUIRE_MFA: this request's token may have been a restricted
+    // mfaSetupPending token. Reissue the access-token cookie without that
+    // flag so the just-completed setup takes effect immediately, without
+    // forcing the admin to log in again.
+    if (req.user?.mfaSetupPending) {
+      const jwt = require('jsonwebtoken');
+      const { role, userId: uid, schoolId, roles } = req.user;
+      const accessTTL = parseInt(process.env.JWT_ACCESS_TOKEN_TTL, 10) || 8 * 3600;
+      const newToken = jwt.sign({ role, userId: uid, schoolId, roles }, process.env.JWT_SECRET, { expiresIn: accessTTL });
+      res.cookie('admin_token', newToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge: accessTTL * 1000,
+        path: '/',
+      });
+    }
+
     return res.json({ message: 'MFA enabled successfully.' });
   } catch (err) {
     logger.error('[MFA] verifyAndEnableUserMfa error', { error: err.message });
     return res.status(500).json({ error: 'Failed to enable MFA.', code: 'MFA_ENABLE_ERROR' });
+  }
+}
+
+/**
+ * POST /api/auth/mfa/backup-codes/regenerate
+ * Headers: X-School-Slug
+ * Body: { code } (valid TOTP code) OR { password }
+ *
+ * Regenerates backup codes for a school. Requires step-up verification
+ * (either a valid TOTP code or the school password) to prevent unauthorized
+ * backup code rotation. Invalidates all previously issued codes.
+ */
+async function regenerateBackupCodes(req, res) {
+  const slug = req.headers['x-school-slug'];
+  const { code, password } = req.body || {};
+
+  if (!slug) {
+    return res.status(400).json({ error: 'X-School-Slug header is required.', code: 'MISSING_SCHOOL_SLUG' });
+  }
+
+  try {
+    const school = await School.findOne({ slug, isActive: true });
+    if (!school) {
+      return res.status(404).json({ error: 'School not found.', code: 'SCHOOL_NOT_FOUND' });
+    }
+
+    // Verify step-up authentication
+    let verified = false;
+
+    // Step 1: Try TOTP code verification if provided
+    if (code) {
+      if (!school.mfaSecret) {
+        return res.status(400).json({
+          error: 'MFA is not configured for this school. Cannot use TOTP code for verification.',
+          code: 'MFA_NOT_CONFIGURED',
+        });
+      }
+      verified = speakeasy.totp.verify({
+        secret: decryptMfaSecret(school.mfaSecret),
+        encoding: 'base32',
+        token: code,
+        window: 1,
+      });
+      if (!verified) {
+        return res.status(401).json({
+          error: 'Invalid TOTP code.',
+          code: 'INVALID_MFA_CODE',
+        });
+      }
+    }
+
+    // Step 2: Try password verification if TOTP failed and password provided
+    if (!verified && password) {
+      // For school-level MFA, we use an environment-based password or stored hash
+      const envPasswordHash = process.env.SCHOOL_ADMIN_PASSWORD_HASH;
+      const envPassword = process.env.SCHOOL_ADMIN_PASSWORD;
+
+      if (envPasswordHash) {
+        verified = await bcrypt.compare(password, envPasswordHash);
+      } else if (envPassword) {
+        // Timing-safe comparison for environment-based password
+        const crypto = require('crypto');
+        verified = crypto.timingSafeEqual(Buffer.from(password), Buffer.from(envPassword));
+      }
+      if (!verified) {
+        return res.status(401).json({
+          error: 'Invalid password.',
+          code: 'INVALID_PASSWORD',
+        });
+      }
+    }
+
+    // Require at least one form of verification
+    if (!verified) {
+      return res.status(400).json({
+        error: 'Either a valid TOTP code or password is required.',
+        code: 'VERIFICATION_REQUIRED',
+      });
+    }
+
+    // Generate new backup codes and invalidate old ones
+    const newCodes = generateBackupCodes();
+    const updatedSchool = await School.findOneAndUpdate(
+      { slug },
+      {
+        $set: {
+          mfaBackupCodes: newCodes.map((c) => ({ hash: hashBackupCode(c), used: false })),
+        },
+      },
+      { new: true }
+    );
+    if (updatedSchool) schoolCache.invalidate(updatedSchool);
+
+    // Audit the backup code regeneration
+    await logAudit({
+      schoolId: school.schoolId || slug,
+      action: 'MFA_BACKUP_CODES_REGENERATED',
+      performedBy: req.admin?.username || req.admin?.email || 'admin',
+      targetId: school._id?.toString() || slug,
+      targetType: 'school',
+      details: {
+        slug,
+        verificationMethod: code ? 'TOTP' : 'password',
+      },
+      result: 'success',
+      severity: 'high',
+    });
+
+    return res.json({
+      message: 'Backup codes regenerated successfully.',
+      backupCodes: newCodes,
+    });
+  } catch (err) {
+    logger.error('[MFA] regenerateBackupCodes error', { error: err.message });
+    return res.status(500).json({ error: 'Failed to regenerate backup codes.', code: 'MFA_REGENERATE_ERROR' });
   }
 }
 
@@ -416,6 +590,11 @@ async function disableUserMfa(req, res) {
       $set: { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: [] },
     });
 
+    // Disabling a second factor must not leave pre-existing sessions alive:
+    // revoke every refresh-token family for this user so any stolen cookie
+    // stops minting access tokens.
+    await revokeAllUserSessions(userId);
+
     await logAudit({
       schoolId: user.schoolId || 'system',
       action: 'USER_MFA_DISABLED',
@@ -438,6 +617,7 @@ module.exports = {
   setupMfa,
   verifyAndEnableMfa,
   disableMfa,
+  regenerateBackupCodes,
   setupUserMfa,
   verifyAndEnableUserMfa,
   disableUserMfa,

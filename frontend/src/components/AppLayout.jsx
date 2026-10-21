@@ -1,90 +1,46 @@
-import { useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/router";
-import { useAdminAuth } from "../hooks/useAdminAuth";
-import {
-  IconDashboard,
-  IconCreditCard,
-  IconBarChart,
-  IconLayers,
-  IconFileText,
-  IconMessageCircle,
-} from "./Icons";
+import { useTranslation } from "react-i18next";
+import { useAdminAuthContext } from "../hooks/AdminAuthContext";
+import { PUBLIC_NAV_ITEMS, ADMIN_NAV_ITEMS } from "../config/navigation";
 
-const PUBLIC_NAV = [
-  { href: "/dashboard",      label: "Dashboard",  Icon: IconDashboard },
-  { href: "/pay-fees",       label: "Pay Fees",   Icon: IconCreditCard },
-  { href: "/reports",        label: "Reports",    Icon: IconBarChart },
-];
+function SidebarLink({ href, i18nKey, Icon, active }) {
+  const { t } = useTranslation();
+  return (
+    <Link
+      href={href}
+      className={`app-sidebar-link${active ? " active" : ""}`}
+      aria-current={active ? "page" : undefined}
+    >
+      <span className="app-sidebar-icon">
+        <Icon size={15} />
+      </span>
+      {t(i18nKey)}
+    </Link>
+  );
+}
 
-const ADMIN_NAV = [
-  { href: "/fee-adjustments", label: "Fee Rules",   Icon: IconLayers },
-  { href: "/audit-logs",      label: "Audit Logs",  Icon: IconFileText },
-  { href: "/disputes",        label: "Disputes",    Icon: IconMessageCircle },
-];
+function AppLayoutInner({ children }) {
+  const { pathname } = useRouter();
+  const { t } = useTranslation();
+  const { isAdmin } = useAdminAuthContext();
 
-export default function AppLayout({ children }) {
-  const router = useRouter();
-  const { pathname } = router;
-  const { isAdmin, checked } = useAdminAuth();
-
-  // Route guard: these routes require an admin session. If the auth check has
-  // resolved and the user is not authenticated, send them to /login (preserving
-  // where they were via returnTo). We do NOT render the protected page until
-  // authenticated — otherwise it would mount and fire admin-only API calls
-  // (e.g. the dashboard's /students) while logged out.
-  useEffect(() => {
-    if (checked && !isAdmin) {
-      router.replace(`/login?returnTo=${encodeURIComponent(router.asPath)}`);
-    }
-  }, [checked, isAdmin, router]);
-
-  if (!isAdmin) {
-    return (
-      <div className="app-layout">
-        <main className="app-main" id="main-content">
-          <div className="app-auth-gate" role="status" aria-live="polite">
-            {checked ? "Redirecting to sign in…" : "Checking access…"}
-          </div>
-        </main>
-      </div>
-    );
-  }
-
+  // #1580 — rendered from the shared navigation config (config/navigation.js),
+  // the same source the top Navbar uses.
   return (
     <div className="app-layout">
-      <aside className="app-sidebar" aria-label="Sidebar navigation">
+      <aside className="app-sidebar" aria-label={t("nav.sidebarAria")}>
         <div>
-          <div className="app-sidebar-section">Navigation</div>
-          {PUBLIC_NAV.map(({ href, label, Icon }) => (
-            <Link
-              key={href}
-              href={href}
-              className={`app-sidebar-link${pathname === href ? " active" : ""}`}
-              aria-current={pathname === href ? "page" : undefined}
-            >
-              <span className="app-sidebar-icon">
-                <Icon size={15} />
-              </span>
-              {label}
-            </Link>
+          <div className="app-sidebar-section">{t("nav.section")}</div>
+          {PUBLIC_NAV_ITEMS.map((item) => (
+            <SidebarLink key={item.href} {...item} active={pathname === item.href} />
           ))}
 
           {isAdmin && (
             <>
-              <div className="app-sidebar-section">Admin</div>
-              {ADMIN_NAV.map(({ href, label, Icon }) => (
-                <Link
-                  key={href}
-                  href={href}
-                  className={`app-sidebar-link${pathname === href ? " active" : ""}`}
-                  aria-current={pathname === href ? "page" : undefined}
-                >
-                  <span className="app-sidebar-icon">
-                    <Icon size={15} />
-                  </span>
-                  {label}
-                </Link>
+              <div className="app-sidebar-section">{t("nav.adminSection")}</div>
+              {ADMIN_NAV_ITEMS.map((item) => (
+                <SidebarLink key={item.href} {...item} active={pathname === item.href} />
               ))}
             </>
           )}
@@ -96,4 +52,15 @@ export default function AppLayout({ children }) {
       </main>
     </div>
   );
+}
+
+/**
+ * AppLayout
+ *
+ * The sidebar layout for admin routes. The RequireAdmin guard is applied
+ * outside this component by RouteShell (#1579), so no layout chrome renders
+ * until authentication is confirmed.
+ */
+export default function AppLayout({ children }) {
+  return <AppLayoutInner>{children}</AppLayoutInner>;
 }

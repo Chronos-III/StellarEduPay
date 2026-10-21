@@ -3,7 +3,7 @@
 // Must set required env vars before app is loaded
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
 process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
-process.env.JWT_SECRET = 'test-secret';
+process.env.JWT_SECRET = 'test-jwt-secret-1234567890abcdef';
 
 const request = require('supertest');
 
@@ -320,7 +320,7 @@ describe('POST /api/disputes — flag a dispute', () => {
   let Dispute, Payment;
 
   beforeEach(() => {
-    process.env.JWT_SECRET = 'test-secret';
+    process.env.JWT_SECRET = 'test-jwt-secret-1234567890abcdef';
     Dispute = require('../backend/src/models/disputeModel');
     Payment = require('../backend/src/models/paymentModel');
     jest.clearAllMocks();
@@ -442,7 +442,7 @@ describe('PATCH /api/disputes/:id/resolve — state machine, auth, audit, SSE, p
   let Dispute, Payment, auditService, sseService;
 
   beforeEach(() => {
-    process.env.JWT_SECRET = 'test-secret';
+    process.env.JWT_SECRET = 'test-jwt-secret-1234567890abcdef';
     Dispute      = require('../backend/src/models/disputeModel');
     Payment      = require('../backend/src/models/paymentModel');
     auditService = require('../backend/src/services/auditService');
@@ -644,49 +644,108 @@ describe('PATCH /api/disputes/:id/resolve — state machine, auth, audit, SSE, p
 
   // ── Payment status sync (#894) ─────────────────────────────────────────────
 
+  // _syncPaymentStatus now loads the payment and goes through `.save()` (with
+  // the admin-override flag) instead of `findOneAndUpdate`, so these mocks
+  // need a document-like object that records the mutation.
+  function mockLoadedPayment(initialStatus) {
+    const doc = { ...MOCK_PAYMENT, status: initialStatus, $locals: {} };
+    doc.save = jest.fn().mockImplementation(async () => doc);
+    return doc;
+  }
+
   test('payment synced to REFUNDED when dispute resolved', async () => {
     const resolved = { ...MOCK_DISPUTE, status: 'resolved', resolvedBy: 'admin@school.test', resolutionNote: 'Done', txHash: MOCK_DISPUTE.txHash };
     Dispute.findOne.mockResolvedValueOnce({ ...MOCK_DISPUTE, status: 'open' });
     Dispute.findOneAndUpdate.mockResolvedValueOnce(resolved);
+    const payment = mockLoadedPayment('SUCCESS');
+    Payment.findOne.mockResolvedValueOnce(payment);
 
     await api('patch', `/api/disputes/${MOCK_DISPUTE._id}/resolve`)
       .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
       .send({ resolutionNote: 'Done', status: 'resolved' });
 
-    expect(Payment.findOneAndUpdate).toHaveBeenCalledWith(
+    expect(Payment.findOne).toHaveBeenCalledWith(
       expect.objectContaining({ txHash: MOCK_DISPUTE.txHash }),
-      expect.objectContaining({ $set: { status: 'REFUNDED' } }),
     );
+    expect(payment.$locals.adminOverride).toBe(true);
+    expect(payment.status).toBe('REFUNDED');
+    expect(payment.save).toHaveBeenCalled();
   });
 
   test('payment synced to SUCCESS when dispute rejected', async () => {
     const rejected = { ...MOCK_DISPUTE, status: 'rejected', resolvedBy: 'admin@school.test', resolutionNote: 'Denied', txHash: MOCK_DISPUTE.txHash };
     Dispute.findOne.mockResolvedValueOnce({ ...MOCK_DISPUTE, status: 'under_review' });
     Dispute.findOneAndUpdate.mockResolvedValueOnce(rejected);
+    const payment = mockLoadedPayment('DISPUTED');
+    Payment.findOne.mockResolvedValueOnce(payment);
 
     await api('patch', `/api/disputes/${MOCK_DISPUTE._id}/resolve`)
       .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
       .send({ resolutionNote: 'Denied', status: 'rejected' });
 
-    expect(Payment.findOneAndUpdate).toHaveBeenCalledWith(
+    expect(Payment.findOne).toHaveBeenCalledWith(
       expect.objectContaining({ txHash: MOCK_DISPUTE.txHash }),
-      expect.objectContaining({ $set: { status: 'SUCCESS' } }),
     );
+    expect(payment.$locals.adminOverride).toBe(true);
+    expect(payment.status).toBe('SUCCESS');
+    expect(payment.save).toHaveBeenCalled();
   });
 
   test('payment synced to DISPUTED when dispute re-opened', async () => {
     const reopened = { ...MOCK_DISPUTE, status: 'open', resolvedBy: 'admin@school.test', resolutionNote: 'New evidence', txHash: MOCK_DISPUTE.txHash };
     Dispute.findOne.mockResolvedValueOnce({ ...MOCK_DISPUTE, status: 'resolved' });
     Dispute.findOneAndUpdate.mockResolvedValueOnce(reopened);
+    const payment = mockLoadedPayment('REFUNDED');
+    Payment.findOne.mockResolvedValueOnce(payment);
 
     await api('patch', `/api/disputes/${MOCK_DISPUTE._id}/resolve`)
       .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
       .send({ resolutionNote: 'New evidence', status: 'open' });
 
-    expect(Payment.findOneAndUpdate).toHaveBeenCalledWith(
+    expect(Payment.findOne).toHaveBeenCalledWith(
       expect.objectContaining({ txHash: MOCK_DISPUTE.txHash }),
-      expect.objectContaining({ $set: { status: 'DISPUTED' } }),
     );
+    expect(payment.$locals.adminOverride).toBe(true);
+    expect(payment.status).toBe('DISPUTED');
+    expect(payment.save).toHaveBeenCalled();
+  });
+
+  // ── open → under_review: same-target payment status is a no-op, not an error
+
+  test('200 — open→under_review succeeds when payment is already DISPUTED (idempotent sync)', async () => {
+    // Both 'open' and 'under_review' map to the DISPUTED payment status.
+    // When flagDispute already set the payment to DISPUTED, the subsequent
+    // open→under_review transition must NOT throw — it should be a no-op.
+    const underReview = {
+      ...MOCK_DISPUTE,
+      status:         'under_review',
+      resolvedBy:     'admin@school.test',
+      resolutionNote: 'Investigating',
+      txHash:         MOCK_DISPUTE.txHash,
+    };
+    Dispute.findOne.mockResolvedValueOnce({ ...MOCK_DISPUTE, status: 'open' });
+    Dispute.findOneAndUpdate.mockResolvedValueOnce(underReview);
+
+    // Payment is already DISPUTED — this is the exact state that previously
+    // caused _syncPaymentStatus to throw INVALID_TRANSITION.
+    const payment = mockLoadedPayment('DISPUTED');
+    Payment.findOne.mockResolvedValueOnce(payment);
+
+    const res = await api('patch', `/api/disputes/${MOCK_DISPUTE._id}/resolve`)
+      .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+      .send({ resolutionNote: 'Investigating', status: 'under_review' });
+
+    // Must succeed — the dispute moved to under_review even though payment
+    // was already DISPUTED.
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('under_review');
+
+    // _syncPaymentStatus should have loaded the payment to check its status…
+    expect(Payment.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({ txHash: MOCK_DISPUTE.txHash }),
+    );
+    // …but must NOT have called save() because status was already DISPUTED.
+    expect(payment.save).not.toHaveBeenCalled();
   });
 });
 
@@ -859,7 +918,7 @@ describe('Dispute resolution — hold lifted on terminal status', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    process.env.JWT_SECRET = 'test-secret';
+    process.env.JWT_SECRET = 'test-jwt-secret-1234567890abcdef';
     Dispute       = require('../backend/src/models/disputeModel');
     Student       = require('../backend/src/models/studentModel');
     School        = require('../backend/src/models/schoolModel');

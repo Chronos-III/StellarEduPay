@@ -96,6 +96,10 @@ async function closeQueues() {
       const retryQueue = require('../services/bullMQRetryService');
       if (retryQueue.shutdownQueue) await retryQueue.shutdownQueue();
     }},
+    { name: 'reportQueue', fn: async () => {
+      const reportQueue = require('../queue/reportQueue');
+      if (reportQueue.closeQueue) await reportQueue.closeQueue();
+    }},
   ];
 
   for (const op of closeOps) {
@@ -114,6 +118,14 @@ async function stopAcceptingNewWork() {
       const polling = require('./transactionPollingService');
       if (polling.stopPolling) polling.stopPolling();
     }},
+    { name: 'horizonStreaming', fn: async () => {
+      const streaming = require('./horizonStreamingService');
+      if (streaming.stopStreaming) streaming.stopStreaming();
+    }},
+    { name: 'anchorPolling', fn: async () => {
+      const anchor = require('./anchorService');
+      if (anchor.stopAllAnchorPolls) anchor.stopAllAnchorPolls();
+    }},
     { name: 'retrySelector', fn: async () => {
       const retrySelector = require('./retryServiceSelector');
       if (retrySelector.stop) retrySelector.stop();
@@ -121,6 +133,12 @@ async function stopAcceptingNewWork() {
     { name: 'leaderElection', fn: async () => {
       const leaderElection = require('./leaderElection');
       if (leaderElection.stop) await leaderElection.stop();
+    }},
+    // Issue #1646: stop the outbox dispatcher and wait for any in-flight batch
+    // to finish before the process closes MongoDB connections beneath it.
+    { name: 'outboxDispatcher', fn: async () => {
+      const outbox = require('./outboxDispatcher');
+      if (outbox.stopOutboxDispatcher) await outbox.stopOutboxDispatcher();
     }},
   ];
 

@@ -14,10 +14,16 @@ if (process.env.NODE_ENV !== 'production') {
   // Suppress ioredis verbose logging (connection/reconnection attempts)
   const redisDebug = require('debug');
   redisDebug.disable('*');
-  
+
   // Suppress Mongoose debug output
   mongoose.set('debug', false);
 }
+
+// Issue #1524: Enable filter sanitization globally as defence in depth
+// against operator injection like {class: {$ne: 'x'}}, even though the
+// query parser is set to 'simple' above. sanitizeFilter masks all values
+// matching the pattern of a MongoDB operator key (starting with $).
+mongoose.set('sanitizeFilter', true);
 
 const studentRoutes = require('./routes/studentRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
@@ -37,12 +43,25 @@ const emailRoutes = require('./routes/emailRoutes');
 const metricsRoute = require('./routes/metricsRoute');
 const webhookEndpointRoutes = require('./routes/webhookEndpointRoutes');
 const webhookDeliveryRoutes = require('./routes/webhookDeliveryRoutes');
+const paymentPlanRoutes = require('./routes/paymentPlanRoutes');
+const auditRoutes = require('./routes/auditRoutes');
+const superAdminRoutes = require('./routes/superAdminRoutes');
+const cspReportRoutes = require('./routes/cspReportRoutes');
+const analyticsRoutes = require('./routes/analyticsRoutes');
+const userRoutes = require('./routes/userRoutes');
+const academicPeriodRoutes = require('./routes/academicPeriodRoutes');
+const anchorRoutes = require('./routes/anchorRoutes');
+const publicConfigRoutes = require('./routes/publicConfigRoutes');
+const internalRoutes = require('./routes/internalRoutes');
+const retryQueueRoutes = require('./routes/retryQueueRoutes');
 
 const { registerPaymentSavedSubscribers } = require('./services/paymentSavedSubscribers');
 const { startPolling, stopPolling } = require('./services/transactionPollingService');
+const { startStreaming, stopStreaming } = require('./services/horizonStreamingService');
 const retrySelector = require('./services/retryServiceSelector');
 const { startConsistencyScheduler, stopConsistencyScheduler } = require('./services/consistencyScheduler');
 const { startReminderScheduler, stopReminderScheduler } = require('./services/reminderService');
+const { startPiiAnonymizationScheduler, stopPiiAnonymizationScheduler } = require('./services/piiAnonymizationScheduler');
 const { startWorker: startTxQueueWorker, stopWorker: stopTxQueueWorker } = require('./services/transactionQueueService');
 const { startSessionCleanupScheduler, stopSessionCleanupScheduler } = require('./services/sessionCleanupService');
 const { startReconciliationScheduler, stopReconciliationScheduler } = require('./services/reconciliationService');
@@ -52,9 +71,11 @@ const { startMetricsRollupScheduler, stopMetricsRollupScheduler } = require('./s
 const { startWebhookRetryScheduler, stopWebhookRetryScheduler } = require('./services/webhookRetryScheduler');
 const { startOutboxDispatcher, stopOutboxDispatcher } = require('./services/outboxDispatcher');
 const { startReconciliationReportScheduler, stopReconciliationReportScheduler } = require('./services/reconciliationReportScheduler');
+const { startJobRecoveryScheduler, stopJobRecoveryScheduler } = require('./services/jobRecoveryScheduler');
+const { startDisputeSlaScheduler, stopDisputeSlaScheduler } = require('./services/disputeNotificationService');
 const { startWorker: startReportQueueWorker, stopWorker: stopReportQueueWorker } = require('./services/reportQueueService');
-const { close: closeReportCacheInvalidator } = require('./services/reportCacheInvalidator');
 const { closeQueue } = require('./queue/transactionQueue');
+const { closeRedisClients } = require('./config/redisClient');
 const bullMQRetryService = require('./services/bullMQRetryService');
 const { initializeRetryQueue, setupMonitoring } = require('./config/retryQueueSetup');
 const { notFoundHandler, globalErrorHandler } = require('./middleware/errorHandler');
@@ -67,8 +88,23 @@ const { healthCheck, healthLive, healthReady } = require('./controllers/healthCo
 const { setupEnforceConsoleErrorLogging } = require('./errorHandling');
 const logger = require('./utils/logger');
 const { startHeapMonitoring } = require('./utils/heapMonitoring');
+const { validateMetricsTokenOnStartup } = require('./middleware/metricsAuth');
 
-const morgan = require('morgan');
+// ── Startup security checks ───────────────────────────────────────────────────
+// Validate METRICS_BEARER_TOKEN before the server binds. In production, an
+// insecure or missing token causes a fatal exit so the /metrics endpoint is
+// never exposed without authentication.
+try {
+  validateMetricsTokenOnStartup();
+} catch (err) {
+  // eslint-disable-next-line no-console
+  console.error(`[FATAL] ${err.message}`);
+  process.exit(1);
+}
+
+// Email bounce/complaint webhook must never fail open in production (#1537).
+require('./controllers/emailWebhookController').checkEmailWebhookConfigOnStartup();
+
 const cookieParser = require('cookie-parser');
 const { parseAllowedOrigins } = require('./utils/corsOrigins');
 
@@ -79,13 +115,51 @@ const app = express();
 // Trust the number of proxy hops configured via TRUSTED_PROXY_HOPS (default: 1).
 // This ensures Express derives req.ip from the correct X-Forwarded-For entry
 // rather than trusting client-supplied headers, which would allow rate-limit bypass.
-app.set('trust proxy', parseInt(process.env.TRUSTED_PROXY_HOPS || '1', 10));
+// Reuses config's already-validated value instead of re-parsing process.env
+// directly, so a malformed TRUSTED_PROXY_HOPS fails fast at config load
+// (see config/index.js) instead of silently becoming NaN here.
+app.set('trust proxy', config.TRUSTED_PROXY_HOPS);
 
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+// Issue #1524: Prevent query-string operator injection like ?field[$ne]=value
+// by only parsing simple string and array values, not nested objects.
+// Nested operators like [$ne], [$regex], etc. become literal strings that fail
+// validation, preventing filter bypass attacks.
+app.set('query parser', 'simple');
+
+// Request logging is handled by the structured requestLogger middleware
+// (see middleware/requestLogger.js) which provides PII redaction, query
+// string stripping, and IP hashing. Morgan is removed to avoid duplicate
+// logging and PII leakage.
 app.use(cors({
   origin: allowedOrigins,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-School-ID', 'Idempotency-Key'],
+  // Issue #1584: Include every request header the API reads so that browser
+  // preflight (OPTIONS) succeeds for cross-origin requests.
+  //
+  // X-School-Slug  — accepted by resolveSchool and required by MFA setup
+  //                  (mfaController returns 400 MISSING_SCHOOL_SLUG without it)
+  // X-Correlation-ID / X-Request-ID — client-generated tracing headers used by
+  //                  requestLogger and correlationId utils for end-to-end tracing
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-School-ID',
+    'X-School-Slug',
+    'Idempotency-Key',
+    'X-Correlation-ID',
+    'X-Request-ID',
+  ],
+  // Issue #1584: Expose response headers so the browser JS can read them.
+  // Rate-limit headers let the frontend back off gracefully; correlation IDs
+  // allow client-side tracing to be linked to server-side logs.
+  exposedHeaders: [
+    'Retry-After',
+    'RateLimit-Limit',
+    'RateLimit-Remaining',
+    'RateLimit-Reset',
+    'X-Correlation-ID',
+    'X-Request-ID',
+  ],
   credentials: true,
 }));
 app.use(cookieParser());
@@ -98,6 +172,7 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'none'"],
       frameAncestors: ["'none'"],
+      reportUri: ['/api/csp-report'],
     },
   },
   crossOriginEmbedderPolicy: false,
@@ -164,6 +239,28 @@ app.use('/api/auth', authRoutes);
 app.use('/api/webhook-endpoints', webhookEndpointRoutes);
 app.use('/api/webhook-deliveries', webhookDeliveryRoutes);
 app.use('/api/email', emailRoutes);
+app.use('/api/payment-plans', paymentPlanRoutes);
+app.use('/api/audit', auditRoutes);
+// Issue #1575 — alias /api/audit-logs → /api/audit for one release so
+// integrators following the old API spec docs get a 200 with a Deprecation
+// header rather than a hard 404.  Remove this alias in the next major version.
+app.use('/api/audit-logs', (req, res, next) => {
+  res.set('Deprecation', 'true');
+  res.set('Link', '</api/audit>; rel="successor-version"');
+  next();
+}, auditRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/superadmin', superAdminRoutes);
+app.use('/api/csp-report', cspReportRoutes);
+app.use('/api', userRoutes);
+app.use('/api/academic-periods', academicPeriodRoutes);
+app.use('/api/anchor', anchorRoutes);
+// #1583 / #1593 / #1592: these routers document themselves as mounted here
+// but the mounts were lost in a merge; restored as part of #1632 so every
+// route in docs/openapi.json is actually reachable.
+app.use('/api/public-config', publicConfigRoutes);
+app.use('/api/internal', internalRoutes);
+app.use('/api/retry-queue', retryQueueRoutes);
 app.get('/api/consistency', requireAdminAuth, runConsistencyCheck);
 app.get('/health', healthCheck);
 app.get('/health/live', healthLive);
@@ -172,19 +269,31 @@ app.get('/health/ready', healthReady);
 // Issue #671: OpenAPI/Swagger documentation
 try {
   const swaggerSpecs = require('./config/swagger');
-  app.get('/api/docs.json', (req, res) => {
+
+  // Swagger UI — defaults to enabled outside production, but can be
+  // explicitly toggled via SWAGGER_ENABLED (e.g. to turn it on for a
+  // staging/UAT environment that runs with NODE_ENV=production).
+  const swaggerEnabled = process.env.SWAGGER_ENABLED !== undefined
+    ? process.env.SWAGGER_ENABLED === 'true'
+    : process.env.NODE_ENV !== 'production';
+
+  // Issue #1541: the raw OpenAPI document maps every route, including admin
+  // endpoints. It is only public when Swagger is enabled; otherwise (the
+  // production default) it requires admin authentication.
+  const sendSpecs = (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.json(swaggerSpecs);
-  });
-
-  // Swagger UI (development only)
-  if (process.env.NODE_ENV !== 'production') {
+  };
+  if (swaggerEnabled) {
+    app.get('/api/docs.json', sendSpecs);
     const swaggerUi = require('swagger-ui-express');
     app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpecs, {
       swaggerOptions: {
         url: '/api/docs.json',
       },
     }));
+  } else {
+    app.get('/api/docs.json', requireAdminAuth, sendSpecs);
   }
 } catch (err) {
   logger.warn('Swagger documentation not available', { error: err.message });
@@ -200,6 +309,18 @@ const { connect: connectDatabase } = require('./config/database');
 // timeouts, and majority write concern for financial data durability.
 
 connectDatabase().then(async () => {
+  // Resolve the signer master key from the configured secrets provider
+  // (issue #1386) before anything might need to sign a transaction. A no-op
+  // when SIGNER_KEY_SOURCE is unset — signerKeyManager then reads
+  // SIGNER_MASTER_KEY directly, as before.
+  const { initializeMasterKey } = require('./utils/signerKeyManager');
+  try {
+    await initializeMasterKey();
+  } catch (err) {
+    logger.error('[Startup] Failed to resolve signer master key from SIGNER_KEY_SOURCE', { error: err.message });
+    throw err;
+  }
+
   // Start heap monitoring to detect memory leaks early
   startHeapMonitoring();
 
@@ -226,10 +347,15 @@ connectDatabase().then(async () => {
     logger.error('Stuck payment reconciliation failed on startup', { error: err.message });
   }
 
-  // Recover any pending/processing BullMQ jobs that survived a restart in MongoDB
-  const { recoverPendingJobs } = require('./queue/transactionQueue');
+  // Recover any pending/processing BullMQ jobs that survived a restart in MongoDB.
+  // Retries with exponential backoff while waiting for Redis to become ready
+  // (#1381) instead of giving up on the first connection error — a Redis outage
+  // at boot would otherwise strand those jobs in MongoDB until the next restart.
+  // If Redis never comes up within the retry budget, the leader-only
+  // jobRecoveryScheduler below keeps retrying once it does.
+  const { recoverPendingJobsWithRetry } = require('./queue/transactionQueue');
   try {
-    await recoverPendingJobs();
+    await recoverPendingJobsWithRetry();
   } catch (err) {
     logger.error('Transaction queue recovery failed on startup', { error: err.message });
   }
@@ -244,6 +370,7 @@ connectDatabase().then(async () => {
     logger.info('[Leader] Starting leader-only schedulers');
     startConsistencyScheduler();
     startReminderScheduler();
+    startPiiAnonymizationScheduler();
     startSessionCleanupScheduler();
     startReconciliationScheduler();
     startStuckPaymentReconciliationScheduler();
@@ -251,12 +378,15 @@ connectDatabase().then(async () => {
     startWebhookRetryScheduler();
     startReconciliationReportScheduler();
     startMetricsRollupScheduler();
+    startJobRecoveryScheduler();
+    startDisputeSlaScheduler();
   };
 
   const stopLeaderSchedulers = () => {
     logger.info('[Leader] Stopping leader-only schedulers');
     stopConsistencyScheduler();
     stopReminderScheduler();
+    stopPiiAnonymizationScheduler();
     stopSessionCleanupScheduler();
     stopReconciliationScheduler();
     stopStuckPaymentReconciliationScheduler();
@@ -264,6 +394,8 @@ connectDatabase().then(async () => {
     stopWebhookRetryScheduler();
     stopReconciliationReportScheduler();
     stopMetricsRollupScheduler();
+    stopJobRecoveryScheduler();
+    stopDisputeSlaScheduler();
   };
 
   leaderElection.register(startLeaderSchedulers, stopLeaderSchedulers);
@@ -271,6 +403,7 @@ connectDatabase().then(async () => {
 
 // Always-start services (handle concurrency internally)
    startPolling();
+   startStreaming();
    retrySelector.start();
    startTxQueueWorker();
    registerPaymentSavedSubscribers();
@@ -350,15 +483,16 @@ async function shutdown(signal) {
     await stopAcceptingNewWork();
     await drainWorkers();
     await notifySSEClients();
-    await closeQueues();
   } catch (err) {
     logger.error('Error during shutdown', { error: err.message });
   }
 
-  // (1) Stop accepting new connections; (2) wait for in-flight requests to finish;
-  // (3) only then close the database connection.
+  // Keep shared clients alive until in-flight requests finish, then close queue
+  // resources, Redis, and MongoDB in ownership order.
   server.close(async () => {
     try {
+      await closeQueues();
+      await closeRedisClients();
       await mongoose.disconnect();
       logger.info('MongoDB disconnected — clean exit');
       clearTimeout(forceExitTimer);

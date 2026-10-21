@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  labels:
+    app: mongodb
+spec:
+  serviceName: mongodb
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:7
+          # ── Single-node replica set ("rs0") — REQUIRED ─────────────────────
+          # Multi-document MongoDB transactions are used by the payment
+          # pipeline, fee batch operations and TransactionManager; a standalone
+          # mongod rejects every startTransaction() with "Transaction numbers
+          # are only allowed on a replica set member or mongos".
+          # --bind_ip_all is also required: mongod's default localhost-only
+          # bind would make the headless Service unreachable from other pods.
+          command:
+            - mongod
+            - --replSet
+            - rs0
+            - --bind_ip_all
+          # rs.initiate() can only run once mongod is up, so it happens in the
+          # postStart hook with retries. The pod is not READY (see readiness
+          # probe) until rs0 has elected this member PRIMARY.
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -ec
+                  - |
+                    for i in $(seq 1 60); do
+                      if mongosh --quiet --eval 'try { if (rs.status().ok === 1 && db.hello().isWritablePrimary) { process.exit(0); } } catch (e) {} process.exit(1);'; then
+                        exit 0
+                      fi
+                      mongosh --quiet --eval 'try { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongodb-0.mongodb:27017" }, { _id: 1, host: "mongodb-1.mongodb:27017" }, { _id: 2, host: "mongodb-2.mongodb:27017" }] }); } catch (e) {}' >/dev/null 2>&1 || true
+                      sleep 2
+                    done
+                    exit 1
+          ports:
+            - containerPort: 27017
+          env:
+            - name: MONGO_INITDB_DATABASE
+              value: stellaredupay
+          volumeMounts:
+            - name: mongodb-data
+              mountPath: /data/db
+          # READY means rs0 initiated AND this member is its writable primary —
+          # a plain ping passes even before initiation, which would let the
+          # backend route transactional writes to a node that must reject them.
+          readinessProbe:
+            exec:
+              command:
+                - mongosh
+                - --quiet
+                - --eval
+                - 'if (!db.hello().isWritablePrimary) { throw new Error("not primary"); }'
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - mongosh
+                - --eval
+                - "db.adminCommand({ping:1})"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+  volumeClaimTemplates:
+    - metadata:
+        name: mongodb-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 30Gi
+---
+# Headless service for stable pod DNS (mongodb-0.mongodb.<namespace>.svc.cluster.local).
+# The pods run a replica set ("rs0") because multi-document transactions require one —
+# see docs/architecture.md "Replica Set Requirement".
+# MONGO_URI in the stellaredupay Secret MUST therefore include the replica set:
+#   mongodb://mongodb-0.mongodb.<namespace>.svc.cluster.local:27017/stellaredupay?replicaSet=rs0
+# Or, to use MongoDB Atlas or another external managed service instead, omit
+# this StatefulSet and point MONGO_URI at the Atlas connection string.
+#
+# NOTE: This is the production-ready 3-node replica set for high availability.
+# For development and testing only, create a kustomization overlay that sets
+# replicas: 1 to reduce resource consumption. A single-replica StatefulSet
+# provides no failover protection but satisfies the transaction requirement.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  labels:
+    app: mongodb
+spec:
+  clusterIP: None
+  selector:
+    app: mongodb
+  ports:
+    - port: 27017
+      targetPort: 27017
+      protocol: TCP

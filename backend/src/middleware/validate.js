@@ -8,6 +8,16 @@ const {
   verifyPaymentSchema,
 } = require('./schemas/paymentSchemas');
 
+const {
+  getPaymentInstructionsQuerySchema,
+} = require('./schemas/paymentQuerySchemas');
+
+const {
+  getAllStudentsQuerySchema,
+  exportStudentsQuerySchema,
+  getStudentFeeHistoryQuerySchema,
+} = require('./schemas/studentQuerySchemas');
+
 function validate(schema, source = 'body') {
   return (req, res, next) => {
     const { error, value } = schema.validate(req[source], {
@@ -34,6 +44,24 @@ const validateVerifyPayment = validate(verifyPaymentSchema, 'body');
 
 const STUDENT_ID_RE = /^[\w-]{1,28}$/;
 
+// Issue #1543: names are interpolated into parent-facing emails and exports.
+// Normalise them and reject control characters / absurd lengths on input.
+const NAME_MAX_LENGTH = 100;
+const CLASS_MAX_LENGTH = 50;
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/;
+
+function normaliseName(value) {
+  return typeof value === 'string' ? value.normalize('NFC').trim().replace(/\s+/g, ' ') : '';
+}
+
+function nameError(field, value, maxLength) {
+  if (!value) return `${field} is required`;
+  if (value.length > maxLength) return `${field} must not exceed ${maxLength} characters`;
+  if (CONTROL_CHARS_RE.test(value)) return `${field} must not contain control characters`;
+  return null;
+}
+
 function validStudentId(id) {
   return typeof id === 'string' && STUDENT_ID_RE.test(id);
 }
@@ -56,6 +84,28 @@ function validateStudentIdParam(req, res, next) {
   return next();
 }
 
+/** Middleware: validate the query string of GET /payments/instructions/:studentId */
+function validatePaymentInstructionsQuery(req, res, next) {
+  const { error, value } = getPaymentInstructionsQuerySchema.validate(req.query, {
+    abortEarly: false,
+    convert:    true,
+  });
+
+  if (error) {
+    return res.status(400).json({
+      error: error.details[0].message,
+      code:  'VALIDATION_ERROR',
+      errors: error.details.map(detail => ({
+        field:   detail.context?.key || detail.path.join('.') || 'unknown',
+        message: detail.message,
+      })),
+    });
+  }
+
+  req.query = value;
+  return next();
+}
+
 /** Middleware: validate :txHash URL param */
 function validateTxHashParam(req, res, next) {
   if (!validTxHash(req.params.txHash)) {
@@ -75,17 +125,15 @@ function validateRegisterStudent(req, res, next) {
     errors.push({ field: 'studentId', message: 'studentId must be 3–20 alphanumeric/dash/underscore characters' });
   }
 
-  // name — required, sanitize
-  const name = typeof body.name === 'string' ? body.name.trim() : '';
-  if (!name) {
-    errors.push({ field: 'name', message: 'name is required' });
-  }
+  // name — required, normalised, length/control-character checked
+  const name = normaliseName(body.name);
+  const nameMsg = nameError('name', name, NAME_MAX_LENGTH);
+  if (nameMsg) errors.push({ field: 'name', message: nameMsg });
 
-  // class — required, sanitize
-  const className = typeof body.class === 'string' ? body.class.trim() : '';
-  if (!className) {
-    errors.push({ field: 'class', message: 'class is required' });
-  }
+  // class — required, normalised, length/control-character checked
+  const className = normaliseName(body.class);
+  const classMsg = nameError('class', className, CLASS_MAX_LENGTH);
+  if (classMsg) errors.push({ field: 'class', message: classMsg });
 
   // feeAmount — optional, but must be positive number if provided
   let feeAmount = body.feeAmount;
@@ -117,13 +165,84 @@ function validateFeeStructure(req, res, next) {
   return next();
 }
 
+function validateGetAllStudentsQuery(req, res, next) {
+  const { error, value } = getAllStudentsQuerySchema.validate(req.query, {
+    abortEarly: false,
+    convert: true,
+  });
+
+  if (error) {
+    return res.status(400).json({
+      error: error.details[0].message,
+      code: 'VALIDATION_ERROR',
+      errors: error.details.map(detail => ({
+        field: detail.context?.key || detail.path.join('.') || 'unknown',
+        message: detail.message,
+      })),
+    });
+  }
+
+  req.query = value;
+  return next();
+}
+
+function validateExportStudentsQuery(req, res, next) {
+  const { error, value } = exportStudentsQuerySchema.validate(req.query, {
+    abortEarly: false,
+    convert: true,
+  });
+
+  if (error) {
+    return res.status(400).json({
+      error: error.details[0].message,
+      code: 'VALIDATION_ERROR',
+      errors: error.details.map(detail => ({
+        field: detail.context?.key || detail.path.join('.') || 'unknown',
+        message: detail.message,
+      })),
+    });
+  }
+
+  req.query = value;
+  return next();
+}
+
+function validateGetStudentFeeHistoryQuery(req, res, next) {
+  const { error, value } = getStudentFeeHistoryQuerySchema.validate(req.query, {
+    abortEarly: false,
+    convert: true,
+  });
+
+  if (error) {
+    return res.status(400).json({
+      error: error.details[0].message,
+      code: 'VALIDATION_ERROR',
+      errors: error.details.map(detail => ({
+        field: detail.context?.key || detail.path.join('.') || 'unknown',
+        message: detail.message,
+      })),
+    });
+  }
+
+  req.query = value;
+  return next();
+}
+
 module.exports = {
   validate,
+  normaliseName,
+  nameError,
+  NAME_MAX_LENGTH,
+  CLASS_MAX_LENGTH,
   validateCreatePaymentIntent,
   validateSubmitTransaction,
   validateVerifyPayment,
   validateStudentIdParam,
+  validatePaymentInstructionsQuery,
   validateTxHashParam,
   validateRegisterStudent,
   validateFeeStructure,
+  validateGetAllStudentsQuery,
+  validateExportStudentsQuery,
+  validateGetStudentFeeHistoryQuery,
 };

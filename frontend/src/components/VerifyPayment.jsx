@@ -1,14 +1,16 @@
 import { useState, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { verifyPayment } from "../services/api";
 import { parseStellarError } from "../utils/stellarErrors";
 import { getErrorMessage } from "../utils/errorMessages";
+import { validateStellarTxHash } from "../utils/stellarTxHash";
 import { IconAlertTriangle, IconCheck, IconExternalLink, IconShield } from "./Icons";
 
 const STATUS_BADGE = {
-  valid:     { cls: "badge badge-success", label: "Valid" },
-  overpaid:  { cls: "badge badge-warning", label: "Overpaid" },
-  underpaid: { cls: "badge badge-danger",  label: "Underpaid" },
-  unknown:   { cls: "badge badge-neutral", label: "Unknown" },
+  valid:     { cls: "badge badge-success", key: "status.validation.valid" },
+  overpaid:  { cls: "badge badge-warning", key: "status.validation.overpaid" },
+  underpaid: { cls: "badge badge-danger",  key: "status.validation.underpaid" },
+  unknown:   { cls: "badge badge-neutral", key: "status.validation.unknown" },
 };
 
 function InfoRow({ label, children, mono }) {
@@ -36,7 +38,9 @@ function InfoRow({ label, children, mono }) {
 }
 
 export default function VerifyPayment() {
+  const { t } = useTranslation();
   const [txHash, setTxHash]               = useState("");
+  const [fieldError, setFieldError]       = useState("");
   const [result, setResult]               = useState(null);
   const [error, setError]                 = useState("");
   const [stellarStatusUrl, setStellarStatusUrl] = useState(null);
@@ -45,9 +49,22 @@ export default function VerifyPayment() {
 
   async function handleSubmit(e) {
     e.preventDefault();
-    setError(""); setResult(null); setStellarStatusUrl(null); setLoading(true);
+    setError(""); setResult(null); setStellarStatusUrl(null);
+
+    const validation = validateStellarTxHash(txHash);
+    if (!validation.valid) {
+      setFieldError(
+        validation.code === "REQUIRED"
+          ? (t("verifyPayment.txHashRequired") || validation.error)
+          : (t("verifyPayment.invalidTxHash") || validation.error)
+      );
+      return;
+    }
+    setFieldError("");
+    setLoading(true);
+
     try {
-      const res = await verifyPayment(txHash.trim());
+      const res = await verifyPayment(validation.normalized || txHash.trim());
       setResult(res.data);
     } catch (err) {
       const stellar = parseStellarError(err);
@@ -57,7 +74,7 @@ export default function VerifyPayment() {
       } else {
         setError(
           getErrorMessage(err.response?.data?.code, err.response?.data?.error) ||
-          "Verification failed. Check the transaction hash and try again."
+          t("verifyPayment.verificationFailed")
         );
         setStellarStatusUrl(null);
       }
@@ -74,27 +91,50 @@ export default function VerifyPayment() {
     <div className="card">
       <div className="card-header">
         <div className="card-title" style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-          <IconShield size={15} /> Verify Payment
+          <IconShield size={15} /> {t("verifyPayment.title")}
         </div>
       </div>
       <div className="card-body">
         <p style={{ fontSize: "0.875rem", color: "var(--text-muted)", marginBottom: "1.25rem" }}>
-          Confirm a payment was recorded by entering its Stellar transaction hash.
+          {t("verifyPayment.intro")}
         </p>
 
         <form onSubmit={handleSubmit}>
           <div className="form-group">
-            <label htmlFor="txin" className="form-label">Transaction Hash</label>
+            <label htmlFor="txin" className="form-label">{t("verifyPayment.txHashLabel")}</label>
             <input
               id="txin"
               type="text"
-              placeholder="e.g. 3389e9f0f1a65f19…"
+              placeholder={t("verifyPayment.txHashPlaceholder")}
               value={txHash}
-              onChange={e => setTxHash(e.target.value)}
+              onChange={e => {
+                setTxHash(e.target.value);
+                if (fieldError) setFieldError("");
+              }}
               required
+              aria-invalid={!!fieldError}
+              aria-describedby={fieldError ? "txin-err" : undefined}
               className="form-input"
-              style={{ fontFamily: "monospace", fontSize: "0.85rem" }}
+              style={{
+                fontFamily: "monospace",
+                fontSize: "0.85rem",
+                borderColor: fieldError ? "var(--danger, #dc2626)" : undefined,
+              }}
             />
+            {fieldError && (
+              <span
+                id="txin-err"
+                role="alert"
+                style={{
+                  display: "block",
+                  color: "var(--danger, #dc2626)",
+                  fontSize: "0.78rem",
+                  marginTop: "0.3rem",
+                }}
+              >
+                {fieldError}
+              </span>
+            )}
           </div>
           <button
             type="submit"
@@ -102,7 +142,7 @@ export default function VerifyPayment() {
             className="btn btn-dark"
             style={{ width: "100%" }}
           >
-            {loading ? "Verifying…" : "Verify Transaction"}
+            {loading ? t("verifyPayment.verifying") : t("verifyPayment.submit")}
           </button>
         </form>
 
@@ -118,7 +158,7 @@ export default function VerifyPayment() {
                   rel="noopener noreferrer"
                   style={{ display: "block", marginTop: "0.375rem", color: "inherit", fontWeight: 600, textDecoration: "underline" }}
                 >
-                  Check Stellar Network Status ↗
+                  {t("verifyPayment.checkNetworkStatus")}
                 </a>
               )}
             </div>
@@ -130,30 +170,30 @@ export default function VerifyPayment() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
                 <IconCheck size={15} style={{ color: "var(--success-text)" }} />
-                <span style={{ fontWeight: 600, fontSize: "0.9rem" }}>Transaction Found</span>
+                <span style={{ fontWeight: 600, fontSize: "0.9rem" }}>{t("verifyPayment.transactionFound")}</span>
               </div>
-              <span className={badge.cls}>{badge.label}</span>
+              <span className={badge.cls}>{t(badge.key)}</span>
             </div>
 
-            <InfoRow label="Amount">
+            <InfoRow label={t("verifyPayment.amount")}>
               {result.amount}{" "}
               <span style={{ fontSize: "0.72rem", fontWeight: 600, color: "var(--text-muted)" }}>
                 {result.assetCode || "XLM"}
               </span>
             </InfoRow>
-            <InfoRow label="Memo (Student ID)" mono>{result.memo}</InfoRow>
-            <InfoRow label="Date">
+            <InfoRow label={t("verifyPayment.memoLabel")} mono>{result.memo}</InfoRow>
+            <InfoRow label={t("verifyPayment.date")}>
               {result.date ? new Date(result.date).toLocaleString() : "—"}
             </InfoRow>
             {result.feeValidation?.message && (
-              <InfoRow label="Note">
+              <InfoRow label={t("verifyPayment.note")}>
                 <span style={{ color: st === "valid" ? "var(--success-text)" : "var(--warning-text)" }}>
                   {result.feeValidation.message}
                 </span>
               </InfoRow>
             )}
             <div style={{ padding: "0.625rem 0" }}>
-              <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "0.25rem" }}>Tx Hash</div>
+              <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "0.25rem" }}>{t("verifyPayment.txHash")}</div>
               <div style={{ fontFamily: "monospace", fontSize: "0.78rem", wordBreak: "break-all", color: "var(--text)" }}>
                 {result.hash}
               </div>
@@ -164,7 +204,7 @@ export default function VerifyPayment() {
                   rel="noopener noreferrer"
                   style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem", marginTop: "0.5rem", color: "var(--accent)", fontSize: "0.8125rem", fontWeight: 600 }}
                 >
-                  View on Stellar Explorer <IconExternalLink size={12} />
+                  {t("verifyPayment.viewExplorer")} <IconExternalLink size={12} />
                 </a>
               )}
             </div>

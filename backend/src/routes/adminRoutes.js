@@ -3,29 +3,97 @@
 const express = require('express');
 const router = express.Router();
 const { setLogLevel } = require('../controllers/adminController');
-const { listDLQ, retryDLQEntry, replayWebhook } = require('../controllers/webhookAdminController');
+const {
+  listDLQ,
+  retryDLQEntry,
+  replayWebhook,
+  listV1Endpoints,
+  notifyV1Endpoints,
+} = require('../controllers/webhookAdminController');
+const { healthDetails } = require('../controllers/healthController');
+const { getOpsOverview } = require('../controllers/opsAdminController');
 const {
   getBacklog,
   listDeadLetterVerifications,
   getDeadLetterVerification,
   retryDeadLetterVerification,
 } = require('../controllers/pendingVerificationAdminController');
+const {
+  getLimits,
+  updateLimits,
+  deleteSchoolLimits,
+} = require('../controllers/paymentLimitsAdminController');
+const {
+  listFailedJobs,
+  getFailedJobDetails,
+  retryFailedJob,
+  discardFailedJob,
+  getQueueStats,
+} = require('../controllers/bullMQAdminController');
+const {
+  listDeadLetterEvents,
+  getDeadLetterEventDetails,
+  replayDeadLetterEvent,
+  discardDeadLetterEvent,
+  getOutboxStats,
+} = require('../controllers/outboxAdminController');
 const { requireAdminAuth } = require('../middleware/auth');
 const { auditContext } = require('../middleware/auditContext');
 
 // POST /api/admin/log-level — change log level at runtime
 router.post('/log-level', requireAdminAuth, auditContext, setLogLevel);
 
+// GET /api/admin/streaming — Horizon SSE streaming status (Issue #1570)
+router.get('/streaming', requireAdminAuth, (req, res) => {
+  try {
+    const { getStreamStatus } = require('../services/horizonStreamingService');
+    res.json(getStreamStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Webhook dead-letter queue admin endpoints
 router.get('/webhooks/dlq', requireAdminAuth, listDLQ);
 router.post('/webhooks/dlq/:id/retry', requireAdminAuth, auditContext, retryDLQEntry);
+// Webhook V1 signature sunset report + advance notice (Issue #1539).
+// Registered before /webhooks/:id/replay so "v1-endpoints" is never read as an :id.
+router.get('/webhooks/v1-endpoints', requireAdminAuth, listV1Endpoints);
+router.post('/webhooks/v1-endpoints/notify', requireAdminAuth, auditContext, notifyV1Endpoints);
 // Manual replay — accepts any delivery status (Issue #73)
 router.post('/webhooks/:id/replay', requireAdminAuth, auditContext, replayWebhook);
+
+// Detailed health diagnostics (Issue #1540) — the public /health returns only
+// { status }; hostnames, endpoints, counters and error reasons live here.
+router.get('/health/details', requireAdminAuth, healthDetails);
 
 // Stellar verification retry backlog / dead-letter admin endpoints
 router.get('/pending-verifications/backlog', requireAdminAuth, getBacklog);
 router.get('/pending-verifications/dead-letter', requireAdminAuth, listDeadLetterVerifications);
 router.get('/pending-verifications/:id', requireAdminAuth, getDeadLetterVerification);
 router.post('/pending-verifications/:id/retry', requireAdminAuth, auditContext, retryDeadLetterVerification);
+
+// Payment limits — runtime-configurable fraud control (#1117). Every mutation
+// is audit-logged by the controller.
+router.get('/payment-limits', requireAdminAuth, getLimits);
+router.put('/payment-limits', requireAdminAuth, auditContext, updateLimits);
+router.delete('/payment-limits/:schoolId', requireAdminAuth, auditContext, deleteSchoolLimits);
+
+// BullMQ retry queue admin endpoints (Issue #1336)
+router.get('/retry-queue/failed', requireAdminAuth, listFailedJobs);
+router.get('/retry-queue/failed/:jobId', requireAdminAuth, getFailedJobDetails);
+router.post('/retry-queue/failed/:jobId/retry', requireAdminAuth, auditContext, retryFailedJob);
+router.delete('/retry-queue/failed/:jobId', requireAdminAuth, auditContext, discardFailedJob);
+router.get('/retry-queue/stats', requireAdminAuth, getQueueStats);
+
+// Outbox dead-letter queue admin endpoints (Issue #1339)
+router.get('/outbox/dead-letter', requireAdminAuth, listDeadLetterEvents);
+router.get('/outbox/dead-letter/:eventId', requireAdminAuth, getDeadLetterEventDetails);
+router.post('/outbox/dead-letter/:eventId/replay', requireAdminAuth, auditContext, replayDeadLetterEvent);
+router.delete('/outbox/dead-letter/:eventId', requireAdminAuth, auditContext, discardDeadLetterEvent);
+router.get('/outbox/stats', requireAdminAuth, getOutboxStats);
+
+// Operations overview — per-school payment detection health (#1817)
+router.get('/ops/overview', requireAdminAuth, getOpsOverview);
 
 module.exports = router;

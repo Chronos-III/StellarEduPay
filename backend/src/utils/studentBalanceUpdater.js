@@ -1,0 +1,144 @@
+'use strict';
+
+/**
+ * Shared utility for updating student balance fields after a successful payment.
+ *
+ * Used by verifyPayment, submitTransaction, and syncPaymentsForSchool to ensure
+ * consistent balance computation across all payment recording paths.
+ * Issue #1034: Consolidates three divergent implementations into one.
+ */
+
+const Student = require('../models/studentModel');
+const Payment = require('../models/paymentModel');
+const { toMoney, decimalFromMongo, classifyFeePayment } = require('./money');
+
+/**
+ * Canonical feeValidationStatus vocabulary (Issue #1766).
+ *
+ * `classifyFeePayment` is the single source of truth for classifying a
+ * cumulative total against the fee. This helper maps its result onto the
+ * `Payment.feeValidationStatus` enum so every writer (verify, sync, poller)
+ * records the same value for the same economic event:
+ *   - 'valid'      cumulative total equals the fee
+ *   - 'partial'    cumulative total below the fee (accepted installment)
+ *   - 'overpaid'   cumulative total above the fee
+ *   - 'unknown'    fee amount not available / not classifiable
+ *
+ * @param {Object} classification - Result of classifyFeePayment
+ * @returns {'valid'|'partial'|'overpaid'|'unknown'}
+ */
+function feeValidationStatusFromClassification(classification) {
+  if (!classification || classification.feeAmount === null || classification.feeAmount === undefined) {
+    return 'unknown';
+  }
+  if (classification.feePaid) {
+    return 'valid';
+  }
+  if (classification.remainingBalance && classification.remainingBalance.greaterThan(0)) {
+    return 'partial';
+  }
+  return 'overpaid';
+}
+
+/**
+ * Update a student's balance fields (totalPaid, remainingBalance, feePaid) after
+ * a successful payment is recorded.
+ *
+ * @param {string} schoolId - School ID
+ * @param {string} studentId - Student ID
+ * @param {Object} options - Optional configuration
+ * @param {Object} options.session - Mongoose session for transaction (if applicable)
+ * @param {boolean} options.includeFeeCategoryBreakdown - Whether to update individual fee categories
+ * @returns {Promise<Object>} - Updated student object or null if not found
+ */
+async function updateStudentBalance(schoolId, studentId, options = {}) {
+  const { session = null, includeFeeCategoryBreakdown = true } = options;
+
+  // Fetch the current student record
+  const student = await Student.findOne({ schoolId, studentId }).session(session);
+  if (!student) {
+    return null;
+  }
+
+  // Aggregate all successful, non-suspicious payments for this student.
+  // Summed via $toDecimal (#1123 money-representation fix) so MongoDB adds
+  // the amounts in exact Decimal128 space instead of accumulating float
+  // error across every installment for the life of the account.
+  const paymentAgg = await Payment.aggregate([
+    {
+      $match: {
+        schoolId,
+        studentId,
+        deletedAt: null,
+        status: 'SUCCESS',
+        isSuspicious: false,
+      },
+    },
+    { $group: { _id: null, total: { $sum: { $toDecimal: '$amount' } } } },
+  ]).session(session);
+
+  const paymentTotal = paymentAgg.length ? decimalFromMongo(paymentAgg[0].total) : toMoney(0);
+
+  // Include creditAdjustments in the cumulative total (Issue #1473).
+  // creditAdjustments represent manual partial-credit overrides applied by admins
+  // and must be included in the expected total so they are never silently reverted
+  // by subsequent reconciliation or balance update runs.
+  const creditAdjustments = toMoney(student.creditAdjustments || 0);
+  const cumulativeTotal = toMoney(paymentTotal.plus(creditAdjustments));
+  const classification = classifyFeePayment(cumulativeTotal, student.feeAmount);
+
+  // Compute top-level student balance
+  const updateData = {
+    totalPaid: classification.cumulativeTotal,
+    remainingBalance: classification.remainingBalance,
+    feePaid: classification.feePaid,
+  };
+
+  // If student has per-category fees, update those balances too
+  if (includeFeeCategoryBreakdown && student.fees && student.fees.length > 0) {
+    const feesUpdated = [...student.fees];
+
+    for (let i = 0; i < feesUpdated.length; i++) {
+      const category = feesUpdated[i].category;
+
+      const categoryPayments = await Payment.aggregate([
+        {
+          $match: {
+            schoolId,
+            studentId,
+            feeCategory: category,
+            deletedAt: null,
+            status: 'SUCCESS',
+            isSuspicious: false,
+          },
+        },
+        { $group: { _id: null, total: { $sum: { $toDecimal: '$amount' } } } },
+      ]).session(session);
+
+      const categoryTotalDecimal = categoryPayments.length
+        ? decimalFromMongo(categoryPayments[0].total)
+        : toMoney(0);
+      const categoryClassification = classifyFeePayment(categoryTotalDecimal, feesUpdated[i].amount);
+
+      feesUpdated[i].totalPaid = categoryClassification.cumulativeTotal;
+      feesUpdated[i].remainingBalance = categoryClassification.remainingBalance;
+      feesUpdated[i].paid = categoryClassification.feePaid;
+    }
+
+    updateData.fees = feesUpdated;
+  }
+
+  // Persist the update
+  const updatedStudent = await Student.findOneAndUpdate(
+    { schoolId, studentId },
+    updateData,
+    { new: true, session }
+  );
+
+  return updatedStudent;
+}
+
+module.exports = {
+  updateStudentBalance,
+  feeValidationStatusFromClassification,
+};

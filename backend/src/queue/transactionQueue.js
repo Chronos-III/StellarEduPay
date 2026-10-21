@@ -17,18 +17,52 @@
  *     Called once at startup.  Finds all PendingVerification docs with
  *     status=pending|processing and re-enqueues them into BullMQ so they are
  *     not silently dropped after a crash or restart.
- *
- *   markResolved(txHash) / markDead(txHash, error)
- *     Called by the worker after a job succeeds or permanently fails.
+ * *   markResolved(txHash) / markDead(txHash, error) / markInterrupted(txHash, reason)
+ *   Called by the worker after a job succeeds, terminally fails, or is killed
+ *   by a shutdown drain timeout respectively. markInterrupted resets the doc to
+ *   `pending` so the next recoverPendingJobs() picks it up.
  */
 
 const { Queue, Worker } = require('bullmq');
 const PendingVerification = require('../models/pendingVerificationModel');
 const logger = require('../utils/logger');
 const { resolveCorrelationId } = require('../utils/correlationId');
-const { getRedisClient } = require('../config/redisClient');
+const { getRedisClient, isRedisReady } = require('../config/redisClient');
+const { transactionQueueProcessingDurationSeconds, transactionQueueFailedTotal } = require('../metrics');
 
 const QUEUE_NAME = 'transaction-processing';
+
+// Retry/backoff tuning for recoverPendingJobsWithRetry() — see #1381.
+const RECOVERY_MAX_RETRIES = parseInt(process.env.JOB_RECOVERY_MAX_RETRIES, 10) || 5;
+const RECOVERY_BASE_DELAY_MS = parseInt(process.env.JOB_RECOVERY_BASE_DELAY_MS, 10) || 2000;
+const RECOVERY_MAX_DELAY_MS = parseInt(process.env.JOB_RECOVERY_MAX_DELAY_MS, 10) || 30000;
+
+/**
+ * Last-known state of pending-job recovery, surfaced by /health (#1381) so a
+ * stuck recovery (Redis unavailable past the retry budget) is a visible,
+ * alertable signal rather than a silent log line.
+ *
+ * status: 'not_run' | 'ok' | 'degraded' | 'disabled'
+ *   'ok'       — the most recent attempt reached BullMQ successfully.
+ *   'degraded' — Redis was not ready when startup recovery gave up; the
+ *                periodic jobRecoveryScheduler will keep retrying.
+ *   'disabled' — Redis is not configured; MongoDB is the only durability layer.
+ */
+let recoveryStatus = {
+  status: 'not_run',
+  lastAttemptAt: null,
+  lastSuccessAt: null,
+  lastError: null,
+  recovered: 0,
+};
+
+function getRecoveryStatus() {
+  return { ...recoveryStatus };
+}
+
+function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const connection = getRedisClient();
  let transactionQueue = null;
@@ -107,6 +141,28 @@ async function markDead(txHash, error) {
     {
       status: 'dead_letter',
       lastError: error?.message || String(error),
+    },
+    { _bypassTenantScope: true }
+  );
+}
+
+/**
+ * Mark a PendingVerification document as pending again after it was interrupted
+ * by a graceful-shutdown timeout (drainWorker). The original job is NOT a
+ * terminal failure — the worker was simply killed mid-flight because the drain
+ * budget expired. Resetting to `pending` ensures the next `recoverPendingJobs()`
+ * startup sweep re-queues it. Using `dead_letter` here would orphan the job,
+ * since `recoverPendingJobs` only picks up `pending|processing` documents.
+ *
+ * Bypass is required: drainWorker has txHash but not schoolId; txHash is globally unique.
+ */
+async function markInterrupted(txHash, reason) {
+  await PendingVerification.findOneAndUpdate(
+    { txHash },
+    {
+      status: 'pending',
+      lastError: reason?.message || String(reason),
+      lastAttemptAt: new Date(),
     },
     { _bypassTenantScope: true }
   );
@@ -211,6 +267,71 @@ async function recoverPendingJobs() {
 }
 
 /**
+ * Startup-safe wrapper around recoverPendingJobs() (#1381).
+ *
+ * If Redis is unavailable when this runs, waiting immediately and giving up
+ * strands every job that survived a restart in MongoDB with status=pending
+ * until the next full process restart. Instead this retries with exponential
+ * backoff, waiting for Redis to become ready before attempting recovery.
+ *
+ * If Redis never becomes ready within the retry budget, recovery is marked
+ * 'degraded' rather than failing the whole startup — recoverPendingJobs() will
+ * be retried again by the periodic jobRecoveryScheduler (leader-only) as soon
+ * as Redis reconnects, so jobs are not permanently stuck.
+ *
+ * @param {{maxRetries?: number, baseDelayMs?: number, maxDelayMs?: number}} [options]
+ * @returns {Promise<number>} number of jobs recovered (0 if Redis never became ready)
+ */
+async function recoverPendingJobsWithRetry(options = {}) {
+  const maxRetries = options.maxRetries ?? RECOVERY_MAX_RETRIES;
+  const baseDelayMs = options.baseDelayMs ?? RECOVERY_BASE_DELAY_MS;
+  const maxDelayMs = options.maxDelayMs ?? RECOVERY_MAX_DELAY_MS;
+
+  recoveryStatus.lastAttemptAt = new Date().toISOString();
+
+  if (!transactionQueue) {
+    recoveryStatus.status = 'disabled';
+    logger.warn('[TransactionQueue] Skipping recovery — BullMQ unavailable (Redis not configured)');
+    return 0;
+  }
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (isRedisReady()) break;
+    if (attempt === maxRetries) {
+      recoveryStatus.status = 'degraded';
+      recoveryStatus.lastError = 'Redis did not become ready within the retry budget';
+      logger.error(
+        '[TransactionQueue] Startup job recovery gave up waiting for Redis — pending jobs ' +
+        'remain in MongoDB; the periodic recovery scheduler will retry once Redis is available',
+        { attempts: attempt + 1 }
+      );
+      return 0;
+    }
+    const delay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
+    logger.warn('[TransactionQueue] Redis not ready for job recovery, retrying with backoff', {
+      attempt: attempt + 1,
+      maxRetries,
+      delayMs: delay,
+    });
+    await _sleep(delay);
+  }
+
+  try {
+    const recovered = await recoverPendingJobs();
+    recoveryStatus.status = 'ok';
+    recoveryStatus.lastSuccessAt = new Date().toISOString();
+    recoveryStatus.lastError = null;
+    recoveryStatus.recovered = recovered;
+    return recovered;
+  } catch (err) {
+    recoveryStatus.status = 'degraded';
+    recoveryStatus.lastError = err.message;
+    logger.error('[TransactionQueue] Job recovery failed after Redis became ready', { error: err.message });
+    return 0;
+  }
+}
+
+/**
  * Get the current status of a queued transaction job.
  * @param {string} txHash
  */
@@ -235,6 +356,21 @@ async function getJobStatus(txHash) {
 }
 
 /**
+ * Get current actionable job counts for the transaction processing queue.
+ * Used by the transaction_queue_depth Prometheus gauge.
+ */
+async function getQueueCounts() {
+  if (!transactionQueue) return null;
+  const [waiting, active, delayed, failed] = await Promise.all([
+    transactionQueue.getWaitingCount(),
+    transactionQueue.getActiveCount(),
+    transactionQueue.getDelayedCount(),
+    transactionQueue.getFailedCount(),
+  ]);
+  return { waiting, active, delayed, failed };
+}
+
+/**
  * Start the BullMQ worker that processes queued transactions.
  * The processor function is injected so this module stays decoupled
  * from the payment controller / stellar service.
@@ -253,21 +389,28 @@ function startTransactionWorker(processor) {
      concurrency: parseInt(process.env.TX_QUEUE_CONCURRENCY, 10) || 5,
    });
 
-  worker.on('completed', (job) =>
+  worker.on('completed', (job) => {
     logger.info('[TransactionQueue] Job completed', {
       jobId: job.id,
       txHash: job.data.txHash,
       correlationId: job.data.correlationId || null,
-    })
-  );
-  worker.on('failed', (job, err) =>
+    });
+    if (job.processedOn && job.finishedOn) {
+      transactionQueueProcessingDurationSeconds.observe((job.finishedOn - job.processedOn) / 1000);
+    }
+  });
+  worker.on('failed', (job, err) => {
     logger.error('[TransactionQueue] Job failed', {
       jobId: job?.id,
       txHash: job?.data?.txHash,
       correlationId: job?.data?.correlationId || null,
       error: err.message,
-    })
-  );
+    });
+    transactionQueueFailedTotal.inc();
+    if (job?.processedOn && job?.finishedOn) {
+      transactionQueueProcessingDurationSeconds.observe((job.finishedOn - job.processedOn) / 1000);
+    }
+  });
 
   logger.info('[TransactionQueue] Worker started', {
     concurrency: parseInt(process.env.TX_QUEUE_CONCURRENCY, 10) || 5,
@@ -290,10 +433,6 @@ async function closeQueue() {
        logger.info('[TransactionQueue] Queue closed');
      }
 
-     if (connection && typeof connection.quit === 'function') {
-       await connection.quit();
-       logger.info('[TransactionQueue] Redis connection closed');
-     }
    } catch (err) {
      logger.error('[TransactionQueue] Failed to close queue', { error: err.message });
    }
@@ -335,7 +474,11 @@ async function drainWorker() {
       try {
         const jobState = await job.getState();
         if (jobState === 'active') {
-          await markDead(job.data.txHash, { message: 'Job interrupted by shutdown — will be recovered on restart' });
+          // Drain-timeout interruption: the job is NOT a terminal failure, the
+          // worker was simply killed mid-flight because DRAIN_TIMEOUT_MS expired.
+          // Reset status to 'pending' (not 'dead_letter') so recoverPendingJobs()
+          // on the next boot picks it up.
+          await markInterrupted(job.data.txHash, { message: 'Job interrupted by shutdown drain timeout — will be recovered on restart' });
           requeuedJobs++;
           logger.info('[TransactionQueue] Re-queued interrupted job for recovery', { txHash: job.data.txHash });
         }
@@ -366,9 +509,13 @@ module.exports = {
    startTransactionWorker,
    closeQueue,
    recoverPendingJobs,
+   recoverPendingJobsWithRetry,
+   getRecoveryStatus,
    markResolved,
    markDead,
+   markInterrupted,
    drainWorker,
    getWorker,
+   getQueueCounts,
    QUEUE_NAME,
  };

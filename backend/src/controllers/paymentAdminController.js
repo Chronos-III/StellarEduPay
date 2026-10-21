@@ -13,10 +13,10 @@ const { finalizeConfirmedPayments } = require('../services/stellarService');
 const { logAudit } = require('../services/auditService');
 const { syncDurationSeconds } = require('../metrics');
 const { syncPaymentsForSchool } = require('../services/stellarService');
-const { initiateRefund, getRefundsByPayment, getRefundsBySchool } = require('../services/refundService');
+const { initiateRefund, approveRefund, rejectRefund, completeRefund, buildPrincipal, getRefundsByPayment, getRefundsBySchool } = require('../services/refundService');
 const { generateReconciliationReport } = require('../services/reconciliationService');
 const lock = require('../services/distributedLock');
-const { ADMIN_PAYMENT_STATUS_TRANSITIONS } = require('../constants/paymentStatus');
+const { ADMIN_PAYMENT_STATUS_TRANSITIONS, PAYMENT_STATUS } = require('../constants/paymentStatus');
 
 // TTL for the per-school distributed sync lock (60 s — long enough to complete
 // a full blockchain sync while short enough to auto-expire after a crash).
@@ -141,7 +141,7 @@ async function generateReceipt(req, res, next) {
     const existing = await Receipt.findOne({ txHash, schoolId });
     if (existing) return res.json(existing);
 
-    const payment = await Payment.findOne({ txHash, schoolId, status: 'SUCCESS' });
+    const payment = await Payment.findOne({ txHash, schoolId, status: PAYMENT_STATUS.SUCCESS });
     if (!payment) {
       return res.status(404).json({ error: 'Confirmed payment not found for this transaction hash', code: 'NOT_FOUND' });
     }
@@ -216,12 +216,82 @@ async function unlockPayment(req, res, next) {
   }
 }
 
+/** Default page size for the dead-letter listing. */
+const DLQ_DEFAULT_PAGE_SIZE = 100;
+/** Upper bound on how many dead-letter jobs one page may return. */
+const DLQ_MAX_PAGE_SIZE = 500;
+
+/**
+ * Parses ?start=&end= into a BullMQ range. `end` is inclusive, matching
+ * BullMQ's getFailed(start, end) semantics.
+ * @param {object} query
+ * @returns {{start: number, end: number}}
+ */
+function parseDlqRange(query) {
+  const start = Math.max(0, parseInt(query.start, 10) || 0);
+  const rawEnd = parseInt(query.end, 10);
+  const end = Number.isFinite(rawEnd) && rawEnd >= start
+    ? Math.min(rawEnd, start + DLQ_MAX_PAGE_SIZE - 1)
+    : start + DLQ_DEFAULT_PAGE_SIZE - 1;
+  return { start, end };
+}
+
+/**
+ * Whether the caller may see dead-letter jobs across all schools.
+ * Only super-admins (requireAdminAuth) get the unscoped view; school
+ * owner/staff callers are always scoped to req.schoolId.
+ * @param {object} req
+ * @returns {boolean}
+ */
+function isDlqCrossTenantViewer(req) {
+  return Boolean(req.admin) && !req.schoolId;
+}
+
+/**
+ * Whether a dead-letter job belongs to the given school.
+ * @param {object} job
+ * @param {string} schoolId
+ * @returns {boolean}
+ */
+function jobBelongsToSchool(job, schoolId) {
+  return Boolean(job && job.data && String(job.data.schoolId) === String(schoolId));
+}
+
 async function getDeadLetterJobs(req, res, next) {
   try {
     const { getDeadLetterQueue } = require('../config/retryQueueSetup');
     const queue = getDeadLetterQueue();
-    const jobs = queue ? await queue.getFailed(0, 99) : [];
-    res.json({ jobs: jobs.map((j) => ({ id: j.id, name: j.name, data: j.data, failedReason: j.failedReason })) });
+    if (!queue) return res.json({ jobs: [], total: 0 });
+
+    const { start, end } = parseDlqRange(req.query || {});
+    const crossTenant = isDlqCrossTenantViewer(req);
+    const schoolId = req.schoolId;
+
+    // The BullMQ dead-letter queue is global, so school callers must filter by
+    // job.data.schoolId. Scan in batches until the requested page is filled or
+    // the queue is exhausted, so a school's jobs are not hidden behind other
+    // schools' failures.
+    const scanBatch = DLQ_MAX_PAGE_SIZE;
+    const jobs = [];
+    let total = 0;
+    let offset = 0;
+    let exhausted = false;
+
+    while (!exhausted && jobs.length <= end) {
+      const batch = await queue.getFailed(offset, offset + scanBatch - 1);
+      if (!batch || batch.length === 0) break;
+      for (const job of batch) {
+        if (!crossTenant && !jobBelongsToSchool(job, schoolId)) continue;
+        if (total >= start && jobs.length <= end) {
+          jobs.push({ id: job.id, name: job.name, data: job.data, failedReason: job.failedReason });
+        }
+        total += 1;
+      }
+      offset += batch.length;
+      if (batch.length < scanBatch) exhausted = true;
+    }
+
+    res.json({ jobs, total, start, end });
   } catch (err) {
     next(err);
   }
@@ -234,7 +304,12 @@ async function retryDeadLetterJob(req, res, next) {
     const queue = getDeadLetterQueue();
     if (!queue) return res.status(503).json({ error: 'Retry queue unavailable', code: 'SERVICE_UNAVAILABLE' });
     const job = await queue.getJob(jobId);
+    // Return 404 (not 403) for another school's job so job ids are not
+    // enumerable across tenants.
     if (!job) return res.status(404).json({ error: 'Job not found', code: 'NOT_FOUND' });
+    if (!isDlqCrossTenantViewer(req) && !jobBelongsToSchool(job, req.schoolId)) {
+      return res.status(404).json({ error: 'Job not found', code: 'NOT_FOUND' });
+    }
     await job.retry();
     res.json({ message: 'Job queued for retry', jobId });
   } catch (err) {
@@ -281,47 +356,171 @@ async function getStuckPayments(req, res, next) {
 // transitions like DISPUTED → REFUNDED in addition to the normal set.
 const ALLOWED_TRANSITIONS = ADMIN_PAYMENT_STATUS_TRANSITIONS;
 
+/**
+ * Applies one admin status transition, school-scoped, and writes the audit
+ * entry. Shared by the single-payment and bulk endpoints so the two can never
+ * diverge on validation, the transition table, or what gets audited.
+ *
+ * @param {object} params
+ * @param {object} params.req - The request, for schoolId and auditContext
+ * @param {string} params.txHash
+ * @param {string} params.newStatus
+ * @param {string} params.reason
+ * @returns {Promise<object>} ok:true with the payment, or ok:false with error and code
+ */
+async function applyStatusTransition({ req, txHash, newStatus, reason }) {
+  const payment = await Payment.findOne({ schoolId: req.schoolId, txHash });
+  if (!payment) {
+    return { ok: false, error: 'Payment not found', code: 'NOT_FOUND' };
+  }
+
+  const previousStatus = payment.status;
+  const allowed = ALLOWED_TRANSITIONS[previousStatus] || [];
+  if (!allowed.includes(newStatus)) {
+    return {
+      ok: false,
+      error: `Cannot transition from ${previousStatus} to ${newStatus}`,
+      code: 'INVALID_TRANSITION',
+    };
+  }
+
+  // Set $locals.adminOverride so the pre-save hook uses ADMIN_PAYMENT_STATUS_TRANSITIONS
+  // instead of the narrower PAYMENT_STATUS_TRANSITIONS.  $locals is Mongoose's
+  // per-document transient store — it is never persisted and survives through save().
+  payment.$locals.adminOverride = true;
+  payment.status = newStatus;
+  const updated = await payment.save();
+
+  await logAudit({
+    schoolId: req.schoolId,
+    action: 'payment_status_update',
+    performedBy: req.auditContext?.performedBy || 'unknown',
+    targetId: txHash,
+    targetType: 'payment',
+    details: { from: previousStatus, to: newStatus, reason, adminOverride: true },
+    result: 'success',
+    ipAddress: req.auditContext?.ipAddress,
+    userAgent: req.auditContext?.userAgent,
+  });
+
+  return { ok: true, payment: updated, previousStatus };
+}
+
+/**
+ * Rejects a status/reason pair that no transition should accept.
+ * @param {string} newStatus
+ * @param {string} reason
+ * @returns {object|null} An error body, or null when the pair is acceptable
+ */
+function validateStatusChange(newStatus, reason) {
+  if (!newStatus || !reason) {
+    return { error: 'status and reason are required', code: 'VALIDATION_ERROR' };
+  }
+  if (newStatus === PAYMENT_STATUS.PENDING) {
+    return { error: 'Cannot transition to PENDING', code: 'INVALID_TRANSITION' };
+  }
+  return null;
+}
+
 async function updatePaymentStatus(req, res, next) {
   try {
     const { txHash } = req.params;
     const { status: newStatus, reason } = req.body;
 
-    if (!newStatus || !reason) return res.status(400).json({ error: 'status and reason are required', code: 'VALIDATION_ERROR' });
-    if (newStatus === 'PENDING') return res.status(400).json({ error: 'Cannot transition to PENDING', code: 'INVALID_TRANSITION' });
+    const invalid = validateStatusChange(newStatus, reason);
+    if (invalid) return res.status(400).json(invalid);
 
-    const payment = await Payment.findOne({ schoolId: req.schoolId, txHash });
-    if (!payment) {
-      const err = new Error('Payment not found');
+    const result = await applyStatusTransition({ req, txHash, newStatus, reason });
+
+    if (!result.ok && result.code === 'NOT_FOUND') {
+      const err = new Error(result.error);
       err.code = 'NOT_FOUND';
       return next(err);
     }
-
-    const previousStatus = payment.status;
-    const allowed = ALLOWED_TRANSITIONS[previousStatus] || [];
-    if (!allowed.includes(newStatus)) {
-      return res.status(400).json({ error: `Cannot transition from ${previousStatus} to ${newStatus}`, code: 'INVALID_TRANSITION' });
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error, code: result.code });
     }
 
-    // Set $locals.adminOverride so the pre-save hook uses ADMIN_PAYMENT_STATUS_TRANSITIONS
-    // instead of the narrower PAYMENT_STATUS_TRANSITIONS.  $locals is Mongoose's
-    // per-document transient store — it is never persisted and survives through save().
-    payment.$locals.adminOverride = true;
-    payment.status = newStatus;
-    const updated = await payment.save();
+    res.json(result.payment);
+  } catch (err) {
+    next(err);
+  }
+}
 
-    await logAudit({
-      schoolId: req.schoolId,
-      action: 'payment_status_update',
-      performedBy: req.auditContext?.performedBy || 'unknown',
-      targetId: txHash,
-      targetType: 'payment',
-      details: { from: previousStatus, to: newStatus, reason, adminOverride: true },
-      result: 'success',
-      ipAddress: req.auditContext?.ipAddress,
-      userAgent: req.auditContext?.userAgent,
+/** Most payments one bulk request may transition. */
+const BULK_STATUS_UPDATE_LIMIT = parseInt(
+  process.env.BULK_PAYMENT_STATUS_LIMIT || '100',
+  10
+);
+
+/**
+ * Rejects a malformed txHashes array.
+ * @param {unknown} txHashes
+ * @returns {object|null} An error body, or null when the array is acceptable
+ */
+function validateTxHashes(txHashes) {
+  if (!Array.isArray(txHashes) || txHashes.length === 0) {
+    return { error: 'txHashes must be a non-empty array', code: 'VALIDATION_ERROR' };
+  }
+  if (txHashes.length > BULK_STATUS_UPDATE_LIMIT) {
+    return {
+      error: `txHashes exceeds the limit of ${BULK_STATUS_UPDATE_LIMIT}`,
+      code: 'BATCH_TOO_LARGE',
+      limit: BULK_STATUS_UPDATE_LIMIT,
+    };
+  }
+  if (txHashes.some((h) => typeof h !== 'string' || !h.trim())) {
+    return { error: 'txHashes must contain only non-empty strings', code: 'VALIDATION_ERROR' };
+  }
+  if (new Set(txHashes).size !== txHashes.length) {
+    return { error: 'txHashes contains duplicates', code: 'VALIDATION_ERROR' };
+  }
+  return null;
+}
+
+/**
+ * PATCH /api/payments/bulk/status
+ *
+ * Applies one status transition to many payments during reconciliation, which
+ * otherwise means one request per payment.
+ *
+ * Deliberately NOT all-or-nothing: a reconciliation batch routinely contains a
+ * few payments that have already moved on, and failing the whole request over
+ * them would leave the admin worse off than the single-payment endpoint. Each
+ * txHash gets its own result, and the response reports how many succeeded.
+ * Every successful transition writes the same audit entry the single endpoint
+ * writes, so the trail is identical either way.
+ */
+async function bulkUpdatePaymentStatus(req, res, next) {
+  try {
+    const { txHashes, status: newStatus, reason } = req.body || {};
+
+    const badBatch = validateTxHashes(txHashes);
+    if (badBatch) return res.status(400).json(badBatch);
+
+    const invalid = validateStatusChange(newStatus, reason);
+    if (invalid) return res.status(400).json(invalid);
+
+    // Sequential on purpose: each transition runs the model pre-save hook and
+    // writes an audit entry, and a reconciliation batch is not worth holding a
+    // large slice of the connection pool for.
+    const results = [];
+    for (const txHash of txHashes) {
+      const outcome = await applyStatusTransition({ req, txHash, newStatus, reason });
+      results.push(
+        outcome.ok
+          ? { txHash, updated: true, from: outcome.previousStatus, to: newStatus }
+          : { txHash, updated: false, error: outcome.error, code: outcome.code }
+      );
+    }
+
+    const updatedCount = results.filter((r) => r.updated).length;
+    res.json({
+      requested: txHashes.length,
+      updated: updatedCount,
+      failed: txHashes.length - updatedCount,
+      results,
     });
-
-    res.json(updated);
   } catch (err) {
     next(err);
   }
@@ -408,8 +607,9 @@ function streamPaymentEvents(req, res) {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  // addClient owns the per-connection heartbeat and enforces the per-school
-  // connection cap. A false return means the cap is reached — reject cleanly.
+  // addClient owns the per-connection heartbeat, enforces the per-school
+  // connection cap, and — when Redis is already degraded — immediately sends
+  // an sse.degraded event to this client (Issue #1054).
   if (!addClient(schoolId, res)) {
     res.write('event: error\ndata: {"error":"too_many_connections"}\n\n');
     res.end();
@@ -425,31 +625,51 @@ async function initiatePaymentRefund(req, res, next) {
   try {
     const { schoolId } = req;
     const { txHash } = req.params;
-    const { reason } = req.body;
+    const { reason, amount } = req.body;
 
     if (!reason) return res.status(400).json({ error: 'reason is required', code: 'VALIDATION_ERROR' });
 
-    const payment = await Payment.findOne({ schoolId, txHash, status: 'SUCCESS' });
+    const payment = await Payment.findOne({ schoolId, txHash, status: PAYMENT_STATUS.SUCCESS });
     if (!payment) {
       return res.status(404).json({ error: 'Confirmed payment not found', code: 'NOT_FOUND' });
+    }
+
+    // Build a stable principal object for two-person approval (#1565).
+    let principal;
+    try {
+      principal = buildPrincipal(req.auditContext, req.admin);
+    } catch (principalErr) {
+      return res.status(403).json({ error: principalErr.message, code: principalErr.code });
+    }
+
+    // #1567 — default to full payment amount when no partial amount is given.
+    const refundAmount = amount !== undefined && amount !== null ? Number(amount) : payment.amount;
+    if (!Number.isFinite(refundAmount) || refundAmount <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number', code: 'VALIDATION_ERROR' });
     }
 
     const refund = await initiateRefund(
       schoolId,
       txHash,
       payment.studentId,
-      payment.amount,
+      refundAmount,
       reason,
-      req.auditContext?.performedBy || 'unknown'
+      principal,
     );
 
     await logAudit({
       schoolId,
       action: 'refund_initiated',
-      performedBy: req.auditContext?.performedBy || 'unknown',
+      performedBy: principal.displayName,
       targetId: txHash,
       targetType: 'refund',
-      details: { refundId: refund._id.toString(), amount: payment.amount },
+      details: {
+        refundId: refund._id.toString(),
+        amount: refundAmount,
+        originalAmount: payment.amount,
+        isPartial: refundAmount < payment.amount,
+        initiatedBy: principal,
+      },
       result: 'success',
       ipAddress: req.auditContext?.ipAddress,
       userAgent: req.auditContext?.userAgent,
@@ -457,6 +677,168 @@ async function initiatePaymentRefund(req, res, next) {
 
     res.status(201).json(refund);
   } catch (err) {
+    if (err.code === 'AMOUNT_EXCEEDS_REFUNDABLE') {
+      return res.status(400).json({ error: err.message, code: err.code, refundable: err.refundable });
+    }
+    if (err.code === 'REFUND_ALREADY_EXISTS') {
+      return res.status(409).json({ error: err.message, code: err.code, refundId: err.refundId });
+    }
+    next(err);
+  }
+}
+
+async function approvePaymentRefund(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { refundId } = req.params;
+
+    let principal;
+    try {
+      principal = buildPrincipal(req.auditContext, req.admin);
+    } catch (principalErr) {
+      return res.status(403).json({ error: principalErr.message, code: principalErr.code });
+    }
+
+    const refund = await approveRefund(refundId, principal, schoolId);
+
+    await logAudit({
+      schoolId,
+      action: 'refund_approved',
+      performedBy: principal.displayName,
+      targetId: refund._id.toString(),
+      targetType: 'refund',
+      details: {
+        refundId: refund._id.toString(),
+        originalTxHash: refund.originalTxHash,
+        initiatedBy: refund.initiatedBy,
+        approvedBy: principal,
+        amount: refund.amount,
+      },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.json(refund);
+  } catch (err) {
+    if (err.code === 'SELF_APPROVAL_NOT_ALLOWED' || err.code === 'INVALID_STATE') {
+      return res.status(400).json({ error: err.message, code: err.code });
+    }
+    if (err.code === 'UNKNOWN_PRINCIPAL') {
+      return res.status(403).json({ error: err.message, code: err.code });
+    }
+    next(err);
+  }
+}
+
+/**
+ * POST /api/payments/refunds/:refundId/reject
+ *
+ * Reject a refund that is in approval_pending status (#1567 / #1564).
+ * The rejector must be a different user from the initiator (same two-person rule).
+ * The original payment is restored to SUCCESS.
+ */
+async function rejectPaymentRefund(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { refundId } = req.params;
+    const { reason } = req.body;
+
+    if (!reason) return res.status(400).json({ error: 'reason is required', code: 'VALIDATION_ERROR' });
+
+    let principal;
+    try {
+      principal = buildPrincipal(req.auditContext, req.admin);
+    } catch (principalErr) {
+      return res.status(403).json({ error: principalErr.message, code: principalErr.code });
+    }
+
+    const refund = await rejectRefund(refundId, principal, reason, schoolId);
+
+    await logAudit({
+      schoolId,
+      action: 'refund_rejected',
+      performedBy: principal.displayName,
+      targetId: refund._id.toString(),
+      targetType: 'refund',
+      details: {
+        refundId: refund._id.toString(),
+        originalTxHash: refund.originalTxHash,
+        initiatedBy: refund.initiatedBy,
+        rejectedBy: principal,
+        rejectionReason: reason,
+        amount: refund.amount,
+      },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.json(refund);
+  } catch (err) {
+    if (err.code === 'SELF_APPROVAL_NOT_ALLOWED' || err.code === 'INVALID_STATE') {
+      return res.status(400).json({ error: err.message, code: err.code });
+    }
+    if (err.code === 'UNKNOWN_PRINCIPAL') {
+      return res.status(403).json({ error: err.message, code: err.code });
+    }
+    next(err);
+  }
+}
+
+/**
+ * POST /api/payments/refunds/:refundId/complete
+ *
+ * Record a completed on-chain refund (#1564).
+ * Accepts the Stellar transaction hash of the actual refund payment,
+ * confirms the refund, marks the payment REFUNDED, and recalculates student
+ * balances. This is the manual execution path.
+ */
+async function completePaymentRefund(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { refundId } = req.params;
+    const { refundTxHash } = req.body;
+
+    if (!refundTxHash) {
+      return res.status(400).json({ error: 'refundTxHash is required', code: 'VALIDATION_ERROR' });
+    }
+
+    let principal;
+    try {
+      principal = buildPrincipal(req.auditContext, req.admin);
+    } catch (principalErr) {
+      return res.status(403).json({ error: principalErr.message, code: principalErr.code });
+    }
+
+    const refund = await completeRefund(refundId, refundTxHash, principal, schoolId);
+
+    await logAudit({
+      schoolId,
+      action: 'refund_completed',
+      performedBy: principal.displayName,
+      targetId: refund._id.toString(),
+      targetType: 'refund',
+      details: {
+        refundId: refund._id.toString(),
+        originalTxHash: refund.originalTxHash,
+        refundTxHash,
+        amount: refund.amount,
+        completedBy: principal,
+      },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.json(refund);
+  } catch (err) {
+    if (err.code === 'INVALID_STATE') {
+      return res.status(400).json({ error: err.message, code: err.code });
+    }
+    if (err.code === 'UNKNOWN_PRINCIPAL') {
+      return res.status(403).json({ error: err.message, code: err.code });
+    }
     next(err);
   }
 }
@@ -489,7 +871,7 @@ async function verifyReceipt(req, res, next) {
   try {
     const { receiptId } = req.params;
 
-    const receipt = await Receipt.findById(receiptId).lean();
+    const receipt = await Receipt.findOne({ _id: receiptId, schoolId: req.schoolId }).lean();
     if (!receipt) return res.status(404).json({ error: 'Receipt not found', code: 'NOT_FOUND' });
 
     try {
@@ -549,6 +931,81 @@ async function generateSchoolReconciliationReport(req, res, next) {
   }
 }
 
+/**
+ * Correct a placeholder payment (zero-amount, FAILED status) once on-chain
+ * verification confirms the transaction succeeded. Issue #1030.
+ *
+ * When a transaction is permanently misclassified as failed, the verify endpoint
+ * creates a placeholder Payment (amount: 0, status: FAILED) that locks the unique
+ * index. This endpoint allows an admin to correct that record with the actual
+ * amount and status once the on-chain transaction is verified as successful.
+ */
+async function correctPlaceholderPayment(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { txHash } = req.params;
+    const { studentId, amount, status, reason } = req.body;
+
+    if (!studentId || amount === undefined || amount === null || !status || !reason) {
+      return res.status(400).json({
+        error: 'studentId, amount, status, and reason are required',
+        code: 'VALIDATION_ERROR',
+      });
+    }
+
+    // Find the placeholder payment (zero amount, FAILED status)
+    const placeholder = await Payment.findOne({ schoolId, txHash, amount: 0, status: PAYMENT_STATUS.FAILED });
+    if (!placeholder) {
+      return res.status(404).json({
+        error: 'Placeholder payment not found (must have amount 0 and status FAILED)',
+        code: 'NOT_FOUND',
+      });
+    }
+
+    // Update with the actual transaction data
+    const previousStatus = placeholder.status;
+    const previousAmount = placeholder.amount;
+    const previousStudentId = placeholder.studentId;
+
+    placeholder.studentId = studentId;
+    placeholder.amount = amount;
+    placeholder.status = status;
+    placeholder.feeValidationStatus = 'unknown'; // Will be recalculated as needed
+
+    // Ensure admin override is set for the transition
+    placeholder.$locals.adminOverride = true;
+    const updated = await placeholder.save();
+
+    await logAudit({
+      schoolId,
+      action: 'payment_placeholder_corrected',
+      performedBy: req.auditContext?.performedBy || 'unknown',
+      targetId: txHash,
+      targetType: 'payment',
+      details: {
+        from: {
+          studentId: previousStudentId,
+          amount: previousAmount,
+          status: previousStatus,
+        },
+        to: {
+          studentId,
+          amount,
+          status,
+        },
+        reason,
+      },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   syncAllPayments,
   getSyncStatus,
@@ -561,14 +1018,20 @@ module.exports = {
   getQueueJobStatus,
   getStuckPayments,
   updatePaymentStatus,
+  bulkUpdatePaymentStatus,
+  BULK_STATUS_UPDATE_LIMIT,
   reviewSuspiciousPayment,
   streamPaymentEvents,
   initiatePaymentRefund,
+  approvePaymentRefund,
+  rejectPaymentRefund,
+  completePaymentRefund,
   getPaymentRefunds,
   getSchoolRefunds,
   verifyReceipt,
   getReconciliationReports,
   generateSchoolReconciliationReport,
+  correctPlaceholderPayment,
   // Exposed for testing — callers can introspect the lock state
   _lock: lock,
 };
