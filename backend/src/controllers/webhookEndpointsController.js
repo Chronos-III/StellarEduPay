@@ -7,14 +7,11 @@ const { generateWebhookSecret, validateWebhookSecretStrength } = require('../uti
 const WebhookDelivery = require('../models/webhookDeliveryModel');
 const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 const { logAudit } = require('../services/auditService');
-const { fireWebhook } = require('../services/webhookService');
+const { fireWebhook, sendTestDelivery } = require('../services/webhookService');
+const { parseOverlapSeconds, applySecretRotation } = require('../services/webhookEndpointService');
 const logger = require('../utils/logger').child('WebhookEndpointsController');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-// Default / maximum dual-signing overlap after a secret rotation (#1538).
-const DEFAULT_ROTATION_OVERLAP_S = parseInt(process.env.WEBHOOK_SECRET_ROTATION_OVERLAP_S || '86400', 10);
-const MAX_ROTATION_OVERLAP_S = 7 * 24 * 60 * 60;
 
 /**
  * Validate a caller-supplied signatureVersions array (#1539).
@@ -159,10 +156,11 @@ async function updateEndpoint(req, res, next) {
     const schoolId = _callerSchoolId(req);
     // Scope the query to the caller's schoolId — cross-tenant IDs and missing
     // IDs both return 404, removing the existence side-channel. (#1179)
-    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId });
+    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).select('+secret +previousSecret');
     if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
 
-    const { url, secret, subscribedEvents, isActive, description, signatureVersions } = req.body;
+    const { url, secret, subscribedEvents, isActive, description, signatureVersions, overlapSeconds } = req.body;
+    let secretOverlapSeconds = null;
 
     if (url !== undefined) {
       const urlCheck = await validateWebhookUrl(url);
@@ -172,16 +170,20 @@ async function updateEndpoint(req, res, next) {
       endpoint.url = url;
     }
     if (secret !== undefined) {
-      // #1538: same strength policy as on creation. A PUT replaces the secret
-      // immediately; use POST /:id/rotate-secret for a dual-signing overlap.
+      // #1538: same strength policy as on creation.
       const strength = validateWebhookSecretStrength(secret);
       if (!strength.valid) {
         return res.status(400).json({ error: strength.reason, code: 'WEAK_WEBHOOK_SECRET' });
       }
-      endpoint.secret = secret;
-      endpoint.previousSecret = null;
-      endpoint.previousSecretExpiresAt = null;
-      endpoint.secretRotatedAt = new Date();
+      // #1639: a caller-supplied secret no longer switches instantly — the old
+      // secret keeps co-signing for the overlap window (default
+      // WEBHOOK_SECRET_ROTATION_OVERLAP_S; pass overlapSeconds: 0 to switch
+      // immediately). Prefer POST /:id/rotate-secret, which also generates a
+      // strong secret server-side.
+      const overlap = parseOverlapSeconds(overlapSeconds);
+      if (!overlap.ok) return res.status(400).json({ error: overlap.error, code: 'VALIDATION_ERROR' });
+      secretOverlapSeconds = overlap.value;
+      applySecretRotation(endpoint, secret, secretOverlapSeconds);
     }
     if (signatureVersions !== undefined) {
       // #1539: lets integrators that have migrated to V2 drop V1 early.
@@ -216,6 +218,10 @@ async function updateEndpoint(req, res, next) {
         isActive: endpoint.isActive,
         signatureVersions: endpoint.signatureVersions,
         secretChanged: secret !== undefined,
+        ...(secret !== undefined ? {
+          overlapSeconds: secretOverlapSeconds,
+          previousSecretExpiresAt: endpoint.previousSecretExpiresAt,
+        } : {}),
       },
     });
 
@@ -228,13 +234,15 @@ async function updateEndpoint(req, res, next) {
 
 // ── POST /api/webhook-endpoints/:id/rotate-secret ────────────────────────────
 /**
- * Rotate an endpoint's signing secret (#1538).
+ * Rotate an endpoint's signing secret (#1538, #1639).
  *
  * A new secret is always generated server-side and returned exactly once.
  * For `overlapSeconds` (default WEBHOOK_SECRET_ROTATION_OVERLAP_S = 24h,
- * max 7 days, 0 = no overlap) deliveries carry an additional
- * X-StellarEduPay-Signature-V2-Previous header signed with the old secret, so
- * receivers can deploy the new secret without dropping events.
+ * max 7 days, 0 = no overlap) deliveries are signed with both secrets: the
+ * X-StellarEduPay-Signature-V2 header carries two comma-separated values
+ * (new first), and X-StellarEduPay-Signature-V2-Previous carries the old one.
+ * Receivers can therefore deploy the new secret without dropping events. The
+ * old secret is discarded once the window closes (webhookRetryScheduler).
  */
 async function rotateSecret(req, res, next) {
   try {
@@ -242,29 +250,12 @@ async function rotateSecret(req, res, next) {
     const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).select('+secret +previousSecret');
     if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
 
-    let overlapSeconds = DEFAULT_ROTATION_OVERLAP_S;
-    if (req.body && req.body.overlapSeconds !== undefined) {
-      overlapSeconds = Number(req.body.overlapSeconds);
-      if (!Number.isInteger(overlapSeconds) || overlapSeconds < 0 || overlapSeconds > MAX_ROTATION_OVERLAP_S) {
-        return res.status(400).json({
-          error: `overlapSeconds must be an integer between 0 and ${MAX_ROTATION_OVERLAP_S}`,
-          code: 'VALIDATION_ERROR',
-        });
-      }
-    }
+    const overlap = parseOverlapSeconds(req.body ? req.body.overlapSeconds : undefined);
+    if (!overlap.ok) return res.status(400).json({ error: overlap.error, code: 'VALIDATION_ERROR' });
+    const overlapSeconds = overlap.value;
 
     const newSecret = generateWebhookSecret();
-    const now = new Date();
-
-    if (overlapSeconds > 0) {
-      endpoint.previousSecret = endpoint.secret;
-      endpoint.previousSecretExpiresAt = new Date(now.getTime() + overlapSeconds * 1000);
-    } else {
-      endpoint.previousSecret = null;
-      endpoint.previousSecretExpiresAt = null;
-    }
-    endpoint.secret = newSecret;
-    endpoint.secretRotatedAt = now;
+    applySecretRotation(endpoint, newSecret, overlapSeconds);
     await endpoint.save();
 
     await logAudit({
@@ -341,28 +332,19 @@ async function listDeliveries(req, res, next) {
 }
 
 // ── POST /api/webhook-endpoints/:id/test ──────────────────────────────────────
+/**
+ * Send a signed `webhook.test` event with sample data to the endpoint through
+ * the normal signing/delivery path and return the receiver's status code and
+ * latency (#1639). Works for inactive endpoints too, so a receiver can be
+ * verified before the endpoint is switched on. A failed test is not retried.
+ */
 async function sendTestEvent(req, res, next) {
   try {
     const schoolId = _callerSchoolId(req);
-    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).select('+secret');
+    const endpoint = await WebhookEndpoint.findOne({ _id: req.params.id, schoolId }).select('+secret +previousSecret');
     if (!endpoint) return res.status(404).json({ error: 'Endpoint not found', code: 'NOT_FOUND' });
 
-    const deliveryId = uuidv4();
-    const testPayload = {
-      testMode: true,
-      timestamp: new Date().toISOString(),
-      message: 'This is a test webhook event from StellarEduPay',
-    };
-
-    const result = await fireWebhook(
-      endpoint.url,
-      'payment.test',
-      testPayload,
-      endpoint.secret,
-      deliveryId,
-      endpoint._id,
-      schoolId,
-    );
+    const result = await sendTestDelivery(endpoint);
 
     await logAudit({
       schoolId,
@@ -370,14 +352,23 @@ async function sendTestEvent(req, res, next) {
       performedBy: _performedBy(req),
       targetId: String(endpoint._id),
       targetType: 'school',
-      details: { deliveryId, success: result.success },
+      details: {
+        deliveryId: result.deliveryId,
+        event: result.event,
+        success: result.success,
+        statusCode: result.statusCode,
+        durationMs: result.durationMs,
+        error: result.error,
+      },
     });
 
     return res.json({
       success: result.success,
-      deliveryId,
+      event: result.event,
+      deliveryId: result.deliveryId,
       statusCode: result.statusCode,
-      error: result.error || null,
+      latencyMs: result.durationMs,
+      error: result.error,
     });
   } catch (err) {
     next(err);
