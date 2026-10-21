@@ -5,18 +5,23 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   smoke:
     name: Smoke (boots + parses)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20
 
@@ -46,23 +51,130 @@ jobs:
         run: |
           node -e "require('./backend/src/app')"
 
+  audit:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            backend/node_modules
+            frontend/node_modules
+            node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - run: npm ci --ignore-scripts
+      - run: cd backend && npm ci --ignore-scripts && cd ..
+      - run: cd frontend && npm ci --ignore-scripts && cd ..
+      - name: Audit root
+        run: node scripts/check-dependency-audit.js .
+      - name: Audit backend
+        run: node scripts/check-dependency-audit.js backend
+      - name: Audit frontend
+        run: node scripts/check-dependency-audit.js frontend
+
+  secret-scan:
+    name: Scan example files for real-format secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: '.nvmrc'
+      - name: Scan example files for secret material
+        run: node scripts/scan-example-secrets.js
+
+  secret-scan-repo:
+    name: Scan repository for committed Stellar secret keys
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: '.nvmrc'
+      - name: Scan tracked files for Stellar secret key material
+        run: node scripts/scan-repo-secrets.js
+
+  migrations:
+    name: Validate migration numbering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: node scripts/validate-migrations.js
+
+  orphan-dirs:
+    name: Check for stray duplicate directories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: node scripts/check-orphan-dirs.js
+
+  error-response-shape:
+    name: Check 401/403 response shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: node scripts/check-error-response-shape.js
+
+  k8s-ingress-tls:
+    name: Verify Kubernetes ingress has TLS configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check ingress TLS block exists
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r file; do
+            if ! node --check "$file"; then
+              echo "::error file=$file::node --check failed"
+              fail=1
+            fi
+          done < <(git ls-files '*.js')
+          exit "$fail"
+
+      - name: Fail on truncated-file placeholders
+        run: |
+          if git grep -n -E "truncated [0-9]+ chars"; then
+            echo "::error::Found truncated-file placeholder markers in tracked files"
+            exit 1
+          fi
+          echo "No truncated-file placeholders found"
+
+      - name: Boot backend app with dummy env (no DB)
+        env:
+          NODE_ENV: test
+        run: |
+          node -e "require('./backend/src/app')"
+
   lockfile-sync:
     name: Lockfile sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 20
-
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: backend/node_modules
+          key: ${{ runner.os }}-backend-node-${{ hashFiles('backend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-backend-node-
+      - name: Install backend dependencies
+        run: cd backend && npm ci --ignore-scripts
+      - name: Run ESLint (backend)
+        run: cd backend && npx eslint src/ --max-warnings=0
       - name: Verify root package-lock.json is in sync
         run: npm ci --dry-run
-
       - name: Verify frontend package-lock.json is in sync
         working-directory: frontend
         run: npm ci --dry-run
-
       - name: Verify backend package-lock.json is in sync
         working-directory: backend
         run: npm ci --dry-run
@@ -142,10 +254,70 @@ jobs:
     name: Lint frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 20
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-frontend-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-frontend-node-
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci --ignore-scripts
+      - name: Run next lint (frontend)
+        run: cd frontend && npm run lint
+
+  build-frontend:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_API_URL: /api
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-frontend-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-frontend-node-
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci --ignore-scripts
+      - name: Build frontend (next build)
+        run: cd frontend && npm run build
+
+  # ── #1591: Automated accessibility checks ──────────────────────────────────
+  # Runs the jest-axe component assertions (payment, login, dashboard) and the
+  # Playwright axe scans of /pay-fees, /login and /dashboard. The job fails on
+  # any serious/critical WCAG 2.2 AA violation, so it is GATING via ci-gate.
+  accessibility:
+    name: Accessibility checks (axe)
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_API_URL: http://localhost:5000/api
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-frontend-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-frontend-node-
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci --ignore-scripts
+      - name: Run jest-axe component assertions
+        run: cd frontend && npm run test:a11y
+      - name: Install Playwright browsers
+        run: cd frontend && npx playwright install --with-deps chromium
+      - name: Run axe scans of /pay-fees, /login and /dashboard
+        run: cd frontend && npm run test:a11y:e2e
 
   property:
     name: Property-based money invariants

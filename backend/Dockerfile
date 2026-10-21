@@ -1,7 +1,8 @@
+# node:20-alpine pinned to this immutable manifest digest.
 # Node major version — keep in sync with the root .nvmrc.
 # Override at build time: docker build --build-arg NODE_VERSION=24 ...
 ARG NODE_VERSION=24
-FROM node:${NODE_VERSION}-alpine
+FROM node@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
 
 # tini: init process for PID 1 — forwards signals to Node and reaps zombies
 # node healthcheck: inline Node script replaces curl (smaller attack surface)
