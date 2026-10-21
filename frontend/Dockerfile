@@ -1,4 +1,7 @@
 # ── Stage 1: build ────────────────────────────────────────────
+# Node major version — keep in sync with the root .nvmrc.
+# Override at build time: docker build --build-arg NODE_VERSION=24 ...
+ARG NODE_VERSION=24
 # node:20-alpine pinned to this immutable manifest digest.
 FROM node@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS builder
 
@@ -25,6 +28,8 @@ COPY . .
 RUN npm run build
 
 # ── Stage 2: run ──────────────────────────────────────────────
+# Re-declare ARG so the runner stage resolves the same image as the builder.
+ARG NODE_VERSION=24
 # node:20-alpine pinned to the same immutable manifest digest as the builder.
 FROM node@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runner
 

@@ -18,9 +18,25 @@ Closes #
 - [ ] CI/install changes use least privilege and pinned dependencies/actions
 - [ ] Security-sensitive changes received an appropriate review
 
+## Test run
+
+- [ ] I ran the relevant tests locally and they pass (paste the command and result below)
+- [ ] `node --check` passes for any `.js` files I touched
+- [ ] The backend boots with `NODE_ENV=test node -e "require('./backend/src/app')"`
+- [ ] No `truncated N chars` placeholder markers were introduced
+
+```
+# command(s) run and result
+```
+
 ## Deployment and rollback
 
 <!-- Note migrations, environment variables, image tags/digests, or rollback steps. Write “None” if not applicable. -->
+
+## Scope
+
+- [ ] This PR addresses a single issue (payments/auth changes are one issue per PR)
+- [ ] I did not bundle unrelated fixes
 
 ## Checklist
 
