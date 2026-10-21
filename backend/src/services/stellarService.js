@@ -1,5 +1,17 @@
 "use strict";
 
+// Issue #1557 — path payments deliver funds to the school wallet just like a
+// plain payment (the destination amount/asset are on the operation), so they
+// must be credited too. Previously only type "payment" was accepted.
+const CREDITABLE_OP_TYPES = new Set([
+  "payment",
+  "path_payment_strict_receive",
+  "path_payment_strict_send",
+]);
+function isCreditableOpType(type) {
+  return CREDITABLE_OP_TYPES.has(type);
+}
+
 const { Operation } = require("@stellar/stellar-sdk");
 const {
   server,
@@ -32,6 +44,7 @@ const {
 } = require("./paymentConfirmationStateMachine");
 const logger = require("../utils/logger").child("StellarService");
 const { getEngineForSchool } = require("./feeAdjustmentEngine");
+const { recordUnmatchedPayment } = require("./unmatchedPaymentService");
 const { PAYMENT_TYPES } = require("./paymentService");
 
 // TTL for the per-student balance lock (#1026), shared with paymentController's
@@ -169,7 +182,7 @@ async function extractValidPayment(tx, walletAddress) {
   // is recorded as its own payment row.
   const creditable = ops
     .map((op, i) => ({ op, opIndex: i }))
-    .filter(({ op }) => PAYMENT_TYPES.includes(op.type) && op.to === walletAddress)
+    .filter(({ op }) => isCreditableOpType(op.type) && op.to === walletAddress)
     .map(({ op, opIndex }) => {
       const asset = detectAsset(op);
       if (!asset) return null;
@@ -605,7 +618,7 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   const ops = await fetchAllOperations(tx, "verifyTransaction.operations");
   const creditable = ops
     .map((op, i) => ({ op, opIndex: i }))
-    .filter(({ op }) => PAYMENT_TYPES.includes(op.type) && op.to === walletAddress);
+    .filter(({ op }) => isCreditableOpType(op.type) && op.to === walletAddress);
   if (!creditable.length) {
     const err = new Error(
       `No payment operation found targeting the school wallet (${walletAddress})`,
@@ -800,7 +813,7 @@ async function syncPaymentsForSchool(school) {
             .then((records) => ({ records }))
             .catch(() => ({ records: [] }));
           const wrongDest = ops.records.find(
-            op => PAYMENT_TYPES.includes(op.type) && op.to && op.to !== stellarAddress
+            op => isCreditableOpType(op.type) && op.to && op.to !== stellarAddress
           );
           if (wrongDest) {
             logger.warn('Transaction skipped — destination does not match school wallet', {
@@ -861,20 +874,4 @@ async function syncPaymentsForSchool(school) {
         });
         studentDeleted = Boolean(student);
         if (studentDeleted) {
-          logger.warn('Transaction matched a soft-deleted student — recording for manual review', {
-            txHash: tx.hash, schoolId, studentId: targetStudentId,
-          });
-        }
-      }
-      if (!student) { summary.unmatched++; continue; }
-
-      summary.matched++;
-
-      // #1760 — validate each operation's amount against its own asset's limits.
-      let limitFailure = null;
-      for (const o of operations) {
-        const limitValidation = await validatePaymentAmount(o.amount, {
-          schoolId,
-          asset: o.asset?.assetCode,  // #1555: detectAsset returns assetCode, not code
-        });
-       
+          logger.warn('Transaction matched a soft-deleted student — recording for manual
