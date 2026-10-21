@@ -15,6 +15,7 @@ StellarEduPay uses the **Stellar Horizon API** to read blockchain transactions �
 - [Fee Validation](#fee-validation)
 - [Confirmation Threshold & Finality State Machine](#confirmation-threshold--finality-state-machine)
 - [Fraud & Anomaly Detection](#fraud--anomaly-detection)
+- [School Wallet Funding Check](#school-wallet-funding-check)
 - [Retry Behaviour](#retry-behaviour)
 - [Verifying a Payment Independently](#verifying-a-payment-independently)
 
@@ -471,9 +472,58 @@ This is independent of `detectMemoCollision`, which is single-school and keyed o
 `detectAbnormalPatterns` checks two additional signals:
 
 - **Velocity**: the same sender makes more than 3 payments within 10 minutes.
-- **Unusual amount**: the payment is more than 3× or less than 1/3 of the expected fee.
+- **Unusual amount**: the payment is at least `suspiciousPaymentMultiplier`× or at most 1/`suspiciousPaymentMultiplier` of the expected fee (both bounds inclusive). The reason recorded on the payment includes the ratio and threshold, e.g. `Unusual payment amount (ratio 3.00, threshold 3.0×)`.
 
 Suspicious payments are still recorded but `isSuspicious: true` prevents the student's `feePaid` flag from being updated until an admin reviews the record.
+
+#### Per-school amount thresholds
+
+`suspiciousPaymentMultiplier` is a per-school field (`backend/src/models/schoolModel.js`), default `3.0`, allowed range `1.1`–`100`. It can be set on `POST /api/schools` and changed with `PATCH /api/schools/:schoolId`; out-of-range values are rejected with `400 VALIDATION_ERROR` on create and `400 INVALID_SUSPICIOUS_PAYMENT_MULTIPLIER` on update.
+
+| Multiplier | Flags payments | Character |
+|---|---|---|
+| 1.1 | ≥1.1× or ≤0.91× of the fee | Very strict |
+| 1.5 | ≥1.5× or ≤0.67× | Strict |
+| 3.0 | ≥3× or ≤0.33× | Default |
+| 5.0 | ≥5× or ≤0.2× | Lenient |
+
+A flat fee multiplier mis-fires for schools whose normal payments cluster away from the expected fee, so each school can instead opt into a threshold based on its **own** confirmed-payment history via `suspiciousAmountConfig`:
+
+```json
+PATCH /api/schools/:schoolId
+{
+  "suspiciousAmountConfig": {
+    "mode": "historical",
+    "historicalWindowDays": 90,
+    "historicalStdDevMultiplier": 3.0,
+    "historicalMinSamples": 20
+  }
+}
+```
+
+- `mode: "fee_multiplier"` (default) — the multiplier rule above.
+- `mode: "historical"` — flags an amount more than `historicalStdDevMultiplier` standard deviations from the school's mean confirmed-payment amount over the last `historicalWindowDays` days. Until the school has `historicalMinSamples` confirmed payments, detection falls back to the fee multiplier to avoid cold-start false positives.
+
+#### Reviewing flagged payments
+
+- `GET /api/payments/suspicious` — list the school's flagged payments.
+- `PATCH /api/payments/:txHash/suspicion-review` — body `{ "action": "clear" | "confirm_fraud", "note": "..." }`. `clear` removes the flag (false positive); `confirm_fraud` records the determination and keeps it.
+
+The outcome is stored on the payment (`suspicionReviewStatus`, `suspicionReviewedBy`, `suspicionReviewedAt`, `suspicionReviewNote`) and every decision writes a `payment_suspicion_review` audit log entry. The Prometheus counter `suspicious_payment_flagged{school_id}` makes flagged volume alertable per tenant.
+
+---
+
+## School Wallet Funding Check
+
+When a school is created (`POST /api/schools`) or its `stellarAddress` changes, `verifyStellarAccountFunding` (`backend/src/services/stellarAccountVerificationService.js`) asks Horizon whether the account exists and holds at least 1 XLM. The check is advisory and never blocks setup:
+
+| Horizon result | Response |
+|---|---|
+| Funded (≥1 XLM) | `201 Created` / `200 OK` |
+| Account missing (404) or <1 XLM | `202 Accepted` with `"warning": "STELLAR_ACCOUNT_UNFUNDED"` — the school is still saved |
+| Timeout (3 s) or network/5xx/429 error | `201 Created` / `200 OK` — logged at warn level, no warning field |
+
+An invalid public key is still a hard `400 INVALID_STELLAR_ADDRESS`. Updates that do not touch `stellarAddress` skip the check.
 
 ---
 

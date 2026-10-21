@@ -543,6 +543,23 @@ Your PR must meet these criteria before merging:
 - [ ] **Follows conventions** - Branch naming, commit messages, code style
 - [ ] **No sensitive data** - No secrets, API keys, or PII in code
 
+### Documentation Rules
+
+- **PR descriptions belong in the PR, not in `docs/`.** Do not commit
+  `PR_DESCRIPTION.md`, `IMPLEMENTATION_SUMMARY.md` or other notes about what a
+  change did. Those go stale as soon as they are merged.
+- **Update the living doc instead.** If your change alters behaviour, edit the
+  document that describes that area (see [docs/README.md](docs/README.md)) in
+  the same PR.
+- **New documents must be indexed.** Add a row to `docs/README.md` with an
+  owner and a "last reviewed" date.
+- **Design decisions** go in `docs/adr/NNNN-short-title.md` as dated, immutable
+  decision records (context, decision, consequences).
+- **API changes** must update `backend/openapi.json`: run
+  `node scripts/openapi/generate.js` and commit the result (add summaries,
+  request bodies and responses by hand in that file). CI fails if a route is
+  missing from it, or if the frontend or docs call a path that doesn't exist.
+
 ### Review Process
 
 1. Maintainers will review your PR within 2-3 business days
