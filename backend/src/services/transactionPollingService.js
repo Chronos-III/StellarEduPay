@@ -18,6 +18,7 @@ const logger = require('../utils/logger').child('TransactionPollingService');
 const { deriveCorrelationId } = require('../utils/correlationId');
 const { captureFiatSnapshot } = require('./currencyConversionService');
 const { HorizonPollBudget, orderSchoolsByPriority } = require('./horizonPollBudget');
+const { drainingWalletEntries } = require('./walletRotationService');
 const { recordUnmatchedPayment } = require('./unmatchedPaymentService');
 const { isBeforeIngestStart } = require('../utils/ingestWindow');
 
@@ -229,6 +230,7 @@ async function processTransaction(tx, school, fencingToken) {
     senderAddress,
     isSuspicious,
     suspicionReason,
+    receivedOnRetiredAddress: Boolean(school.receivedOnRetiredAddress),
     ledger: txLedger,
     ledgerSequence: txLedger,
     confirmationStatus,
@@ -352,7 +354,11 @@ function getEffectiveBatchSize(queueDepth) {
   return Math.max(MIN_TRANSACTIONS_PER_POLL, Math.min(MAX_TRANSACTIONS_PER_POLL, scaled));
 }
 
-async function pollSchoolTransactions(school, budget = null) {
+/**
+ * Poll one school's wallet. With `retired` set ({ address, cursor }), poll that
+ * retired address instead, using its own cursor (#1799).
+ */
+async function pollSchoolTransactions(school, budget = null, retired = null) {
   const backpressure = getQueueBackpressureState();
   if (backpressure.queueDepth >= backpressure.highWater) {
     logger.warn('Skipping school poll due to high payment processor queue depth', {
@@ -369,6 +375,13 @@ async function pollSchoolTransactions(school, budget = null) {
     };
   }
 
+  const address = retired ? retired.address : school.stellarAddress;
+  // A retired address is credited like the current one, but its payments are
+  // flagged so the school can see them (#1799).
+  const scope = retired
+    ? { ...school, stellarAddress: address, receivedOnRetiredAddress: true }
+    : school;
+
   const lockKey = `sync:lock:${school.schoolId}`;
   const acquired = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
   if (!acquired) {
@@ -383,7 +396,7 @@ async function pollSchoolTransactions(school, budget = null) {
     ? lock.startWatchdog(lockKey, token, SYNC_LOCK_TTL_MS)
     : null;
 
-  let cursor = school.syncCursor || null;
+  let cursor = retired ? retired.cursor || null : school.syncCursor || null;
   const startCursor = cursor;
   let processedCount = 0;
   let skippedCount = 0;
@@ -421,7 +434,7 @@ async function pollSchoolTransactions(school, budget = null) {
 
       let builder = server
         .transactions()
-        .forAccount(school.stellarAddress)
+        .forAccount(address)
         .order('asc')
         .limit(batchSize);
       // Resume from the persisted cursor; omit on first-ever run so Horizon
@@ -438,9 +451,16 @@ async function pollSchoolTransactions(school, budget = null) {
           if (tx.paging_token) cursor = tx.paging_token;
           continue;
         }
-        const result = await processTransaction(tx, school, fencingToken);
+        const result = await processTransaction(tx, scope, fencingToken);
         if (result.processed) {
           processedCount++;
+          if (retired) {
+            logger.warn('Payment credited to a retired wallet address', {
+              schoolId: school.schoolId,
+              address,
+              txHash: tx.hash,
+            });
+          }
         } else {
           skippedCount++;
         }
@@ -451,10 +471,17 @@ async function pollSchoolTransactions(school, budget = null) {
 
       // Persist the cursor after each page so a crash resumes without gaps/rescans.
       if (cursor && cursor !== startCursor) {
-        await School.updateOne(
-          { schoolId: school.schoolId },
-          { $set: { syncCursor: cursor } },
-        );
+        if (retired) {
+          await School.updateOne(
+            { schoolId: school.schoolId, 'walletHistory.address': address },
+            { $set: { 'walletHistory.$.cursor': cursor } },
+          );
+        } else {
+          await School.updateOne(
+            { schoolId: school.schoolId },
+            { $set: { syncCursor: cursor } },
+          );
+        }
       }
 
       if (records.length < batchSize) {
@@ -523,6 +550,27 @@ async function pollSchoolTransactions(school, budget = null) {
  * @param {HorizonPollBudget} budget
  * @returns {Promise<Map<string, object>>} schoolId → signals
  */
+/**
+ * Poll a school's current wallet, then each retired wallet still inside its
+ * drain window, one after another (#1799). A failure on a retired address is
+ * logged and does not stop the current address's result.
+ */
+async function pollSchoolWithDrainingAddresses(school, budget = null) {
+  const result = await pollSchoolTransactions(school, budget);
+  for (const retired of drainingWalletEntries(school)) {
+    try {
+      await pollSchoolTransactions(school, budget, retired);
+    } catch (err) {
+      logger.error('Error draining retired wallet address', {
+        schoolId: school.schoolId,
+        address: retired.address,
+        error: err.message,
+      });
+    }
+  }
+  return result;
+}
+
 async function gatherSchoolSignals(schools, budget) {
   const signals = new Map();
 
@@ -658,7 +706,7 @@ async function pollAllSchools() {
     const results = await runWithConcurrency(
       ordered,
       MAX_CONCURRENT_SCHOOL_POLLS,
-      ({ school }) => pollSchoolTransactions(school, pollBudget),
+      ({ school }) => pollSchoolWithDrainingAddresses(school, pollBudget),
     );
 
     const summary = results.reduce((acc, result) => {
@@ -830,6 +878,7 @@ module.exports = {
   stopPolling,
   pollAllSchools,
   pollSchoolTransactions,
+  pollSchoolWithDrainingAddresses,
   processTransaction,
   isBeforeIngestStart,
   // Exposed for testing
@@ -841,10 +890,4 @@ module.exports = {
   _gatherSchoolSignals: gatherSchoolSignals,
   _resetBackoffState: () => {
     consecutiveErrors = 0;
-    currentIntervalMs = SYNC_INTERVAL_MS;
-    horizonUnreachableSince = null;
-    pollBudget = new HorizonPollBudget({ intervalMs: SYNC_INTERVAL_MS });
-    isPolling = true; // allow direct pollAllSchools() calls in tests
-    if (pollingInterval) { clearTimeout(pollingInterval); pollingInterval = null; }
-  },
-};
+    currentIntervalMs = SY
