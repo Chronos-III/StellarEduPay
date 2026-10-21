@@ -153,7 +153,7 @@ function rl(windowMs, max, message = RL_MSG, opts = {}) {
 
     if (count > max) {
       res.set('Retry-After', resetSeconds);
-      return res.status(429).json(message);
+      return res.status(429).json({ ...message, retryAfter: resetSeconds });
     }
 
     next();
@@ -176,13 +176,10 @@ const SYNC_INTERVAL_MS = parseInt(
   10,
 );
 const SYNC_RL_MSG = {
-  success: false,
-  error: {
-    code: 'SYNC_RATE_LIMITED',
-    message:
-      'A manual sync was already requested for this school recently. ' +
-      'Background polling continues regardless; retry after the interval shown in Retry-After.',
-  },
+  error:
+    'A manual sync was already requested for this school recently. ' +
+    'Background polling continues regardless; retry after the interval shown in Retry-After.',
+  code: 'SYNC_RATE_LIMITED',
 };
 const syncLimiter = rl(SYNC_INTERVAL_MS, 1, SYNC_RL_MSG, {
   name: 'rl:sync',
@@ -195,10 +192,11 @@ const reminderTriggerLimiter = rl(
   { error: 'Too many reminder requests. Please wait.', code: 'RATE_LIMIT_EXCEEDED' },
   { name: 'rl:reminders', keyGenerator: (req) => `reminders:${req.schoolId || 'unknown-tenant'}` }
 );
+const BULK_IMPORT_RATE_LIMIT = parseInt(process.env.BULK_IMPORT_RATE_LIMIT, 10) || 5;
 const bulkImportLimiter    = rl(
   60 * 60 * 1000,
-  parseInt(process.env.BULK_IMPORT_RATE_LIMIT, 10) || 5,
-  { error: 'Maximum 5 bulk imports per hour.', code: 'RATE_LIMIT_EXCEEDED' },
+  BULK_IMPORT_RATE_LIMIT,
+  { error: `Maximum ${BULK_IMPORT_RATE_LIMIT} bulk imports per hour.`, code: 'RATE_LIMIT_EXCEEDED' },
   { name: 'rl:bulkimport', keyGenerator: (req) => req.schoolId || 'unknown-tenant' },
 );
 

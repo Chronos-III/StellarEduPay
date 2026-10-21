@@ -10,7 +10,10 @@
  * 64-character hex string / 32 bytes). When the env var is absent, encryption
  * is a no-op so local development without the key continues to work.
  *
- * The encrypted format (base64url) is:
+ * The encrypted format (hex) is:
+ *   Hex is used rather than base64url because parentEmail has a lowercase
+ *   setter in studentModel.js, which would corrupt any uppercase base64url
+ *   characters and make the ciphertext undecryptable (#1787).
  *   <12-byte IV> + <ciphertext> + <16-byte GCM auth tag>
  * Prefixed with "enc:" so plaintext and encrypted values are distinguishable.
  *
@@ -57,7 +60,7 @@ function encryptStudentPii(plaintext) {
   const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
 
-  const payload = Buffer.concat([iv, encrypted, tag]).toString('base64url');
+  const payload = Buffer.concat([iv, encrypted, tag]).toString('hex');
   return `${ENC_PREFIX}${payload}`;
 }
 
@@ -74,7 +77,7 @@ function decryptStudentPii(value) {
 
   let buf;
   try {
-    buf = Buffer.from(value.slice(ENC_PREFIX.length), 'base64url');
+    buf = Buffer.from(value.slice(ENC_PREFIX.length), 'hex');
   } catch {
     return value;
   }

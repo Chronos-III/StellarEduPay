@@ -64,7 +64,7 @@ async function processTransactionJob(job) {
   // Validate intent expiry
   const intent = await PaymentIntent.findOne({ memo: result.memo, schoolId });
   if (intent?.expiresAt && intent.expiresAt < new Date()) {
-    await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'expired' });
+    await PaymentIntent.findOneAndUpdate({ _id: intent._id, schoolId }, { status: 'expired' });
     throw Object.assign(new Error('Payment intent has expired'), { code: 'INTENT_EXPIRED' });
   }
 

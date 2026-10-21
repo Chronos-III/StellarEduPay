@@ -1,4 +1,7 @@
-FROM node:20-alpine
+# Node major version — keep in sync with the root .nvmrc.
+# Override at build time: docker build --build-arg NODE_VERSION=24 ...
+ARG NODE_VERSION=24
+FROM node:${NODE_VERSION}-alpine
 
 # tini: init process for PID 1 — forwards signals to Node and reaps zombies
 # node healthcheck: inline Node script replaces curl (smaller attack surface)
