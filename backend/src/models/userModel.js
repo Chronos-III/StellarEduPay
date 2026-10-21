@@ -2,6 +2,11 @@
 
 const mongoose = require('mongoose');
 
+// Single source of truth for assignable roles. Route guards (requireSchoolAuth)
+// must only reference roles from this list — see the static scan test in
+// backend/src/routes/__tests__/roleGuardRoles.test.js.
+const USER_ROLES = ['super_admin', 'owner', 'staff', 'read_only'];
+
 const userSchema = new mongoose.Schema(
   {
     email: {
@@ -18,7 +23,7 @@ const userSchema = new mongoose.Schema(
     roles: [
       {
         type: String,
-        enum: ['super_admin', 'owner', 'staff', 'read_only'],
+        enum: USER_ROLES,
       },
     ],
     isActive: { type: Boolean, default: true, index: true },
@@ -26,8 +31,15 @@ const userSchema = new mongoose.Schema(
     mfaSecret: { type: String, default: null },
     mfaBackupCodes: [
       {
+        // Salted slow hash (bcrypt/scrypt). Never store the raw code.
         hash: { type: String, required: true },
+        // Which algorithm produced `hash` (e.g. 'bcrypt', 'scrypt', 'sha256').
+        algo: { type: String, default: 'bcrypt' },
+        // Legacy codes were unsalted SHA-256 with low entropy; they must be
+        // regenerated on next login and are rejected for verification.
+        legacy: { type: Boolean, default: false },
         used: { type: Boolean, default: false },
+        usedAt: { type: Date, default: null },
       },
     ],
     // Invitation flow
@@ -51,4 +63,10 @@ userSchema.set('toJSON', {
   },
 });
 
-module.exports = mongoose.model('User', userSchema);
+const User = mongoose.model('User', userSchema);
+
+// Expose the role enum so tests and guards can validate against it.
+User.USER_ROLES = USER_ROLES;
+
+module.exports = User;
+module.exports.USER_ROLES = USER_ROLES;

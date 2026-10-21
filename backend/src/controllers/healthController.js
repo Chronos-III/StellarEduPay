@@ -13,6 +13,7 @@ const logger = require('../utils/logger');
 const { isReady: isShutdownReady } = require('../services/shutdownManager');
 const { isEncryptionEnabled: isPiiEncryptionEnabled } = require('../services/studentPiiEncryption');
 const { isEncryptionEnabled: isWebhookSecretEncryptionEnabled } = require('../services/webhookSecretEncryption');
+const { getBuildInfo } = require('../utils/buildInfo');
 
 const STELLAR_CHECK_TIMEOUT_MS = 3000; // 3 second timeout for Stellar health check
 
@@ -350,7 +351,17 @@ async function healthDetails(req, res) {
  * No external dependency checks — if this fails, the container should restart.
  */
 async function healthLive(req, res) {
-  return res.status(200).json({ status: 'alive', timestamp: new Date().toISOString() });
+  const { version, commit } = getBuildInfo();
+  return res.status(200).json({ status: 'alive', version, commit, timestamp: new Date().toISOString() });
+}
+
+/**
+ * GET /api/version
+ * Reports which release this process is running (#1634) so operators can
+ * tell deployments apart and integrators can track API changes.
+ */
+async function version(req, res) {
+  return res.status(200).json(getBuildInfo());
 }
 
 /**
@@ -409,6 +420,7 @@ module.exports = {
   healthDetails,
   healthLive,
   healthReady,
+  version,
   buildHealthReport,
   toReasonCode,
   getEncryptionStatus,
