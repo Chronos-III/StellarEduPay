@@ -47,6 +47,21 @@ const paymentProcessingDurationSeconds = new client.Histogram({
   registers: [registry],
 });
 
+// build_info{version,commit} — constant 1, labelled with the running release
+// (#1634), so dashboards can annotate deploys and alert on version skew
+// between replicas.
+const { getBuildInfo } = require('../utils/buildInfo');
+const buildInfoGauge = new client.Gauge({
+  name: 'build_info',
+  help: 'Build information for the running backend (value is always 1)',
+  labelNames: ['version', 'commit', 'node_version'],
+  registers: [registry],
+});
+{
+  const { version, commit, node } = getBuildInfo();
+  buildInfoGauge.set({ version, commit, node_version: node }, 1);
+}
+
 // nodejs_heap_used_ratio — heap utilization ratio from heapMonitoring.js
 const nodejsHeapUsedRatio = new client.Gauge({
   name: 'nodejs_heap_used_ratio',
@@ -202,6 +217,29 @@ const suspiciousPaymentFlagged = new client.Counter({
   name: 'suspicious_payment_flagged',
   help: 'Number of payments flagged as suspicious, labelled by school',
   labelNames: ['school_id'],
+  registers: [registry],
+});
+
+// Issue #1795 — these three metrics were referenced by alert rules and by
+// callers (`require('../metrics').receiptGenerationFailuresTotal.inc(...)`)
+// but never registered, so the calls threw inside try/catch blocks and the
+// alerts could never fire.
+const receiptGenerationFailuresTotal = new client.Counter({
+  name: 'receipt_generation_failures_total',
+  help: 'Number of receipt generation failures, labelled by source',
+  labelNames: ['source'],
+  registers: [registry],
+});
+
+const sendAdminAlertTotal = new client.Counter({
+  name: 'send_admin_alert_total',
+  help: 'Total number of admin alerts triggered',
+  registers: [registry],
+});
+
+const transactionQueueDepth = new client.Gauge({
+  name: 'transaction_queue_depth',
+  help: 'Number of actionable (waiting, active, delayed) transaction queue jobs',
   registers: [registry],
 });
 
@@ -500,6 +538,7 @@ new client.Gauge({
 
 module.exports = {
   registry,
+  buildInfoGauge,
   mongoConnectionState,
   mongoConnectionErrorsTotal,
   horizonPollBudgetRemaining,
@@ -514,6 +553,9 @@ module.exports = {
   nodejsHeapUsedRatio,
   httpRequestDurationSeconds,
   suspiciousPaymentFlagged,
+  receiptGenerationFailuresTotal,
+  sendAdminAlertTotal,
+  transactionQueueDepth,
   paymentLimitTriggeredTotal,
   paymentBatchTotal,
   paymentBatchItemsTotal,
