@@ -20,8 +20,7 @@ function isTransient(err) {
 
 function classifyHorizonError(err, context = '') {
   const s = getStatus(err);
-  // originalError is attached to every classified error (mirroring the
-  // StellarAPIError convention in stellarRateLimitedClient.js) so the raw
+  // originalError is attached to every classified error so the raw
   // Horizon/axios failure — status, message, Horizon `extras`/result_codes —
   // is never fully discarded, even though the classified .status/.code/.message
   // are deliberately normalized for callers that branch on error type.
