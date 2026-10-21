@@ -142,3 +142,4 @@ async function resolveSchool(req, res, next) {
 }
 
 module.exports = { resolveSchool };
+module.exports.resolveSchool = resolveSchool;
