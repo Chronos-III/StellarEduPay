@@ -8,6 +8,14 @@ const { verifyStellarAccountFunding } = require('../services/stellarAccountVerif
 const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 const schoolCache = require('../services/schoolCacheInvalidator');
 const { buildWalletRotation } = require('../services/walletRotationService');
+const {
+  parseOverlapSeconds,
+  applySecretRotation,
+  findLegacySchoolEndpoint,
+  upsertLegacySchoolEndpoint,
+  setWebhookDeprecationHeaders,
+  generateWebhookSecret,
+} = require('../services/webhookEndpointService');
 const { isSupportedCurrency } = require('../services/currencyConversionService');
 
 function isValidTimezone(tz) {
@@ -73,6 +81,8 @@ async function createSchool(req, res, next) {
       network: network || 'testnet',
       adminEmail: adminEmail || null,
       address: address || null,
+      // A new wallet's pre-existing history is not ingested (#1818).
+      ingestStartsAt: new Date(),
       ...(localCurrency !== undefined && { localCurrency: localCurrency.toUpperCase() }),
       ...(timezone !== undefined && { timezone }),
       ...(suspiciousPaymentMultiplier !== undefined && { suspiciousPaymentMultiplier }),
@@ -122,26 +132,17 @@ async function createSchool(req, res, next) {
 // GET /api/schools
 async function getAllSchools(req, res, next) {
   try {
+    // ?includeInactive=true is gated by requireAdminAuth in schoolRoutes.js
     const includeInactive = req.query.includeInactive === 'true';
 
-    // ?includeInactive=true is admin-only — verify JWT inline
-    if (includeInactive) {
-      const jwt = require('jsonwebtoken');
-      const authHeader = req.headers['authorization'];
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Authentication required to include inactive schools.', code: 'MISSING_AUTH_TOKEN' });
-      }
-      try {
-        const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
-        if (decoded.role !== 'admin') {
-          return res.status(403).json({ error: 'Admin role required to include inactive schools.', code: 'INSUFFICIENT_ROLE' });
-        }
-      } catch {
-        return res.status(401).json({ error: 'Invalid token.', code: 'INVALID_AUTH_TOKEN' });
-      }
-    }
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
 
     const query = includeInactive ? {} : { isActive: true };
+    if (typeof req.query.q === 'string' && req.query.q.trim()) {
+      const escaped = req.query.q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      query.name = { $regex: escaped, $options: 'i' };
+    }
     const publicFields = {
       schoolId: 1,
       name: 1,
@@ -169,8 +170,18 @@ async function getAllSchools(req, res, next) {
       createdAt: 1,
       updatedAt: 1,
     };
-    const schools = await School.find(query, publicFields).sort({ name: 1 }).lean();
-    res.json(schools);
+    const [schools, total] = await Promise.all([
+      School.find(query, publicFields)
+        .sort({ name: 1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      School.countDocuments(query),
+    ]);
+    res.json({
+      schools,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
   } catch (err) {
     next(err);
   }
@@ -184,7 +195,6 @@ async function getSchool(req, res, next) {
       isActive: true,
     }, {
       jwtSecret: 0,
-      webhookSecret: 0,
       internalNotes: 0,
       mfaSecret: 0,
       mfaBackupCodes: 0,
@@ -451,6 +461,8 @@ async function rotateStellarAddress(req, res, next) {
     school.stellarAddress = stellarAddress;
     school.syncCursor = rotation.syncCursor;
     school.walletActiveFrom = rotation.walletActiveFrom;
+    // The new wallet's pre-existing history must not be credited as fees (#1818).
+    school.ingestStartsAt = new Date();
     await school.save();
 
     schoolCache.invalidate(school);
@@ -491,13 +503,19 @@ async function rotateStellarAddress(req, res, next) {
 }
 
 // PUT /api/schools/:schoolId/webhook-secret
-// Issue #1412: regenerating webhookSecret controls webhook signature
+// Issue #1412: regenerating the webhook secret controls webhook signature
 // verification, so — like stellarAddress — it requires the same step-up
 // password confirmation before a new session-hijacked admin can silently
 // take over webhook delivery for a school.
+//
+// DEPRECATED (#1640): School.webhookSecret no longer exists. This rotates the
+// secret of the school's legacy WebhookEndpoint (with the same dual-signing
+// overlap as POST /api/webhook-endpoints/:id/rotate-secret). Will be removed
+// in the next release.
 async function rotateWebhookSecret(req, res, next) {
   try {
-    const { confirmPassword } = req.body || {};
+    setWebhookDeprecationHeaders(res);
+    const { confirmPassword, overlapSeconds } = req.body || {};
 
     const expectedPassword = process.env.ADMIN_PASSWORD;
     const bufExpected = Buffer.from(expectedPassword || '');
@@ -522,11 +540,22 @@ async function rotateWebhookSecret(req, res, next) {
       return next(e);
     }
 
-    const newSecret = crypto.randomBytes(32).toString('hex');
-    school.webhookSecret = newSecret;
-    await school.save();
+    const overlap = parseOverlapSeconds(overlapSeconds);
+    if (!overlap.ok) {
+      return res.status(400).json({ error: overlap.error, code: 'VALIDATION_ERROR' });
+    }
 
-    schoolCache.invalidate(school);
+    const endpoint = await findLegacySchoolEndpoint(school.schoolId, { withSecrets: true });
+    if (!endpoint) {
+      return res.status(404).json({
+        error: 'No school webhook is registered. Manage webhooks via /api/webhook-endpoints.',
+        code: 'NOT_FOUND',
+      });
+    }
+
+    const newSecret = generateWebhookSecret();
+    applySecretRotation(endpoint, newSecret, overlap.value);
+    await endpoint.save();
 
     if (req.auditContext) {
       await logAudit({
@@ -535,7 +564,13 @@ async function rotateWebhookSecret(req, res, next) {
         performedBy: req.auditContext.performedBy,
         targetId: school.schoolId,
         targetType: 'school',
-        details: { severity: 'high' },
+        details: {
+          severity: 'high',
+          endpointId: String(endpoint._id),
+          overlapSeconds: overlap.value,
+          previousSecretExpiresAt: endpoint.previousSecretExpiresAt,
+          deprecatedRoute: true,
+        },
         result: 'success',
         ipAddress: req.auditContext.ipAddress,
         userAgent: req.auditContext.userAgent,
@@ -543,54 +578,24 @@ async function rotateWebhookSecret(req, res, next) {
     }
 
     // The plaintext secret is only ever returned once, at rotation time — it
-    // is encrypted at rest (schoolModel's pre-save hook) and never included
-    // in getSchool()'s projection.
-    res.json({ webhookSecret: newSecret });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// DELETE /api/schools/:schoolId  (soft-delete)
-async function deactivateSchool(req, res, next) {
-  try {
-    const school = await School.findOneAndUpdate(
-      { schoolId: req.params.schoolId },
-      { isActive: false },
-      { new: true }
-    );
-    if (!school) {
-      const e = new Error('School not found');
-      e.code = 'NOT_FOUND';
-      return next(e);
-    }
-
-    // Drop the cached copy everywhere so deactivation blocks requests at once.
-    schoolCache.invalidate(school);
-
-    // Audit log
-    if (req.auditContext) {
-      await logAudit({
-        schoolId: school.schoolId,
-        action: 'school_deactivate',
-        performedBy: req.auditContext.performedBy,
-        targetId: school.schoolId,
-        targetType: 'school',
-        details: { name: school.name, slug: school.slug },
-        result: 'success',
-        ipAddress: req.auditContext.ipAddress,
-        userAgent: req.auditContext.userAgent,
-      });
-    }
-
-    res.json({ message: `School "${school.name}" deactivated` });
+    // is encrypted at rest (webhookEndpointModel's pre-save hook).
+    res.json({
+      webhookSecret: newSecret,
+      endpointId: String(endpoint._id),
+      previousSecretExpiresAt: endpoint.previousSecretExpiresAt,
+      deprecated: true,
+    });
   } catch (err) {
     next(err);
   }
 }
 
 // PATCH /api/schools/:schoolId/deactivate
-async function deactivateSchoolEndpoint(req, res, next) {
+// Single code path for soft-deactivating a school. Side effects:
+//   - sets isActive=false
+//   - writes a school_deactivate audit log entry
+//   - invalidates the school cache so requests for it are blocked at once
+async function deactivateSchool(req, res, next) {
   try {
     const school = await School.findOneAndUpdate(
       { schoolId: req.params.schoolId },
@@ -622,6 +627,13 @@ async function deactivateSchoolEndpoint(req, res, next) {
   } catch (err) {
     next(err);
   }
+}
+
+// DELETE /api/schools/:schoolId — deprecated alias for PATCH /:schoolId/deactivate
+function deprecatedDeleteSchool(req, res, next) {
+  res.set('Deprecation', 'true');
+  res.set('Link', `</api/schools/${req.params.schoolId}/deactivate>; rel="successor-version"`);
+  return deactivateSchool(req, res, next);
 }
 
 // PATCH /api/schools/:schoolId/activate
@@ -660,8 +672,15 @@ async function activateSchool(req, res, next) {
 }
 
 // POST /api/schools/:slug/webhooks
+//
+// DEPRECATED (#1640): WebhookEndpoint is the only webhook configuration model.
+// This route now creates (or re-points) the school's legacy WebhookEndpoint,
+// subscribed to the events the old School.webhookUrl path delivered, and
+// answers with a Deprecation header. Will be removed in the next release —
+// use POST /api/webhook-endpoints.
 async function registerWebhook(req, res, next) {
   try {
+    setWebhookDeprecationHeaders(res);
     const { webhookUrl } = req.body;
 
     if (!webhookUrl || typeof webhookUrl !== 'string') {
@@ -673,17 +692,19 @@ async function registerWebhook(req, res, next) {
       return res.status(400).json({ error: 'webhookUrl must use https:// and resolve to a public IP address', code: 'INVALID_WEBHOOK_URL' });
     }
 
-    const school = await School.findOneAndUpdate(
-      { slug: req.params.slug, isActive: true },
-      { webhookUrl },
-      { new: true }
-    );
+    const school = await School.findOne({ slug: req.params.slug, isActive: true });
 
     if (!school) {
       const e = new Error('School not found');
       e.code = 'NOT_FOUND';
       return next(e);
     }
+
+    const { endpoint, created, secret } = await upsertLegacySchoolEndpoint({
+      schoolId: school.schoolId,
+      url: webhookUrl,
+      createdBy: req.auditContext?.performedBy || null,
+    });
 
     if (req.auditContext) {
       await logAudit({
@@ -692,15 +713,23 @@ async function registerWebhook(req, res, next) {
         performedBy: req.auditContext.performedBy,
         targetId: school.schoolId,
         targetType: 'school',
-        details: { webhookUrl },
+        details: { webhookUrl, endpointId: String(endpoint._id), created, deprecatedRoute: true },
         result: 'success',
         ipAddress: req.auditContext.ipAddress,
         userAgent: req.auditContext.userAgent,
       });
     }
 
-    schoolCache.invalidate(school);
-    res.json({ webhookUrl: school.webhookUrl });
+    const body = {
+      webhookUrl: endpoint.url,
+      endpointId: String(endpoint._id),
+      subscribedEvents: endpoint.subscribedEvents,
+      deprecated: true,
+    };
+    // A newly created endpoint's secret is returned once, like
+    // POST /api/webhook-endpoints.
+    if (created) body.webhookSecret = secret;
+    res.status(created ? 201 : 200).json(body);
   } catch (err) {
     next(err);
   }
@@ -790,4 +819,4 @@ async function clearSchoolSetting(req, res, next) {
   }
 }
 
-module.exports = { createSchool, getAllSchools, getSchool, updateSchool, rotateStellarAddress, rotateWebhookSecret, deactivateSchool, deactivateSchoolEndpoint, activateSchool, registerWebhook, getSchoolSettings, updateSchoolSettings, clearSchoolSetting };
+module.exports = { createSchool, getAllSchools, getSchool, updateSchool, rotateStellarAddress, rotateWebhookSecret, deactivateSchool, deprecatedDeleteSchool, activateSchool, registerWebhook, getSchoolSettings, updateSchoolSettings, clearSchoolSetting };

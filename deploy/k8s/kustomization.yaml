@@ -40,3 +40,4 @@ resources:
   - mongodb-statefulset.yaml
   - configmap.yaml
   - ingress.yaml
+  - backup-cronjob.yaml

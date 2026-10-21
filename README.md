@@ -198,7 +198,7 @@ StellarEduPay is a three-tier application:
                             │ REST API / SSE
                             ▼
 ┌────────────────────────────────────────────────────────────────┐
-│             Express.js Backend (Node.js 20+)                   │
+│             Express.js Backend (Node.js 24+)                   │
 │  Auth · Payments · Students · Schools · Reports · Webhooks     │
 │  Fee Adjustments · Disputes · Receipts · Audit Logs            │
 └──────────┬─────────────────────────────────┬───────────────────┘
@@ -240,7 +240,7 @@ StellarEduPay is a three-tier application:
 | Layer | Technology |
 |-------|-----------|
 | Blockchain | Stellar Network + Stellar SDK v12 |
-| Backend | Node.js 20+ · Express 4 |
+| Backend | Node.js 24+ · Express 4 |
 | Database | MongoDB 7 (Replica Set) · Mongoose 8 |
 | Queue | BullMQ 5 · Redis 7 |
 | Frontend | Next.js (React) |
@@ -255,7 +255,7 @@ StellarEduPay is a three-tier application:
 
 ### Prerequisites
 
-- **Node.js** ≥ 20 ([download](https://nodejs.org/))
+- **Node.js** ≥ 24 ([download](https://nodejs.org/))
 - **MongoDB 7** running as a **replica set** (required for multi-document transactions)
 - **Redis 7** (required for BullMQ; the service degrades gracefully without it but Redis is recommended for production)
 - **Git**
@@ -507,12 +507,11 @@ node scripts/seed-test-data.js --clean  # Drop and recreate
 
 ## API Reference
 
-Full OpenAPI specification is available at `GET /api/docs.json` (or `/api/docs` in development). In production (unless `SWAGGER_ENABLED=true`) `/api/docs.json` requires admin authentication. A static reference is in [`docs/api-spec.md`](docs/api-spec.md).
+The HTTP contract lives in [`backend/openapi.json`](backend/openapi.json), generated from the routers by `node scripts/openapi/generate.js` and enforced in CI (`node scripts/openapi/check-contract.js`). It is served at `GET /api/docs.json` (or `/api/docs` in development). In production (unless `SWAGGER_ENABLED=true`) `/api/docs.json` requires admin authentication. [`docs/api-spec.md`](docs/api-spec.md) has the full endpoint index plus request/response examples; the list below is a summary.
 
 ### Authentication
 
 ```
-POST /api/auth/register    Register a new admin account
 POST /api/auth/login       Login (returns JWT in HttpOnly cookie + response body)
 POST /api/auth/refresh     Refresh access token
 POST /api/auth/logout      Invalidate session
@@ -526,8 +525,8 @@ POST /api/auth/mfa/verify  Verify TOTP code
 POST   /api/schools            Create a school
 GET    /api/schools            List schools
 GET    /api/schools/:id        Get school details
-PUT    /api/schools/:id        Update school
-DELETE /api/schools/:id        Deactivate school
+PATCH  /api/schools/:id        Update school
+DELETE /api/schools/:id        Delete school
 ```
 
 ### Students
@@ -536,7 +535,7 @@ DELETE /api/schools/:id        Deactivate school
 POST   /api/students           Register a student (auto-assigns fee from class)
 GET    /api/students           List students (paginated)
 GET    /api/students/:id       Get student
-PUT    /api/students/:id       Update student
+PATCH  /api/students/:id       Update student
 DELETE /api/students/:id       Soft-delete student
 POST   /api/students/bulk      Bulk import via CSV (respects school quota)
 ```
@@ -560,8 +559,8 @@ GET    /api/payments/pending                   List pending verifications (pagin
 POST   /api/fees               Create a fee structure
 GET    /api/fees               List fee structures
 GET    /api/fees/:className    Get fee for a class
-PUT    /api/fees/:id           Update fee structure
-DELETE /api/fees/:id           Soft-delete fee structure
+PUT    /api/fees/:className    Update fee structure
+DELETE /api/fees/:className    Soft-delete fee structure
 ```
 
 ### Fee Adjustments
@@ -576,9 +575,10 @@ DELETE /api/fee-adjustments/:id        Delete rule
 ### Payment Plans
 
 ```
-POST   /api/payment-plans              Create installment plan
-GET    /api/payment-plans/:studentId   Get plan for student
-PUT    /api/payment-plans/:id          Update plan
+POST   /api/payment-plans/:studentId                              Create installment plan
+GET    /api/payment-plans/:studentId                              Get plan for student
+PATCH  /api/payment-plans/:studentId/installment/:installmentIndex Update an installment
+DELETE /api/payment-plans/:studentId                              Cancel plan
 ```
 
 ### Disputes
@@ -586,7 +586,7 @@ PUT    /api/payment-plans/:id          Update plan
 ```
 POST   /api/disputes           Open a dispute
 GET    /api/disputes           List disputes
-PUT    /api/disputes/:id       Update dispute status
+PATCH  /api/disputes/:id/resolve  Resolve a dispute
 ```
 
 ### Reports
@@ -610,14 +610,14 @@ GET    /api/audit              Paginated audit log with date/actor filters
 ### Reminders
 
 ```
-POST   /api/reminders/send     Trigger payment reminder emails
-GET    /api/reminders          List reminder history
+POST   /api/reminders/trigger  Trigger payment reminder emails
+GET    /api/reminders/preview  Preview who would be reminded
 ```
 
 ### Admin
 
 ```
-GET    /api/admin/retry-queue       Retry queue depth and status
+GET    /api/admin/retry-queue/stats Retry queue depth and status
 POST   /api/admin/log-level         Change log level at runtime
 GET    /api/consistency             Run data consistency check
 ```
@@ -905,51 +905,4 @@ StellarEduPay/
 |----------|-------------|
 | [`docs/architecture.md`](docs/architecture.md) | System design and data flow |
 | [`docs/api-spec.md`](docs/api-spec.md) | Full API reference |
-| [`docs/stellar-integration.md`](docs/stellar-integration.md) | Stellar-specific details |
-| [`docs/payment-limits.md`](docs/payment-limits.md) | Payment limits configuration |
-| [`docs/security.md`](docs/security.md) | Security model and threat analysis |
-| [`docs/WEBHOOK_INTEGRATION.md`](docs/WEBHOOK_INTEGRATION.md) | Webhook setup and HMAC verification |
-| [`docs/idempotency-payment-verification.md`](docs/idempotency-payment-verification.md) | Idempotency key design |
-| [`docs/QUICK_START_DOCKER.md`](docs/QUICK_START_DOCKER.md) | Docker quick start |
-
----
-
-## Changelog
-
-See [`CHANGELOG.md`](CHANGELOG.md) for a complete history of changes, breaking changes, and migration guides.
-
----
-
-## Troubleshooting
-
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `tx_insufficient_balance` | Testnet account has 0 XLM | Fund via [Friendbot](https://laboratory.stellar.org/#account-creator?network=test) |
-| `op_no_trust` | Recipient has no trustline for the asset | Submit a `ChangeTrust` op from the recipient account |
-| `connection refused` (MongoDB) | DB container not ready or wrong URI | Check `docker ps`; ensure `MONGO_URI` includes `?replicaSet=rs0` |
-| `tx_bad_auth` | Secret key doesn't match public address | Verify the keypair in `.env` |
-| Rate-limit counters reset on restart | `REDIS_HOST` not set | Configure Redis for persistent counters |
-| Swagger UI missing in production | Expected — intentional | Set `NODE_ENV` to anything other than `production`, set `SWAGGER_ENABLED=true`, or fetch `/api/docs.json` with an admin token |
-
----
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Add tests for new behaviour
-4. Run the full test suite: `npm test`
-5. Add a `[Unreleased]` entry to `CHANGELOG.md`
-6. Open a pull request — CI must pass before merging
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full contribution guide, coding standards, and PR process.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
-**Built with Stellar blockchain technology**
+| [`docs/stellar-integration.md
