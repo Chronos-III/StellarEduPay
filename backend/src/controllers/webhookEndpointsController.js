@@ -9,6 +9,7 @@ const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 const { logAudit } = require('../services/auditService');
 const { fireWebhook, sendTestDelivery } = require('../services/webhookService');
 const { parseOverlapSeconds, applySecretRotation } = require('../services/webhookEndpointService');
+const { requireStepUp } = require('../middleware/stepUpMiddleware');
 const logger = require('../utils/logger').child('WebhookEndpointsController');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -35,12 +36,21 @@ function _validateSignatureVersions(versions) {
 }
 
 function _callerSchoolId(req) {
-  // Prefer the JWT's schoolId (tenant-scoped); fall back to header.
-  return req.user?.schoolId || req.admin?.schoolId || req.headers['x-school-id'] || null;
+  // Tenant is derived exclusively from resolveSchool (req.schoolId / req.school).
+  // The client-supplied X-School-ID header is never trusted.
+  return req.schoolId || req.school?._id || req.school?.id || null;
 }
 
 function _performedBy(req) {
-  return req.user?.email || req.admin?.email || req.user?.sub || req.admin?.sub || 'unknown';
+  // Access tokens carry userId (not email/sub); fall back to admin identity.
+  return (
+    req.user?.userId ||
+    req.user?.id ||
+    req.admin?.userId ||
+    req.admin?.id ||
+    req.admin?.email ||
+    'unknown'
+  );
 }
 
 // ── POST /api/webhook-endpoints ───────────────────────────────────────────────
@@ -48,6 +58,11 @@ async function createEndpoint(req, res, next) {
   try {
     const schoolId = _callerSchoolId(req);
     if (!schoolId) return res.status(400).json({ error: 'schoolId required', code: 'MISSING_SCHOOL_ID' });
+
+    // Creating an endpoint points outbound payment data at a new URL — require
+    // step-up confirmation, same helper as wallet rotation.
+    const stepUpError = await requireStepUp(req);
+    if (stepUpError) return res.status(stepUpError.status).json(stepUpError.body);
 
     const { url, secret, subscribedEvents, isActive = true, description, signatureVersions } = req.body;
 
@@ -161,6 +176,13 @@ async function updateEndpoint(req, res, next) {
 
     const { url, secret, subscribedEvents, isActive, description, signatureVersions, overlapSeconds } = req.body;
     let secretOverlapSeconds = null;
+
+    if (url !== undefined && url !== endpoint.url) {
+      // Changing the delivery URL redirects future payment data — require
+      // step-up confirmation, same helper as wallet rotation.
+      const stepUpError = await requireStepUp(req);
+      if (stepUpError) return res.status(stepUpError.status).json(stepUpError.body);
+    }
 
     if (url !== undefined) {
       const urlCheck = await validateWebhookUrl(url);

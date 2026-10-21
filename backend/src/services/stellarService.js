@@ -1,5 +1,17 @@
 "use strict";
 
+// Issue #1557 — path payments deliver funds to the school wallet just like a
+// plain payment (the destination amount/asset are on the operation), so they
+// must be credited too. Previously only type "payment" was accepted.
+const CREDITABLE_OP_TYPES = new Set([
+  "payment",
+  "path_payment_strict_receive",
+  "path_payment_strict_send",
+]);
+function isCreditableOpType(type) {
+  return CREDITABLE_OP_TYPES.has(type);
+}
+
 const { Operation } = require("@stellar/stellar-sdk");
 const {
   server,
@@ -32,6 +44,7 @@ const {
 } = require("./paymentConfirmationStateMachine");
 const logger = require("../utils/logger").child("StellarService");
 const { getEngineForSchool } = require("./feeAdjustmentEngine");
+const { recordUnmatchedPayment } = require("./unmatchedPaymentService");
 const { PAYMENT_TYPES } = require("./paymentService");
 
 // TTL for the per-student balance lock (#1026), shared with paymentController's
@@ -169,7 +182,7 @@ async function extractValidPayment(tx, walletAddress) {
   // is recorded as its own payment row.
   const creditable = ops
     .map((op, i) => ({ op, opIndex: i }))
-    .filter(({ op }) => PAYMENT_TYPES.includes(op.type) && op.to === walletAddress)
+    .filter(({ op }) => isCreditableOpType(op.type) && op.to === walletAddress)
     .map(({ op, opIndex }) => {
       const asset = detectAsset(op);
       if (!asset) return null;
@@ -605,7 +618,7 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   const ops = await fetchAllOperations(tx, "verifyTransaction.operations");
   const creditable = ops
     .map((op, i) => ({ op, opIndex: i }))
-    .filter(({ op }) => PAYMENT_TYPES.includes(op.type) && op.to === walletAddress);
+    .filter(({ op }) => isCreditableOpType(op.type) && op.to === walletAddress);
   if (!creditable.length) {
     const err = new Error(
       `No payment operation found targeting the school wallet (${walletAddress})`,
@@ -800,7 +813,7 @@ async function syncPaymentsForSchool(school) {
             .then((records) => ({ records }))
             .catch(() => ({ records: [] }));
           const wrongDest = ops.records.find(
-            op => PAYMENT_TYPES.includes(op.type) && op.to && op.to !== stellarAddress
+            op => isCreditableOpType(op.type) && op.to && op.to !== stellarAddress
           );
           if (wrongDest) {
             logger.warn('Transaction skipped — destination does not match school wallet', {
@@ -861,413 +874,4 @@ async function syncPaymentsForSchool(school) {
         });
         studentDeleted = Boolean(student);
         if (studentDeleted) {
-          logger.warn('Transaction matched a soft-deleted student — recording for manual review', {
-            txHash: tx.hash, schoolId, studentId: targetStudentId,
-          });
-        }
-      }
-      if (!student) { summary.unmatched++; continue; }
-
-      summary.matched++;
-
-      // #1760 — validate each operation's amount against its own asset's limits.
-      let limitFailure = null;
-      for (const o of operations) {
-        const limitValidation = await validatePaymentAmount(o.amount, {
-          schoolId,
-          asset: o.asset?.assetCode,  // #1555: detectAsset returns assetCode, not code
-        });
-        if (!limitValidation.valid) { limitFailure = limitValidation; break; }
-      }
-      if (limitFailure) {
-        summary.failed++;
-        summary.failedDetails.push({ txHash: tx.hash, reason: limitFailure.code });
-        continue;
-      }
-
-      // Total credited for this transaction: the sum of all creditable operations.
-      const paymentAmount = parseFloat(
-        operations.reduce((sum, o) => sum + o.amount, 0).toFixed(7),
-      );
-
-      const senderAddress = operations[0].payOp.from || null;
-      const txDate = new Date(tx.created_at);
-      const txLedger = tx.ledger_attr || tx.ledger || null;
-
-      const collision = await detectMemoCollision(
-        memo,
-        senderAddress,
-        paymentAmount,
-        student.feeAmount,
-        txDate,
-        schoolId,
-      );
-      const crossSchoolCollision = await detectCrossSchoolMemoCollision(
-        memo,
-        schoolId,
-        txDate,
-      );
-      const isSuspicious = collision.suspicious || crossSchoolCollision.suspicious;
-      const suspicionReason =
-        [collision.reason, crossSchoolCollision.reason].filter(Boolean).join('; ') || null;
-
-      const confirmation = await determineConfirmationState(
-        txLedger,
-        CONFIRMATION_STATES.DETECTED,
-        isSuspicious,
-      );
-      const isConfirmed = isConfirmedOrAbove(confirmation.state);
-      const confirmationStatus = confirmation.confirmationStatus;
-
-      const studentId = student.studentId;
-      // Fee amount and category come from the intent when one exists; otherwise
-      // fall back to the student's current fee record (intent-decoupled crediting).
-      const feeAmountForRecord = intent ? intent.amount : student.feeAmount;
-      const feeCategory = intent ? (intent.feeCategory || null) : null;
-
-      // Issue #1026 — the balance write below is a non-atomic read-aggregate-then-
-      // absolute-write. It races against another sync pass touching the same
-      // student, and against verifyPayment's equivalent section, unless both hold
-      // this shared per-student lock around it.
-      const studentLockKey = lock.studentBalanceLockKey(schoolId, studentId);
-      const studentLockInfo = await lock.acquire(studentLockKey, STUDENT_BALANCE_LOCK_TTL_MS);
-      if (!studentLockInfo) {
-        // A concurrent verify/sync is updating this student's balance right now.
-        // Skip this transaction for this pass — it will be picked up on the next
-        // sync run once the in-flight update releases the lock.
-        summary.failed++;
-        summary.failedDetails.push({ txHash: tx.hash, reason: 'STUDENT_BALANCE_LOCK_CONTENDED' });
-        continue;
-      }
-      const studentLockToken = studentLockInfo.token;
-
-      const previousPayments = await Payment.aggregate([
-        { $match: { schoolId, studentId, deletedAt: null } },
-        { $group: { _id: null, total: { $sum: "$amount" } } },
-      ]);
-      const previousTotal = previousPayments.length
-        ? previousPayments[0].total
-        : 0;
-      const cumulativeTotal = parseFloat(
-        (previousTotal + paymentAmount).toFixed(7),
-      );
-
-      // Partial payments are accepted in the sync path — cumulative total determines status.
-      // Classification is delegated to the canonical classifyFeePayment helper (#1766)
-      // so the sync path, verify path and updateStudentBalance cannot diverge on the
-      // vocabulary used for a cumulative total below the fee.
-      const cumulativeClassification = classifyFeePayment(
-        cumulativeTotal,
-        student.feeAmount,
-      );
-      const cumulativeStatus = cumulativeClassification.status;
-      const excessAmount = cumulativeClassification.excessAmount;
-
-      let session;
-      try {
-        session = await mongoose.connection.startSession();
-        await session.withTransaction(async () => {
-          // #1760 — one payment row per (schoolId, txHash, opIndex).
-          for (const o of operations) {
-            await savePayment({
-              schoolId,
-              studentId,
-              txHash: tx.hash,
-              opIndex: o.opIndex,
-              correlationId: deriveCorrelationId(tx.hash),
-              amount: o.amount,
-              feeAmount: feeAmountForRecord,
-              feeCategory,
-              feeValidationStatus: cumulativeStatus,
-              excessAmount,
-              status: "SUCCESS",
-              memo,
-              senderAddress: o.payOp.from || null,
-              isSuspicious,
-              suspicionReason,
-              ledger: txLedger,
-              ledgerSequence: txLedger,
-              confirmationStatus,
-              confirmationState: confirmation.state,
-              confirmedAt: txDate,
-              studentDeleted,
-            }, { session });
-          }
-
-          if (isConfirmed && !isSuspicious && !studentDeleted) {
-            const updateData = {
-              totalPaid: cumulativeTotal,
-              remainingBalance: parseFloat(Math.max(0, student.feeAmount - cumulativeTotal).toFixed(7)),
-              feePaid: cumulativeTotal >= student.feeAmount,
-            };
-
-            if (feeCategory && student.fees && student.fees.length > 0) {
-              const feeIndex = student.fees.findIndex(f => f.category === feeCategory);
-              if (feeIndex !== -1) {
-                const categoryPayments = await Payment.aggregate([
-                  {
-                    $match: {
-                      schoolId,
-                      studentId,
-                      feeCategory,
-                      confirmationStatus: "confirmed",
-                      isSuspicious: false,
-                      deletedAt: null,
-                    },
-                  },
-                  { $group: { _id: null, total: { $sum: "$amount" } } },
-                ]).session(session);
-                const categoryTotalPaid = categoryPayments.length
-                  ? parseFloat(categoryPayments[0].total.toFixed(7))
-                  : 0;
-
-                student.fees[feeIndex].totalPaid = categoryTotalPaid;
-                student.fees[feeIndex].remainingBalance = Math.max(
-                  0,
-                  student.fees[feeIndex].amount - categoryTotalPaid
-                );
-                student.fees[feeIndex].paid = categoryTotalPaid >= student.fees[feeIndex].amount;
-                updateData.fees = student.fees;
-              }
-            }
-
-            await Student.findOneAndUpdate(
-              { schoolId, studentId },
-              updateData,
-              { session }
-            );
-          }
-
-          if (intent) {
-            await PaymentIntent.findOneAndUpdate(
-              { _id: intent._id, schoolId },
-              { status: "completed" },
-              { session }
-            );
-          }
-        });
-      } catch (saveErr) {
-        if (saveErr.code === 'DUPLICATE_TX') {
-          // Another concurrent path (poller or verify) already recorded this tx.
-          // Treat as already-processed rather than an error.
-          summary.new--;
-          summary.alreadyProcessed++;
-          if (intent) {
-            await PaymentIntent.findOneAndUpdate({ _id: intent._id, schoolId }, { status: 'completed' });
-          }
-          continue;
-        }
-        throw saveErr;
-      } finally {
-        if (session) await session.endSession();
-        await lock.release(studentLockKey, studentLockToken);
-      }
-      newPayments++;
-
-      logger.info("Transaction recorded", {
-        txHash: tx.hash,
-        schoolId,
-        studentId,
-        operationCount: operations.length,
-        amount: paymentAmount,
-        feeValidationStatus: cumulativeStatus,
-        isSuspicious,
-        confirmationStatus,
-        confirmationState: confirmation.state,
-        intentMatched: Boolean(intent),
-      });
-    }
-
-    if (!done) {
-      if (page.records.length < 200) break; // last page
-      page = await withStellarRetry(() => page.next(), {
-        label: `syncPaymentsForSchool.next(${schoolId})`,
-      });
-      if (!page || !page.records.length) break;
-    }
-  }
-
-  return summary;
-}
-
-/**
- * Re-check all non-terminal payments for a school and advance each one
- * (detected/pending -> confirmed -> finalized) per the finality policy
- * (issue #747). Safe to call repeatedly/concurrently for the same school:
- * `determineConfirmationState` is idempotent, so a re-run over an unchanged
- * ledger range leaves already-resolved payments untouched.
- *
- * Falls back to the legacy `confirmationStatus` field for payments written
- * before `confirmationState` existed, so older pending records keep getting
- * swept without a separate migration step.
- *
- * @param {string} schoolId
- */
-async function finalizeConfirmedPayments(schoolId) {
-  const pending = await Payment.find({
-    schoolId,
-    isSuspicious: false,
-    $or: [
-      { confirmationState: { $in: [CONFIRMATION_STATES.DETECTED, CONFIRMATION_STATES.PENDING, CONFIRMATION_STATES.CONFIRMED] } },
-      { confirmationState: { $exists: false }, confirmationStatus: "pending_confirmation" },
-    ],
-  });
-
-  for (const payment of pending) {
-    const txLedger = payment.ledgerSequence || payment.ledger;
-    if (!txLedger) continue;
-
-    const currentState = payment.confirmationState || CONFIRMATION_STATES.DETECTED;
-    const { state: nextState, changed } = await determineConfirmationState(
-      txLedger,
-      currentState,
-      payment.isSuspicious,
-    );
-    if (!changed) continue;
-
-    if (typeof Payment.findByIdAndUpdate === "function") {
-      await Payment.findOneAndUpdate({ _id: payment._id, schoolId }, {
-        confirmationState: nextState,
-        confirmationStatus: deriveLegacyConfirmationStatus(nextState),
-      });
-    }
-
-    if (!isConfirmedOrAbove(nextState)) continue;
-
-    const student = await Student.findOne({
-      schoolId,
-      studentId: payment.studentId,
-    });
-    if (!student) continue;
-
-    const agg = await Payment.aggregate([
-      {
-        $match: {
-          schoolId,
-          studentId: payment.studentId,
-          confirmationStatus: "confirmed",
-          isSuspicious: false,
-          deletedAt: null,
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-    const totalPaid = agg.length ? parseFloat(agg[0].total.toFixed(7)) : 0;
-    const remainingBalance = parseFloat(
-      Math.max(0, student.feeAmount - totalPaid).toFixed(7),
-    );
-
-    const updateData = { totalPaid, remainingBalance, feePaid: totalPaid >= student.feeAmount };
-
-    // Update fee categories if they exist
-    if (student.fees && student.fees.length > 0) {
-      const categoryPayments = await Payment.aggregate([
-        {
-          $match: {
-            schoolId,
-            studentId: payment.studentId,
-            feeCategory: { $ne: null },
-            confirmationStatus: "confirmed",
-            isSuspicious: false,
-            deletedAt: null,
-          },
-        },
-        {
-          $group: {
-            _id: "$feeCategory",
-            totalPaid: { $sum: "$amount" },
-          },
-        },
-      ]);
-
-      const categoryPaymentMap = {};
-      categoryPayments.forEach(cp => {
-        categoryPaymentMap[cp._id] = parseFloat(cp.totalPaid.toFixed(7));
-      });
-
-      // Update each fee category
-      student.fees.forEach(fee => {
-        const paid = categoryPaymentMap[fee.category] || 0;
-        fee.totalPaid = paid;
-        fee.remainingBalance = Math.max(0, fee.amount - paid);
-        fee.paid = paid >= fee.amount;
-      });
-
-      updateData.fees = student.fees;
-    }
-
-    await Student.findOneAndUpdate(
-      { schoolId, studentId: payment.studentId },
-      updateData,
-    );
-  }
-}
-
-/**
- * Parse an incoming Stellar transaction for memo and payment amounts.
- * If walletAddress is provided, only payments to that wallet are included.
- */
-async function parseIncomingTransaction(txHash, walletAddress = null) {
-  // withStellarRetry classifies any failure (404/429/5xx/network) into a
-  // structured error before it reaches here — see the design decision
-  // documented in withStellarRetry.js. No local try/catch needed.
-  const tx = await withStellarRetry(
-    () => server.transactions().transaction(txHash).call(),
-    { label: "parseIncomingTransaction", context: `Transaction ${txHash}` },
-  );
-
-  const memo = tx.memo ? tx.memo.trim() : null;
-
-  const ops = await fetchAllOperations(tx, "parseIncomingTransaction.operations");
-  const payments = ops
-    .map((op, i) => ({ op, opIndex: i }))
-    .filter(
-      ({ op }) =>
-        PAYMENT_TYPES.includes(op.type) && (!walletAddress || op.to === walletAddress),
-    )
-    .map(({ op, opIndex }) => {
-      const { assetType, assetCode, assetIssuer } = resolveDeliveredAsset(op);
-      return {
-        opIndex,
-        from: op.from || null,
-        to: op.to,
-        amount: normalizeAmount(resolveCreditedAmount(op)),
-        assetCode,
-        assetType,
-        assetIssuer,
-      };
-    });
-
-  return {
-    hash: tx.hash,
-    successful: tx.successful,
-    memo,
-    payments,
-    created_at: tx.created_at,
-  };
-}
-
-module.exports = {
-  syncPaymentsForSchool,
-  finalizeConfirmedPayments,
-  verifyTransaction,
-  parseIncomingTransaction,
-  validatePaymentAgainstFee,
-  validatePaymentWithDynamicFee,
-  detectAsset,
-  normalizeAmount,
-  extractValidPayment,
-  fetchAllOperations,
-  detectMemoCollision,
-  detectCrossSchoolMemoCollision,
-  detectAbnormalPatterns,
-  computeHistoricalAmountStats,
-  checkConfirmationStatus,
-  // Consumed by transactionPollingService (import + call) and covered by tests —
-  // must be exported or those callers invoke `undefined`.
-  determineConfirmationState,
-  // recordPayment was moved to transactionService.savePayment (db layer split);
-  // re-exported under its original name since paymentController, retryService,
-  // transactionQueueService, and transactionRetryQueue still import it from here.
-  recordPayment: savePayment,
-};
+          logger.warn('Transaction matched a soft-deleted student — recording for manual
