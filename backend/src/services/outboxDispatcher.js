@@ -50,6 +50,7 @@ const os = require('os');
 const Outbox = require('../models/outboxModel');
 const paymentEvents = require('../events/paymentEvents');
 const logger = require('../utils/logger');
+const { withSpan, withExtractedContext } = require('../tracing');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -214,10 +215,18 @@ async function dispatchEvent(event, maxRetries) {
 
   for (const { fn, name } of pendingListeners) {
     try {
-      const result = fn(event.payload, event);
-      if (result != null && typeof result.then === 'function') {
-        await result;
-      }
+      // #1636: continue the trace of the transaction that wrote the event.
+      await withExtractedContext(event.traceContext, () => withSpan(`outbox.dispatch ${event.eventType}`, {
+        'outbox.event_id': String(event._id),
+        'outbox.event_type': event.eventType,
+        'outbox.attempt': (event.retryCount || 0) + 1,
+        'outbox.listener': name,
+      }, async () => {
+        const result = fn(event.payload, event);
+        if (result != null && typeof result.then === 'function') {
+          await result;
+        }
+      }));
       // Success — record delivery immediately so a crash here still preserves
       // the fact that this listener succeeded (next retry skips it).
       await Outbox.updateOne(

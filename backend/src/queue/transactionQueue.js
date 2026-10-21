@@ -27,6 +27,7 @@ const { Queue, Worker } = require('bullmq');
 const PendingVerification = require('../models/pendingVerificationModel');
 const logger = require('../utils/logger');
 const { resolveCorrelationId } = require('../utils/correlationId');
+const { injectTraceContext } = require('../tracing');
 const { getRedisClient, isRedisReady } = require('../config/redisClient');
 const { transactionQueueProcessingDurationSeconds, transactionQueueFailedTotal } = require('../metrics');
 
@@ -197,7 +198,9 @@ async function enqueueTransaction(txHash, context = {}) {
   try {
     const job = await transactionQueue.add(
       'verify-transaction',
-      { txHash, ...enrichedContext },
+      // #1636: carry the W3C trace context so the worker (possibly on another
+      // replica) continues the same trace. Absent when tracing is off.
+      { txHash, ...enrichedContext, traceContext: injectTraceContext() },
       { jobId: txHash } // deduplicate by txHash
     );
     logger.info('[TransactionQueue] Enqueued transaction', { txHash, correlationId, jobId: job.id });
