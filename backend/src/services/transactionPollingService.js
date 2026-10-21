@@ -9,6 +9,7 @@ const { extractValidPayment, detectMemoCollision, detectCrossSchoolMemoCollision
 const { CONFIRMATION_STATES, isConfirmedOrAbove } = require('./paymentConfirmationStateMachine');
 const { validatePaymentAmount } = require('../utils/paymentLimits');
 const { compareAmounts, toStroops, stroopsToNumber, normalizeToNumber } = require('../utils/stellarAmount');
+const { classifyFeePayment } = require('../utils/money');
 const { generateReferenceCode } = require('../utils/generateReferenceCode');
 const { emit: sseEmit } = require('./sseService');
 const lock = require('./distributedLock');
@@ -18,6 +19,7 @@ const { deriveCorrelationId } = require('../utils/correlationId');
 const { captureFiatSnapshot } = require('./currencyConversionService');
 const { HorizonPollBudget, orderSchoolsByPriority } = require('./horizonPollBudget');
 const { updateStudentBalance } = require('../utils/studentBalanceUpdater');
+const { isBeforeIngestStart } = require('../utils/ingestWindow');
 
 // Metrics — imported lazily inside helpers to survive jest module resets.
 function _incFunnel(stage, schoolId) {
@@ -197,15 +199,18 @@ async function processTransaction(tx, school, fencingToken) {
   // mis-flagged as underpaid/overpaid by a float rounding epsilon.
   const cumulativeTotal = stroopsToNumber(toStroops(previousTotal) + toStroops(paymentAmount));
 
-  const cumulativeVsFee = compareAmounts(cumulativeTotal, student.feeAmount);
-  let cumulativeStatus;
-  if (cumulativeVsFee < 0) cumulativeStatus = 'underpaid';
-  else if (cumulativeVsFee > 0) cumulativeStatus = 'overpaid';
-  else cumulativeStatus = 'valid';
-
-  const excessAmount = cumulativeStatus === 'overpaid'
-    ? stroopsToNumber(toStroops(cumulativeTotal) - toStroops(student.feeAmount))
-    : 0;
+  // Route classification through the single canonical helper (#1766) so the
+  // poller/stream path uses the same vocabulary as verify and sync: 'partial'
+  // for a cumulative total below the fee, 'underpaid' only when an installment
+  // is short of its expected amount.
+  const classification = classifyFeePayment({
+    cumulativeTotal,
+    feeAmount: student.feeAmount,
+    installmentAmount: student.expectedInstallmentAmount,
+    hasPlan: Boolean(student.paymentPlanId),
+  });
+  const cumulativeStatus = classification.status;
+  const excessAmount = classification.excessAmount;
 
   // Extract network fee
   const networkFee = parseFloat(tx.fee_paid || '0') / 10000000;
@@ -319,21 +324,22 @@ async function processTransaction(tx, school, fencingToken) {
  * duplicate writes does not depend on the lock: the unique index on Payment
  * remains the authoritative dedup guard if the lock ever expires mid-poll.
  */
+/**
+ * Read the payment-processor queue depth that drives polling backpressure.
+ *
+ * The concurrent payment processor was removed (#1036) and no replacement
+ * currently emits queue depth, so this reports an empty queue. That is the
+ * explicit no-throttle fallback — the same `const queueDepth = 0;` pattern
+ * used in healthController.js — rather than a guarded `require` of a module
+ * that no longer exists. See docs/architecture.md for what now provides
+ * backpressure on payment processing.
+ */
 function getQueueBackpressureState() {
-  try {
-    const { concurrentPaymentProcessor } = require('./concurrentPaymentProcessor');
-    const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
-    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
-    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
-    return { queueDepth, maxQueueDepth, highWater, lowWater };
-  } catch (error) {
-    logger.warn('Unable to read payment processor stats for polling backpressure', {
-      error: error.message,
-    });
-    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, config.MAX_QUEUE_DEPTH);
-    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
-    return { queueDepth: 0, maxQueueDepth: config.MAX_QUEUE_DEPTH, highWater, lowWater };
-  }
+  const queueDepth = 0;
+  const maxQueueDepth = config.MAX_QUEUE_DEPTH;
+  const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
+  const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
+  return { queueDepth, maxQueueDepth, highWater, lowWater };
 }
 
 function getEffectiveBatchSize(queueDepth) {
@@ -427,6 +433,11 @@ async function pollSchoolTransactions(school, budget = null) {
       if (records.length === 0) break;
 
       for (const tx of records) {
+        if (isBeforeIngestStart(tx, school)) {
+          skippedCount++;
+          if (tx.paging_token) cursor = tx.paging_token;
+          continue;
+        }
         const result = await processTransaction(tx, school, fencingToken);
         if (result.processed) {
           processedCount++;
@@ -820,6 +831,7 @@ module.exports = {
   pollAllSchools,
   pollSchoolTransactions,
   processTransaction,
+  isBeforeIngestStart,
   // Exposed for testing
   _getBackoffState: () => ({ consecutiveErrors, currentIntervalMs }),
   getHorizonUnreachableSince: () => horizonUnreachableSince,
