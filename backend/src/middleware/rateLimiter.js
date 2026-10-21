@@ -153,7 +153,7 @@ function rl(windowMs, max, message = RL_MSG, opts = {}) {
 
     if (count > max) {
       res.set('Retry-After', resetSeconds);
-      return res.status(429).json(message);
+      return res.status(429).json({ ...message, retryAfter: resetSeconds });
     }
 
     next();
@@ -176,13 +176,10 @@ const SYNC_INTERVAL_MS = parseInt(
   10,
 );
 const SYNC_RL_MSG = {
-  success: false,
-  error: {
-    code: 'SYNC_RATE_LIMITED',
-    message:
-      'A manual sync was already requested for this school recently. ' +
-      'Background polling continues regardless; retry after the interval shown in Retry-After.',
-  },
+  error:
+    'A manual sync was already requested for this school recently. ' +
+    'Background polling continues regardless; retry after the interval shown in Retry-After.',
+  code: 'SYNC_RATE_LIMITED',
 };
 const syncLimiter = rl(SYNC_INTERVAL_MS, 1, SYNC_RL_MSG, {
   name: 'rl:sync',
@@ -195,15 +192,45 @@ const reminderTriggerLimiter = rl(
   { error: 'Too many reminder requests. Please wait.', code: 'RATE_LIMIT_EXCEEDED' },
   { name: 'rl:reminders', keyGenerator: (req) => `reminders:${req.schoolId || 'unknown-tenant'}` }
 );
+const BULK_IMPORT_RATE_LIMIT = parseInt(process.env.BULK_IMPORT_RATE_LIMIT, 10) || 5;
 const bulkImportLimiter    = rl(
   60 * 60 * 1000,
-  parseInt(process.env.BULK_IMPORT_RATE_LIMIT, 10) || 5,
-  { error: 'Maximum 5 bulk imports per hour.', code: 'RATE_LIMIT_EXCEEDED' },
+  BULK_IMPORT_RATE_LIMIT,
+  { error: `Maximum ${BULK_IMPORT_RATE_LIMIT} bulk imports per hour.`, code: 'RATE_LIMIT_EXCEEDED' },
   { name: 'rl:bulkimport', keyGenerator: (req) => req.schoolId || 'unknown-tenant' },
 );
 
 // GET /api/students/public/:studentId is a public endpoint that returns student info.
 // Without strict rate limiting, this can be used to enumerate student rosters.
-// Limit to 10 requests per IP per minute AND per school (dual key) with ale
+// Limit to 10 requests per IP per minute AND per school (dual key) with alerting.
+const publicStudentLimiter = rl(
+  60 * 1000,
+  10,
+  { error: 'Too many student lookup requests. Please try again later.', code: 'RATE_LIMIT_EXCEEDED' },
+  { 
+    name: 'rl:publicstudent',
+    keyGenerator: (req) => {
+      // Dual key: IP + school to prevent enumeration across different schools from same IP
+      const schoolId = req.schoolId || req.headers['x-school-id'] || 'unknown';
+      return `${req.ip}:${schoolId}`;
+    }
+  },
+);
 
-/* … truncated 870 chars — edit only what you need near the top … */
+module.exports = {
+  rl,
+  generalLimiter,
+  strictLimiter,
+  verifyLimiter,
+  reminderTriggerLimiter,
+  bulkImportLimiter,
+  publicStudentLimiter,
+  syncLimiter,
+  // Exported for tests only — the shared decision function both the Redis
+  // and in-memory paths call, plus the fallback-store internals.
+  _bucketInfo,
+  _slidingWindowCount,
+  _createFallbackStore,
+  _inMemoryBucketCount,
+  _inMemoryPreviousCount,
+};

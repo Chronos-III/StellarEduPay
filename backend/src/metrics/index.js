@@ -388,53 +388,6 @@ const mongoConnectionErrorsTotal = new client.Counter({
   registers: [registry],
 });
 
-// payment_processor_queue_depth / *_high_water / *_max_depth — the
-// in-process concurrent payment processor queue that MAX_QUEUE_DEPTH and
-// QUEUE_BACKPRESSURE_HIGH_WATER (config/index.js) govern. The thresholds are
-// exposed as gauges (not hardcoded in alert expressions) so an alert stays
-// correct if an operator overrides either env var.
-const paymentProcessorQueueDepth = new client.Gauge({
-  name: 'payment_processor_queue_depth',
-  help: 'Number of in-flight payments currently held by the concurrent payment processor',
-  registers: [registry],
-  collect() {
-    try {
-      const { concurrentPaymentProcessor } = require('../services/concurrentPaymentProcessor');
-      this.set(concurrentPaymentProcessor.getStats().queueDepth);
-    } catch (_) {
-      // Processor not loaded — scrape still succeeds
-    }
-  },
-});
-
-const paymentProcessorQueueHighWater = new client.Gauge({
-  name: 'payment_processor_queue_backpressure_high_water',
-  help: 'Configured high-water mark (QUEUE_BACKPRESSURE_HIGH_WATER) above which polling backpressure engages',
-  registers: [registry],
-  collect() {
-    try {
-      const config = require('../config');
-      this.set(config.QUEUE_BACKPRESSURE_HIGH_WATER);
-    } catch (_) {
-      // Config not loaded — scrape still succeeds
-    }
-  },
-});
-
-const paymentProcessorQueueMaxDepth = new client.Gauge({
-  name: 'payment_processor_queue_max_depth',
-  help: 'Configured maximum queue depth (MAX_QUEUE_DEPTH) beyond which payments are rejected as QUEUE_FULL',
-  registers: [registry],
-  collect() {
-    try {
-      const config = require('../config');
-      this.set(config.MAX_QUEUE_DEPTH);
-    } catch (_) {
-      // Config not loaded — scrape still succeeds
-    }
-  },
-});
-
 // backup_last_success_timestamp_seconds — Unix timestamp of the most recent
 // successful backup. Updated by POST /api/internal/backup-heartbeat which
 // backup.sh calls on success. Initialised to 0 (meaning "never recorded") so
@@ -543,13 +496,35 @@ function recordBackupRestoreTestSuccess(timestampSeconds = Math.floor(Date.now()
   _lastBackupRestoreTestSuccessAt = timestampSeconds;
 }
 
+// outbox_lag_seconds — age of the oldest pending/processing outbox event on
+// this scrape.  A rising value means the dispatcher is falling behind (slow
+// downstream, replica saturation, or dispatcher stopped).
+// Issue #1646: the metric is queried live from MongoDB on each scrape so it
+// reflects reality across restarts and is not reset by process recycling.
+// 0 is reported when no unprocessed events exist (healthy empty-queue state).
+new client.Gauge({
+  name: 'outbox_lag_seconds',
+  help: 'Age in seconds of the oldest outbox event not yet fully delivered (0 when queue is empty)',
+  registers: [registry],
+  async collect() {
+    try {
+      const Outbox = require('../models/outboxModel');
+      const oldest = await Outbox.findOne(
+        { status: { $in: ['pending', 'processing'] } },
+        { createdAt: 1 },
+        { sort: { createdAt: 1 }, lean: true }
+      );
+      this.set(oldest ? (Date.now() - oldest.createdAt.getTime()) / 1000 : 0);
+    } catch (_) {
+      // DB may not be ready yet — scrape still succeeds with stale/zero values
+    }
+  },
+});
+
 module.exports = {
   registry,
   mongoConnectionState,
   mongoConnectionErrorsTotal,
-  paymentProcessorQueueDepth,
-  paymentProcessorQueueHighWater,
-  paymentProcessorQueueMaxDepth,
   horizonPollBudgetRemaining,
   horizonPollBudgetCeiling,
   horizonPollDeferredSchools,
