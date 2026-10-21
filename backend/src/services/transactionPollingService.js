@@ -321,21 +321,22 @@ async function processTransaction(tx, school, fencingToken) {
  * duplicate writes does not depend on the lock: the unique index on Payment
  * remains the authoritative dedup guard if the lock ever expires mid-poll.
  */
+/**
+ * Read the payment-processor queue depth that drives polling backpressure.
+ *
+ * The concurrent payment processor was removed (#1036) and no replacement
+ * currently emits queue depth, so this reports an empty queue. That is the
+ * explicit no-throttle fallback — the same `const queueDepth = 0;` pattern
+ * used in healthController.js — rather than a guarded `require` of a module
+ * that no longer exists. See docs/architecture.md for what now provides
+ * backpressure on payment processing.
+ */
 function getQueueBackpressureState() {
-  try {
-    const { concurrentPaymentProcessor } = require('./concurrentPaymentProcessor');
-    const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
-    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
-    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
-    return { queueDepth, maxQueueDepth, highWater, lowWater };
-  } catch (error) {
-    logger.warn('Unable to read payment processor stats for polling backpressure', {
-      error: error.message,
-    });
-    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, config.MAX_QUEUE_DEPTH);
-    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
-    return { queueDepth: 0, maxQueueDepth: config.MAX_QUEUE_DEPTH, highWater, lowWater };
-  }
+  const queueDepth = 0;
+  const maxQueueDepth = config.MAX_QUEUE_DEPTH;
+  const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
+  const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
+  return { queueDepth, maxQueueDepth, highWater, lowWater };
 }
 
 function getEffectiveBatchSize(queueDepth) {

@@ -365,53 +365,6 @@ const mongoConnectionErrorsTotal = new client.Counter({
   registers: [registry],
 });
 
-// payment_processor_queue_depth / *_high_water / *_max_depth — the
-// in-process concurrent payment processor queue that MAX_QUEUE_DEPTH and
-// QUEUE_BACKPRESSURE_HIGH_WATER (config/index.js) govern. The thresholds are
-// exposed as gauges (not hardcoded in alert expressions) so an alert stays
-// correct if an operator overrides either env var.
-const paymentProcessorQueueDepth = new client.Gauge({
-  name: 'payment_processor_queue_depth',
-  help: 'Number of in-flight payments currently held by the concurrent payment processor',
-  registers: [registry],
-  collect() {
-    try {
-      const { concurrentPaymentProcessor } = require('../services/concurrentPaymentProcessor');
-      this.set(concurrentPaymentProcessor.getStats().queueDepth);
-    } catch (_) {
-      // Processor not loaded — scrape still succeeds
-    }
-  },
-});
-
-const paymentProcessorQueueHighWater = new client.Gauge({
-  name: 'payment_processor_queue_backpressure_high_water',
-  help: 'Configured high-water mark (QUEUE_BACKPRESSURE_HIGH_WATER) above which polling backpressure engages',
-  registers: [registry],
-  collect() {
-    try {
-      const config = require('../config');
-      this.set(config.QUEUE_BACKPRESSURE_HIGH_WATER);
-    } catch (_) {
-      // Config not loaded — scrape still succeeds
-    }
-  },
-});
-
-const paymentProcessorQueueMaxDepth = new client.Gauge({
-  name: 'payment_processor_queue_max_depth',
-  help: 'Configured maximum queue depth (MAX_QUEUE_DEPTH) beyond which payments are rejected as QUEUE_FULL',
-  registers: [registry],
-  collect() {
-    try {
-      const config = require('../config');
-      this.set(config.MAX_QUEUE_DEPTH);
-    } catch (_) {
-      // Config not loaded — scrape still succeeds
-    }
-  },
-});
-
 // backup_last_success_timestamp_seconds — Unix timestamp of the most recent
 // successful backup. Updated by POST /api/internal/backup-heartbeat which
 // backup.sh calls on success. Initialised to 0 (meaning "never recorded") so
@@ -549,9 +502,6 @@ module.exports = {
   registry,
   mongoConnectionState,
   mongoConnectionErrorsTotal,
-  paymentProcessorQueueDepth,
-  paymentProcessorQueueHighWater,
-  paymentProcessorQueueMaxDepth,
   horizonPollBudgetRemaining,
   horizonPollBudgetCeiling,
   horizonPollDeferredSchools,
