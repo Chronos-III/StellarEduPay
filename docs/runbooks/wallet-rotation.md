@@ -65,7 +65,7 @@ curl -s "https://horizon.stellar.org/accounts/<OLD_ADDRESS>/payments?order=desc&
 ```
 
 Cross-reference the results against `StellarEduPay`'s `Payment` records for
-the school (`GET /api/students/:studentId/payments` per student, or a direct
+the school (`GET /api/payments/:studentId` per student, or a direct
 `Payment.find({ schoolId })` query) to confirm every payment the pre-rotation
 poller already saw is recorded. Any payment on Horizon that isn't yet in
 `Payment` is still in flight — wait for it to confirm before rotating, or be
@@ -145,7 +145,7 @@ The endpoint:
   docker compose logs --tail=200 backend | grep -i "<schoolId>"
   ```
 - Send (or ask the school to confirm) a small test payment to the new
-  address and verify it appears in `GET /api/students/:studentId/payments`
+  address and verify it appears in `GET /api/payments/:studentId`
   within one poll cycle.
 - If the drain step found any unresolved in-flight payment to the **old**
   address, manually reconcile it: the payment recording pipeline keys off

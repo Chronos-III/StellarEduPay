@@ -3,8 +3,9 @@
 const express = require("express");
 
 /**
- * Regression test for issue #1594:
- * `GET /api/payments/verify/:receiptId` was shadowed by
+ * Regression tests for payment routes.
+ *
+ * Issue #1594: `GET /api/payments/verify/:receiptId` was shadowed by
  * `GET /api/payments/verify/:txHash` because Express matches the first
  * declared route with the same method + path pattern. The txHash route's
  * `validateTxHashParam` middleware rejects non-64-char-hex values with 400,
@@ -14,11 +15,10 @@ const express = require("express");
  * path pattern (which would shadow one another) and that the receipt
  * verification route is reachable on its own distinct path.
  *
- * Regression test for issue #1723:
- * paymentRoutes.js was truncated mid-statement, losing lock/unlock, refund,
- * admin status patch, and reconciliation routes. These tests assert every
- * expected method + path pair is registered so a repeat truncation is caught
- * immediately by CI.
+ * Issue #1723: an editing tool truncated the tail of paymentRoutes.js,
+ * dropping lock/unlock, admin status patches, refunds, reconciliation and
+ * `module.exports`. These tests assert every expected method + path pair is
+ * registered so a regression fails loudly.
  */
 
 /**
@@ -164,6 +164,13 @@ describe("payment routes (#1723) — all required routes are registered", () => 
   beforeAll(() => {
     const paymentRoutes = require("../paymentRoutes");
     routes = collectRoutes(paymentRoutes);
+  });
+
+  it("exports the router so app.js can mount it", () => {
+    const paymentRoutes = require("../paymentRoutes");
+    expect(paymentRoutes).toBeDefined();
+    expect(typeof paymentRoutes).toBe("function");
+    expect(Array.isArray(paymentRoutes.stack)).toBe(true);
   });
 
   // ── Core payment endpoints ──────────────────────────────────────────────
@@ -362,5 +369,38 @@ describe("payment routes (#1723) — all required routes are registered", () => 
     expect(reconciliationIdx).toBeGreaterThan(-1);
     expect(firstTxHashRouteIdx).toBeGreaterThan(-1);
     expect(reconciliationIdx).toBeLessThan(firstTxHashRouteIdx);
+  });
+
+  it("registers every expected method + path pair", () => {
+    const registered = new Set(
+      routes.map((r) => `${r.method} ${normalizePath(r.path)}`)
+    );
+
+    const expected = [
+      // lock / unlock
+      "POST /:paymentId/lock",
+      "POST /:paymentId/unlock",
+      // admin status patches
+      "PATCH /bulk/status",
+      "PATCH /:txHash/status",
+      "PATCH /:txHash/suspicion-review",
+      "PATCH /:txHash/correct-placeholder",
+      // refunds
+      "POST /:txHash/refund",
+      "POST /refunds/:refundId/approve",
+      "GET /:txHash/refunds",
+      "GET /refunds/school/list",
+      // receipt verification
+      "GET /verify/:receiptId",
+      // reconciliation
+      "GET /reconciliation/reports",
+      "POST /reconciliation/report",
+    ];
+
+    const missing = expected.filter(
+      (key) => !registered.has(normalizePath(key).replace(/^([A-Z]+) /, "$1 "))
+    );
+
+    expect(missing).toEqual([]);
   });
 });
