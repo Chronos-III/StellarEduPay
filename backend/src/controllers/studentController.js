@@ -9,6 +9,7 @@ const { csvEscape } = require('../utils/csv');
 const { normaliseName, nameError, NAME_MAX_LENGTH, CLASS_MAX_LENGTH } = require('../middleware/validate');
 const { logAudit } = require('../services/auditService');
 const { encryptStudentPii, decryptStudentPii, hashParentEmail } = require('../services/studentPiiEncryption');
+const { maskEmail, maskPhone } = require('../utils/piiRedaction');
 
 async function registerStudent(req, res, next) {
   // Declared in the function scope (not inside try) so the 11000 duplicate-key
@@ -377,15 +378,35 @@ async function getDeletedStudentPayments(req, res, next) {
   }
 }
 
+const PARENT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Audit the parent contact fields with masked values only (#1787): the audit
+// trail must never hold a plaintext address or phone number.
+function parentContactAudit(previous, current) {
+  const changed = previous.parentEmail !== current.parentEmail || previous.parentPhone !== current.parentPhone;
+  if (!changed) return { before: {}, after: {} };
+  return {
+    before: { parentEmail: maskEmail(previous.parentEmail), parentPhone: maskPhone(previous.parentPhone) },
+    after: { parentEmail: maskEmail(current.parentEmail), parentPhone: maskPhone(current.parentPhone) },
+  };
+}
+
 async function updateStudent(req, res, next) {
   try {
     const { studentId } = req.params;
-    const { name, class: className, feeAmount, reminderOptOut } = req.body;
+    const { name, class: className, feeAmount, reminderOptOut, parentEmail, parentPhone } = req.body;
 
     const original = await Student.findOne({ schoolId: req.schoolId, studentId }).lean();
     if (!original) {
       const err = new Error('Student not found');
       err.code = 'NOT_FOUND';
+      return next(err);
+    }
+
+    if (parentEmail !== undefined && parentEmail !== null && parentEmail !== '' && !PARENT_EMAIL_RE.test(String(parentEmail).trim())) {
+      const err = new Error('parentEmail must be a valid email address');
+      err.code = 'VALIDATION_ERROR';
+      err.status = 400;
       return next(err);
     }
 
@@ -409,11 +430,37 @@ async function updateStudent(req, res, next) {
     if (feeAmount !== undefined) update.feeAmount = feeAmount;
     if (reminderOptOut !== undefined) update.reminderOptOut = Boolean(reminderOptOut);
 
-    const student = await Student.findOneAndUpdate(
-      { schoolId: req.schoolId, studentId },
-      update,
-      { new: true, runValidators: true },
-    );
+    // Parent contact changes go through a document save, not findOneAndUpdate:
+    // the encryption and blind-index hooks in studentModel.js only run on save.
+    const doc = await Student.findOne({ schoolId: req.schoolId, studentId });
+    if (!doc) {
+      const err = new Error('Student not found');
+      err.code = 'NOT_FOUND';
+      return next(err);
+    }
+    doc.set(update);
+
+    // doc.parentEmail/parentPhone are decrypted by the post('init') hook; `original` is lean and is not.
+    const previousContact = { parentEmail: doc.parentEmail, parentPhone: doc.parentPhone };
+    const newEmail = parentEmail === undefined ? undefined : (parentEmail ? String(parentEmail).trim().toLowerCase() : null);
+    const newPhone = parentPhone === undefined ? undefined : (parentPhone ? String(parentPhone).trim() : null);
+    if (newEmail !== undefined && newEmail !== previousContact.parentEmail) {
+      doc.parentEmail = newEmail;
+      // A new address starts with a clean reminder history and is no longer suppressed.
+      doc.parentEmailSuppressed = false;
+      doc.parentEmailSuppressionReason = null;
+      doc.parentEmailSuppressedAt = null;
+      doc.reminderCount = 0;
+      doc.lastReminderSentAt = null;
+    }
+    if (newPhone !== undefined && newPhone !== previousContact.parentPhone) {
+      doc.parentPhone = newPhone;
+      doc.reminderCount = 0;
+      doc.lastReminderSentAt = null;
+    }
+
+    const student = await doc.save();
+    const contactAudit = parentContactAudit(previousContact, student);
 
     del(KEYS.student(req.schoolId, studentId), KEYS.publicStudent(req.schoolId, studentId));
 
@@ -426,8 +473,8 @@ async function updateStudent(req, res, next) {
         targetId: studentId,
         targetType: 'student',
         details: {
-          before: { name: original.name, class: original.class, feeAmount: original.feeAmount },
-          after: { name: student.name, class: student.class, feeAmount: student.feeAmount },
+          before: { name: original.name, class: original.class, feeAmount: original.feeAmount, ...contactAudit.before },
+          after: { name: student.name, class: student.class, feeAmount: student.feeAmount, ...contactAudit.after },
         },
         result: 'success',
         ipAddress: req.auditContext.ipAddress,
@@ -555,6 +602,20 @@ const CSV_MAX_SIZE_BYTES = parseInt(process.env.CSV_MAX_SIZE_BYTES, 10) || 5 * 1
 const CSV_MAX_ROWS = parseInt(process.env.CSV_MAX_ROWS, 10) || 10000;
 const CSV_MAX_COLUMNS = parseInt(process.env.CSV_MAX_COLUMNS, 10) || 20;
 const BULK_IMPORT_MAX_FAILURES = parseInt(process.env.BULK_IMPORT_MAX_FAILURES, 10) || 100;
+
+// Column names accepted by the bulk import (#1816). The template endpoint emits
+// exactly these headers so bursars do not have to guess the mapping.
+const BULK_IMPORT_TEMPLATE_HEADERS = ['studentId', 'name', 'class', 'feeAmount', 'parentEmail', 'parentPhone'];
+
+function buildBulkImportTemplateCsv(classNames = []) {
+  const example = ['STU001', 'Jane Doe', classNames[0] || 'Grade 1', '', 'parent@example.com', '+15555550100'];
+  const lines = [BULK_IMPORT_TEMPLATE_HEADERS.join(','), example.join(',')];
+  if (classNames.length > 0) {
+    lines.push('');
+    lines.push(`# Known classes: ${classNames.join(', ')}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
 
 function parseCsvBuffer(buffer) {
   return new Promise((resolve, reject) => {
@@ -738,6 +799,37 @@ async function bulkImportStudents(req, res, next) {
         parentPhone: encryptStudentPii(rawParentPhone),
         parentEmailHash: hashParentEmail(rawParentEmail),
       });
+    }
+
+    // Dry run (#1816): report what would be created without writing anything.
+    if (req.query && req.query.dryRun === 'true') {
+      const candidateIds = validatedRows.map(r => r.studentId);
+      const existing = candidateIds.length > 0
+        ? await Student.find({ schoolId, studentId: { $in: candidateIds }, deletedAt: null })
+            .select('studentId')
+            .lean()
+        : [];
+      const existingIds = new Set(existing.map(s => s.studentId));
+      const preview = { total: rows.length, wouldCreate: 0, failed: results.failed, details: results.details };
+      for (const row of validatedRows) {
+        if (existingIds.has(row.studentId)) {
+          preview.failed++;
+          if (preview.details.length < BULK_IMPORT_MAX_FAILURES) {
+            preview.details.push({
+              row: row.index + 2,
+              studentId: row.studentId,
+              error: 'Student ID already exists in this school',
+              code: 'DUPLICATE_STUDENT_ID',
+            });
+          }
+        } else {
+          preview.wouldCreate++;
+          if (preview.details.length < BULK_IMPORT_MAX_FAILURES) {
+            preview.details.push({ row: row.index + 2, studentId: row.studentId, status: 'valid' });
+          }
+        }
+      }
+      return res.status(200).json({ dryRun: true, ...preview });
     }
 
     // Process validated rows in chunks using insertMany with ordered: false
@@ -1226,4 +1318,18 @@ async function adjustStudentCredit(req, res, next) {
   }
 }
 
-module.exports = { registerStudent, getAllStudents, getStudent, getPublicStudentInfo, updateStudent, deleteStudent, restoreStudent, getDeletedStudentPayments, getPaymentSummary, bulkImportStudents, getOverdueStudents, resetPayment, reconcileStudent, parseCsvBuffer, exportStudents, getFeeHistory, FEE_HISTORY_MAX_LIMIT, adjustStudentCredit };
+// GET /api/students/bulk/template.csv (#1816)
+async function getBulkImportTemplate(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const feeStructures = await FeeStructure.find({ schoolId, isActive: true }).select('className').lean();
+    const classNames = [...new Set(feeStructures.map(fs => fs.className))].sort();
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="student-import-template.csv"');
+    return res.status(200).send(buildBulkImportTemplateCsv(classNames));
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { registerStudent, getAllStudents, getStudent, getPublicStudentInfo, updateStudent, deleteStudent, restoreStudent, getDeletedStudentPayments, getPaymentSummary, bulkImportStudents, getBulkImportTemplate, buildBulkImportTemplateCsv, BULK_IMPORT_TEMPLATE_HEADERS, getOverdueStudents, resetPayment, reconcileStudent, parseCsvBuffer, exportStudents, getFeeHistory, FEE_HISTORY_MAX_LIMIT, adjustStudentCredit };
