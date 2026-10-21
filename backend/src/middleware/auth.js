@@ -6,6 +6,7 @@ const { get, set } = require('../cache');
 const { sendAdminAlert } = require('../services/alertService');
 const { getRedisClient, isRedisReady } = require('../config/redisClient');
 const { hashIp } = require('../utils/piiRedaction');
+const User = require('../models/User');
 const tokenService = require('../services/tokenService');
 
 // ── IP failure tracking constants ──────────────────────────────────────────────
@@ -19,6 +20,46 @@ function ipFailKey(ip) {
 
 function ipBlockKey(ip) {
   return `ip_blocked:${ip}`;
+}
+
+// ── Session revocation check ──────────────────────────────────────────────────
+// Deactivation and role changes bump user.tokenVersion and revoke refresh
+// families. Access tokens carry the tokenVersion they were minted with, so a
+// mismatch (or an inactive user) means the session must be rejected now rather
+// than at access-token expiry.
+//
+// Returns null when the token is still valid, or a { status, body } object to
+// send back when it has been revoked.
+async function checkSessionRevoked(decoded) {
+  // Env super-admin tokens (role:'admin') are not backed by a DB user row.
+  if (decoded.role === 'admin' && !decoded.userId && !decoded.sub) return null;
+
+  const userId = decoded.userId || decoded.sub || decoded.id;
+  if (!userId) return null;
+
+  let user;
+  try {
+    user = await User.findById(userId).select('isActive tokenVersion').lean();
+  } catch (err) {
+    logger.error('[AuthMiddleware] Failed to load user for session check', { error: err.message, userId });
+    return { status: 500, body: { error: 'Server error validating session.', code: 'SESSION_CHECK_FAILED' } };
+  }
+
+  if (!user) {
+    return { status: 401, body: { error: 'Session is no longer valid.', code: 'SESSION_REVOKED' } };
+  }
+
+  if (user.isActive === false) {
+    return { status: 401, body: { error: 'Account is deactivated.', code: 'SESSION_REVOKED' } };
+  }
+
+  const storedVersion = user.tokenVersion || 0;
+  const tokenVersion = decoded.tokenVersion || 0;
+  if (storedVersion !== tokenVersion) {
+    return { status: 401, body: { error: 'Session has been revoked.', code: 'SESSION_REVOKED' } };
+  }
+
+  return null;
 }
 
 // ── Shared failure handler (used by both middleware factories) ────────────────
@@ -142,6 +183,12 @@ async function requireAdminAuth(req, res, next) {
       return res.status(403).json({ error: 'Forbidden. Admin role required.', code: 'INSUFFICIENT_ROLE' });
     }
 
+    // Reject tokens whose session has been revoked (deactivated/demoted user).
+    const revoked = await checkSessionRevoked(decoded);
+    if (revoked) {
+      return res.status(revoked.status).json(revoked.body);
+    }
+
     req.admin = decoded;
     req.user = decoded; // alias so downstream code works regardless of which middleware ran
     next();
@@ -215,6 +262,53 @@ function requireSchoolAuth(allowedRoles = []) {
 
     if (decoded.sid && await tokenService.isSessionRevoked(decoded.sid)) {
       return handleAuthFailure(req, res, ip, 'Session has been revoked.', 'SESSION_REVOKED', { countTowardsBlock: false });
+    }
+
+    // Reject tokens whose session has been revoked (deactivated/demoted user).
+    const revoked = await checkSessionRevoked(decoded);
+    if (revoked) {
+      return res.status(revoked.status).json(revoked.body);
+    }
+
+    // Super-admin bypass — break-glass access to all tenants
+    const isSuperAdmin =
+      decoded.role === 'admin' ||
+      (Array.isArray(decoded.roles) && decoded.roles.includes('super_admin'));
+
+    if (!isSuperAdmin) {
+      // Tenant scope: non-super-admin tokens MUST have a schoolId
+      if (!decoded.schoolId) {
+        return res.status(403).json({
+          error: 'Forbidden. Token is not scoped to a school.',
+          code: 'MISSING_TENANT_CLAIM',
+        });
+      }
+
+      // Token schoolId must match the requested school.
+      // Accept schoolId from X-School-ID header, URL param, or route param.
+      // URL param support enables EventSource (which cannot send custom headers).
+      const requestedSchoolId = req.headers['x-school-id'] || req.query?.schoolId || req.params?.schoolId;
+      if (requestedSchoolId && decoded.schoolId !== requestedSchoolId) {
+        return res.status(403).json({
+          error: 'Forbidden. Token schoolId does not match the requested school.',
+          code: 'TENANT_MISMATCH',
+        });
+      }
+
+      // Role check
+      if (allowedRoles.length > 0) {
+        const userRoles = Array.isArray(decoded.roles) ? decoded.roles : [];
+        const hasRole = allowedRoles.some((r) => userRoles.includes(r));
+        if (!hasRole) {
+          return res.status(403).json({
+            error: `Forbidden. Required role: ${allowedRoles.join(' or ')}.`,
+            code: 'INSUFFICIENT_ROLE',
+          });
+        }
+      }
+
+      // Set req.schoolId from token — authoritative source for downstream use
+      req.schoolId = decoded.schoolId;
     }
 
     // Tenant isolation: token schoolId must match X-School-ID header

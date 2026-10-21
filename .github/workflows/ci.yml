@@ -90,6 +90,63 @@ jobs:
       - name: Check generated route manifest and API contract
         run: npm run test:contract
 
+  # ── #1723: Standalone syntax gate ──────────────────────────────────────────
+  # Runs `node --check` over every tracked backend JS file.  Requires only a
+  # Node.js install — no npm install, no MongoDB, no Redis — so it fires on
+  # every push/PR within seconds and catches truncation or parse errors before
+  # the heavier test job even starts.
+  syntax-check:
+    name: Syntax check (node --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - name: Check JS syntax (backend/src)
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r -d '' file; do
+            if ! node --check "$file" 2>&1; then
+              echo "SYNTAX ERROR: $file"
+              failed=1
+            fi
+          done < <(find backend/src -name '*.js' -not -path '*/node_modules/*' -print0)
+          if [ "$failed" -ne 0 ]; then
+            echo "One or more files failed node --check"
+            exit 1
+          fi
+          echo "All backend/src JS files passed node --check"
+
+  dead-code-backend:
+    name: Detect dead/orphan backend modules (knip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@v6
+        with:
+          path: backend/node_modules
+          key: ${{ runner.os }}-backend-node-${{ hashFiles('backend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-backend-node-
+      - name: Install backend dependencies
+        run: cd backend && npm ci
+      - name: Run knip (unused files/exports)
+        run: cd backend && npx knip --reporter compact
+
+  lint-frontend:
+    name: Lint frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
   property:
     name: Property-based money invariants
     runs-on: ubuntu-latest
@@ -148,6 +205,143 @@ jobs:
   #   - Start: global 46 % branches / 37 % functions / 51 % lines (backend)
   #            global 47 % branches / 22 % functions / 39 % lines (frontend)
   #   - Target: raise each value by ~5 pp per sprint until ≥ 80
+  #
+  # #1635: on top of the Jest floors, scripts/coverage-ratchet.js compares this
+  # run against coverage-baseline.json and fails if any global metric — or the
+  # line coverage of any file changed in the PR — went down. The result is
+  # posted as a sticky PR comment. Raise the baseline with
+  # `npm run coverage:ratchet -- --update` after coverage improves.
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+      MONGO_URI: mongodb://localhost:27017/stellaredupay_test?replicaSet=rs0
+      JWT_SECRET: ci-test-jwt-secret-not-used-in-production
+      SCHOOL_WALLET_ADDRESS: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --replSet rs0
+          --health-cmd "mongosh --quiet --eval 'try { if (rs.status().ok !== 1) { throw new Error(\"rs not initiated\"); } } catch (e) { try { rs.initiate({ _id: \"rs0\", members: [{ _id: 0, host: \"localhost:27017\" }] }); } catch (e2) {} process.exit(1); } if (!db.hello().isWritablePrimary) { process.exit(1); }'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@v6
+        with:
+          path: |
+            backend/node_modules
+            frontend/node_modules
+            node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - run: npm ci
+      - run: cd backend && npm ci && cd ..
+      - run: cd frontend && npm ci && cd ..
+      - name: Syntax check
+        run: npm run check:syntax
+      - name: Validate migration policy
+        run: node scripts/validate-migrations.js
+      - name: Run migrations against CI MongoDB
+        run: npm run migrate:up
+      - name: Backend coverage
+        run: npm run coverage
+      - name: Frontend coverage
+        if: always()
+        run: npm run coverage:frontend
+      - name: Coverage ratchet
+        if: always()
+        run: node scripts/coverage-ratchet.js --base origin/${{ github.base_ref || 'main' }} --markdown coverage/ratchet.md
+      - name: Comment coverage on PR
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage-ratchet
+          path: coverage/ratchet.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [syntax-check]
+    env:
+      STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+      MONGO_URI: mongodb://localhost:27017/stellaredupay_test?replicaSet=rs0
+      JWT_SECRET: ci-test-jwt-secret-not-used-in-production
+      SCHOOL_WALLET_ADDRESS: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --replSet rs0
+          --health-cmd "mongosh --quiet --eval 'try { if (rs.status().ok !== 1) { throw new Error(\"rs not initiated\"); } } catch (e) { try { rs.initiate({ _id: \"rs0\", members: [{ _id: 0, host: \"localhost:27017\" }] }); } catch (e2) {} process.exit(1); } if (!db.hello().isWritablePrimary) { process.exit(1); }'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@v6
+        with:
+          path: |
+            backend/node_modules
+            frontend/node_modules
+            node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - run: npm ci
+      - run: cd backend && npm ci && cd ..
+      - run: cd frontend && npm ci && cd ..
+      - name: Syntax check
+        run: npm run check:syntax
+      - name: Validate migration policy
+        run: node scripts/validate-migrations.js
+      - name: Run migrations against CI MongoDB
+        run: npm run migrate:up
+      - name: Backend coverage
+        run: npm run coverage
+      - name: Frontend coverage
+        if: always()
+        run: npm run coverage:frontend
+      - name: Coverage ratchet
+        if: always()
+        run: node scripts/coverage-ratchet.js --base origin/${{ github.base_ref || 'main' }} --markdown coverage/ratchet.md
+      - name: Comment coverage on PR
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage-ratchet
+          path: coverage/ratchet.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
 
   frontend:
     name: Frontend

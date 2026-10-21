@@ -256,6 +256,11 @@ async function flagDispute(req, res, next) {
     if (!payment) {
       return res.status(404).json({ error: 'Payment not found for this school.', code: 'NOT_FOUND' });
     }
+    // #1810 — a dispute and its disputeHold must attach to the student the
+    // payment actually belongs to, not whichever studentId the body claims.
+    if (String(payment.studentId) !== String(studentId)) {
+      return res.status(404).json({ error: 'Payment not found for this student.', code: 'NOT_FOUND' });
+    }
     const existing = await Dispute.findOne({ schoolId, txHash, status: { $in: ['open', 'under_review'] } });
     if (existing) {
       return res.status(409).json({ error: 'An active dispute already exists for this payment.', code: 'DISPUTE_ALREADY_EXISTS', disputeId: existing._id });

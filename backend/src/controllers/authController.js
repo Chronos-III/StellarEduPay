@@ -27,6 +27,39 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
+// ── Session revocation helper (#1772) ─────────────────────────────────────────
+// Revokes all refresh tokens/families for a user and bumps their tokenVersion
+// so any access token already issued is rejected by the auth middleware.
+// Returns the new tokenVersion (or null when the user cannot be found).
+async function revokeUserSessions(userId) {
+  if (!userId) return null;
+
+  const store = getStore();
+  const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
+
+  try {
+    await store.revokeAllUserTokens(userId, refreshTTL);
+  } catch (err) {
+    logger.warn('[AuthController] Failed to revoke user sessions', { userId, error: err.message });
+  }
+
+  // Bump tokenVersion so outstanding access tokens are invalidated immediately.
+  let newVersion = null;
+  try {
+    const User = require('../models/userModel');
+    const updated = await User.findByIdAndUpdate(
+      userId,
+      { $inc: { tokenVersion: 1 } },
+      { new: true, projection: { tokenVersion: 1 } }
+    );
+    newVersion = updated?.tokenVersion ?? null;
+  } catch (err) {
+    logger.warn('[AuthController] Failed to bump tokenVersion', { userId, error: err.message });
+  }
+
+  return newVersion;
+}
+
 // ── Per-account login lockout ─────────────────────────────────────────────────
 
 const LOGIN_FAIL_WINDOW = 900;
@@ -36,8 +69,20 @@ const LOGIN_LOCK_TTL = 900;
 function loginLockKey(id) { return `loginLock:${id}`; }
 function loginFailKey(id) { return `loginFail:${id}`; }
 
-function isLockedOut(loginId) {
-  return Boolean(get(loginLockKey(loginId)));
+// Issue #1795 — a lock written to Redis by another replica must be honoured,
+// so Redis is consulted in addition to the in-process cache.
+async function isLockedOut(loginId) {
+  if (get(loginLockKey(loginId))) return true;
+
+  const redis = getRedisClient();
+  if (redis && isRedisReady()) {
+    try {
+      return (await redis.exists(loginLockKey(loginId))) === 1;
+    } catch (e) {
+      logger.warn('[AuthController] Redis error checking login lockout', { error: e.message });
+    }
+  }
+  return false;
 }
 
 async function recordLoginFailure(loginId) {
@@ -145,7 +190,7 @@ async function handleLogin(req, res) {
   const { username, email, password, mfaCode } = req.body || {};
   const loginId = ((email || username) || '').trim().toLowerCase();
 
-  if (isLockedOut(loginId)) {
+  if (await isLockedOut(loginId)) {
     return res.status(429).json({
       error: 'Too many failed login attempts. Account temporarily locked.',
       code: 'ACCOUNT_LOCKED',
@@ -601,11 +646,13 @@ module.exports = {
   handleListSessions,
   handleRevokeSession,
   handleChangePassword,
+  revokeUserSessions,
   // Re-exported from services/sessionStore so callers (e.g. userController)
   // can revoke sessions without optional chaining that silently no-ops.
   getStore,
   revokeAllUserSessions,
   parseTTL,
   _resetStore,
+  isLockedOut,
   isSuperAdmin,
 };

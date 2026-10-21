@@ -11,6 +11,7 @@
     "test:contract": "npm run routes:check && jest tests/api-route-contract.test.js --runInBand",
     "test:integration": "STELLAR_INTEGRATION_TESTS=true jest --config tests/integration/jest.config.js --runInBand --forceExit",
     "test:property": "FC_SEED=18231824 jest tests/property-based-money.test.js --runInBand",
+    "coverage:ratchet": "node scripts/coverage-ratchet.js",
     "test:e2e": "jest tests/e2e/ --forceExit --runInBand --testPathIgnorePatterns=/node_modules/",
     "test:loadsim": "jest --testPathPattern=tests/loadsim/ --testPathIgnorePatterns=/node_modules/ --forceExit",
     "test:docker-healthcheck": "cross-env RUN_DOCKER_COMPOSE_HEALTHCHECK_TESTS=true jest tests/dockerComposeHealthCheck.test.js --forceExit",

@@ -292,7 +292,7 @@ HTTP 400
 
 ## Idempotency
 
-`POST /api/payments/intent` and `POST /api/payments/verify` require an `Idempotency-Key` header. Use any unique string (e.g. a UUID). The server caches the response for 24 hours.
+`POST /api/payments/intent` and `POST /api/payments/verify` require an `Idempotency-Key` header. The server caches the response for 24 hours and replays it for any retry that reuses the same key, so retries are safe and never double-record a payment.
 
 ```
 Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
@@ -304,6 +304,22 @@ Missing the header on these routes returns:
 HTTP 400
 { "error": "Idempotency-Key header is required for this request", "code": "MISSING_IDEMPOTENCY_KEY" }
 ```
+
+### Choosing a key
+
+| Route | Recommended key | Why |
+|---|---|---|
+| `POST /api/payments/verify` | `verify:<txHash>` | Deterministic per transaction hash. Retrying the same hash replays the cached result; a different hash is a new request. |
+| `POST /api/payments/intent` | `crypto.randomUUID()` | One key per logical intent creation, generated once and stored with the form state so a retry of the same submission reuses it. |
+
+Example for verify:
+
+```
+POST /api/payments/verify
+Idempotency-Key: verify:a1b2c3d4e5f6...64charhex
+```
+
+The frontend `verifyPayment(txHash)` helper sends this header automatically. Any client that omits it receives `400 MISSING_IDEMPOTENCY_KEY` before the handler runs.
 
 ---
 
@@ -679,6 +695,8 @@ Idempotency-Key: <uuid>
 ```
 Generates a unique time-limited memo (expires in 2 hours) for a student's payment.
 
+The `Idempotency-Key` header is **required** (see [Idempotency](#idempotency)). Generate one UUID per intent creation and reuse it when retrying the same submission.
+
 **Request body**
 
 | Field | Type | Required |
@@ -699,9 +717,11 @@ Generates a unique time-limited memo (expires in 2 hours) for a student's paymen
 ```
 POST /api/payments/verify
 X-School-ID: SCH-3F2A
-Idempotency-Key: <uuid>
+Idempotency-Key: verify:<txHash>
 ```
 Looks up a Stellar transaction by hash, validates it against the school wallet, records the payment, and returns the result. If the Stellar network is temporarily unavailable the transaction is queued for automatic retry.
+
+The `Idempotency-Key` header is **required** (see [Idempotency](#idempotency)). Use the deterministic key `verify:<txHash>` so that retrying the same transaction replays the cached result instead of re-recording the payment.
 
 **Request body**
 
@@ -1468,7 +1488,7 @@ Validation middleware failures return an `errors` array:
 |---|---|---|
 | `VALIDATION_ERROR` | 400 | Request body or query parameter failed validation |
 | `INVALID_DATE_FORMAT` | 400 | `startDate` or `endDate` is not a valid ISO 8601 date, or `startDate` is after `endDate` |
-| `MISSING_IDEMPOTENCY_KEY` | 400 | `Idempotency-Key` header missing on required routes |
+| `MISSING_IDEMPOTENCY_KEY` | 400 | `Idempotency-Key` header missing on required routes (`POST /api/payments/intent`, `POST /api/payments/verify`) |
 | `MISSING_SCHOOL_CONTEXT` | 400 | `X-School-ID` or `X-School-Slug` header missing |
 | `TX_FAILED` | 400 | Stellar transaction failed on-chain |
 | `MISSING_MEMO` | 400 | Transaction has no memo field |
