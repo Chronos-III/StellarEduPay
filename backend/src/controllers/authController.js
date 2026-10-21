@@ -69,8 +69,20 @@ const LOGIN_LOCK_TTL = 900;
 function loginLockKey(id) { return `loginLock:${id}`; }
 function loginFailKey(id) { return `loginFail:${id}`; }
 
-function isLockedOut(loginId) {
-  return Boolean(get(loginLockKey(loginId)));
+// Issue #1795 — a lock written to Redis by another replica must be honoured,
+// so Redis is consulted in addition to the in-process cache.
+async function isLockedOut(loginId) {
+  if (get(loginLockKey(loginId))) return true;
+
+  const redis = getRedisClient();
+  if (redis && isRedisReady()) {
+    try {
+      return (await redis.exists(loginLockKey(loginId))) === 1;
+    } catch (e) {
+      logger.warn('[AuthController] Redis error checking login lockout', { error: e.message });
+    }
+  }
+  return false;
 }
 
 async function recordLoginFailure(loginId) {
@@ -178,7 +190,7 @@ async function handleLogin(req, res) {
   const { username, email, password, mfaCode } = req.body || {};
   const loginId = ((email || username) || '').trim().toLowerCase();
 
-  if (isLockedOut(loginId)) {
+  if (await isLockedOut(loginId)) {
     return res.status(429).json({
       error: 'Too many failed login attempts. Account temporarily locked.',
       code: 'ACCOUNT_LOCKED',
@@ -641,5 +653,6 @@ module.exports = {
   revokeAllUserSessions,
   parseTTL,
   _resetStore,
+  isLockedOut,
   isSuperAdmin,
 };
