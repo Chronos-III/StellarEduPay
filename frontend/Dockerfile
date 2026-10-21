@@ -33,6 +33,16 @@ ARG NODE_VERSION=24
 # node:20-alpine pinned to the same immutable manifest digest as the builder.
 FROM node@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runner
 
+# Build metadata (#1634), supplied by .github/workflows/release.yml.
+ARG APP_VERSION=""
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV APP_VERSION=${APP_VERSION} \
+    GIT_SHA=${GIT_SHA} \
+    BUILD_TIME=${BUILD_TIME}
+LABEL org.opencontainers.image.version=${APP_VERSION} \
+      org.opencontainers.image.revision=${GIT_SHA}
+
 # Non-root user for security
 RUN addgroup -S -g 1001 appgroup && adduser -S -u 1001 -G appgroup appuser
 

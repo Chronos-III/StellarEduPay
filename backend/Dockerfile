@@ -15,6 +15,15 @@ RUN addgroup -S -g 1001 appgroup && adduser -S -u 1001 -G appgroup appuser
 # branches, and sets secure cookie flags even without an explicit override.
 ENV NODE_ENV=production
 
+# Build metadata (#1634) — reported by GET /api/version, /health/live and the
+# build_info metric. Supplied by .github/workflows/release.yml.
+ARG APP_VERSION=""
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV APP_VERSION=${APP_VERSION} \
+    GIT_SHA=${GIT_SHA} \
+    BUILD_TIME=${BUILD_TIME}
+
 WORKDIR /app
 
 COPY package*.json ./

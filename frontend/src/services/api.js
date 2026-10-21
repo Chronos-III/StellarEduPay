@@ -14,10 +14,39 @@ const api = axios.create({
   withCredentials: true,
 });
 
+// Issue #1762: Generate a UUID for idempotency keys. crypto.randomUUID is
+// available in all modern browsers and Node 19+, but fall back to a
+// Math.random-based v4 UUID for older environments.
+export function generateIdempotencyKey() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 // Attach the school context header to every request unless one is already set.
 // For super-admins: use selectedSchoolId from localStorage (school switcher selection).
 // For school users: use schoolId from their JWT token (stored after login).
 api.interceptors.request.use((config) => {
+  // Issue #1762: The backend's idempotency middleware rejects non-GET requests
+  // that lack an Idempotency-Key header (400 MISSING_IDEMPOTENCY_KEY). Attach a
+  // generated key to any mutating request that doesn't already carry one, so
+  // callers never have to remember. Callers that need a deterministic key
+  // (e.g. verifyPayment) set the header explicitly and it is preserved here.
+  const method = (config.method || "get").toLowerCase();
+  if (method !== "get" && method !== "head" && method !== "options") {
+    const hasIdempotencyKey = Object.keys(config.headers || {}).some(
+      (h) => h.toLowerCase() === "idempotency-key"
+    );
+    if (!hasIdempotencyKey) {
+      config.headers = { ...config.headers, "Idempotency-Key": generateIdempotencyKey() };
+    }
+  }
+
   const hasSchoolHeader = Object.keys(config.headers || {}).some(
     (h) => h.toLowerCase() === "x-school-id" || h.toLowerCase() === "x-school-slug"
   );
@@ -96,7 +125,26 @@ export const getPaymentSummary = () => api.get("/payments/summary");
 export const getPaymentInstructions = (studentId, { signal } = {}) => api.get(`/payments/instructions/${studentId}`, { signal });
 export const getStudentPayments = (studentId, { signal } = {}) => api.get(`/payments/${studentId}`, { signal });
 export const getStudentBalance  = (studentId, { signal } = {}) => api.get(`/payments/balance/${studentId}`, { signal });
-export const verifyPayment = (txHash) => api.post("/payments/verify", { txHash });
+// Issue #1762: /payments/verify is protected by the idempotency middleware.
+// Use a deterministic key derived from the txHash so retrying the same
+// verification replays the cached result instead of re-processing, while a
+// different hash is treated as a new request.
+export const verifyPayment = (txHash) =>
+  api.post(
+    "/payments/verify",
+    { txHash },
+    { headers: { "Idempotency-Key": `verify:${txHash}` } }
+  );
+// Issue #1762: /payments/intent also requires an Idempotency-Key. Callers
+// should generate one per logical action (e.g. with generateIdempotencyKey())
+// and keep it in form state so retries of the same intent replay. If omitted,
+// the request interceptor attaches a generated key.
+export const createPaymentIntent = (data, idempotencyKey) =>
+  api.post(
+    "/payments/intent",
+    data,
+    idempotencyKey ? { headers: { "Idempotency-Key": idempotencyKey } } : undefined
+  );
 export const syncPayments = () => api.post("/payments/sync");
 export const getSyncStatus = () => api.get("/payments/sync/status");
 export const getFeeStructures = () => api.get("/fees");
