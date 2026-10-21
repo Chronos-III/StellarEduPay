@@ -67,6 +67,29 @@ jobs:
         working-directory: backend
         run: npm ci --dry-run
 
+  route-contract:
+    name: Route manifest and frontend API contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@v6
+        with:
+          path: |
+            backend/node_modules
+            node_modules
+          key: ${{ runner.os }}-route-contract-${{ hashFiles('package-lock.json', 'backend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-route-contract-
+      - name: Install root dependencies
+        run: npm ci
+      - name: Install backend dependencies
+        run: cd backend && npm ci
+      - name: Check generated route manifest and API contract
+        run: npm run test:contract
+
   # ── #1723: Standalone syntax gate ──────────────────────────────────────────
   # Runs `node --check` over every tracked backend JS file.  Requires only a
   # Node.js install — no npm install, no MongoDB, no Redis — so it fires on
@@ -123,6 +146,52 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 20
+
+  property:
+    name: Property-based money invariants
+    runs-on: ubuntu-latest
+    env:
+      FC_SEED: 18231824
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-property-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-property-
+      - run: npm ci
+      - name: Run fixed-seed money property suite
+        run: npm run test:property
+
+  integration:
+    name: Critical integration flows
+    runs-on: ubuntu-latest
+    env:
+      STELLAR_INTEGRATION_TESTS: 'true'
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+      - uses: actions/cache@v6
+        with:
+          path: |
+            backend/node_modules
+            node_modules
+          key: ${{ runner.os }}-integration-${{ hashFiles('package-lock.json', 'backend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-integration-
+      - name: Install root dependencies
+        run: npm ci
+      - name: Install backend dependencies
+        run: cd backend && npm ci
+      - name: Run critical integration project
+        run: npm run test:integration
 
   # ── #1389: Test coverage enforcement ───────────────────────────────────────
   # Collects backend (root jest config) and frontend coverage and uploads the
