@@ -10,6 +10,8 @@
 
 const Student = require('../models/studentModel');
 const Payment = require('../models/paymentModel');
+const AcademicPeriod = require('../models/academicPeriodModel');
+const StudentPeriodFee = require('../models/studentPeriodFeeModel');
 const { toMoney, decimalFromMongo, classifyFeePayment } = require('./money');
 
 /**
@@ -135,7 +137,55 @@ async function updateStudentBalance(schoolId, studentId, options = {}) {
     { new: true, session }
   );
 
+  await syncCurrentPeriodFee(schoolId, studentId, session);
+
   return updatedStudent;
+}
+
+/**
+ * Keep the current academic period's StudentPeriodFee in step with payments (#1785).
+ *
+ * Payments carry no periodId, so a payment is attributed to the current period
+ * when it was made on or after the period's start. Closed periods are no longer
+ * current, so their totals stay frozen after a rollover.
+ */
+async function syncCurrentPeriodFee(schoolId, studentId, session) {
+  const period = await AcademicPeriod.findOne({ schoolId, isCurrent: true }).session(session).lean();
+  if (!period) return;
+
+  const periodFee = await StudentPeriodFee.findOne({ schoolId, studentId, periodId: period._id }).session(session);
+  if (!periodFee) return;
+
+  const paidAgg = await Payment.aggregate([
+    {
+      $match: {
+        schoolId,
+        studentId,
+        deletedAt: null,
+        status: 'SUCCESS',
+        isSuspicious: false,
+        createdAt: { $gte: period.startsAt },
+      },
+    },
+    { $group: { _id: null, total: { $sum: { $toDecimal: '$amount' } } } },
+  ]).session(session);
+
+  const paymentTotal = paidAgg.length ? decimalFromMongo(paidAgg[0].total) : toMoney(0);
+  const cumulativeTotal = toMoney(paymentTotal.plus(periodFee.creditAdjustments || 0));
+  const totalDue = (periodFee.feeAmount || 0) + (periodFee.carriedArrears || 0);
+  const classification = classifyFeePayment(cumulativeTotal, totalDue);
+
+  await StudentPeriodFee.updateOne(
+    { _id: periodFee._id },
+    {
+      $set: {
+        totalPaid: classification.cumulativeTotal,
+        remainingBalance: classification.remainingBalance,
+        feePaid: classification.feePaid,
+      },
+    },
+    { session }
+  );
 }
 
 module.exports = {

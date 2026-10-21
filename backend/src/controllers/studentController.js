@@ -2,6 +2,8 @@
 
 const Student = require('../models/studentModel');
 const FeeStructure = require('../models/feeStructureModel');
+const StudentFeeHistory = require('../models/studentFeeHistoryModel');
+const { updateStudentBalance } = require('../utils/studentBalanceUpdater');
 const { get, set, del, KEYS, TTL } = require('../cache');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
@@ -427,7 +429,13 @@ async function updateStudent(req, res, next) {
         update.feeAmount = feeStructure.feeAmount;
       }
     }
-    if (feeAmount !== undefined) update.feeAmount = feeAmount;
+    if (feeAmount !== undefined) {
+      const amount = Number(feeAmount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'feeAmount must be a positive number', code: 'VALIDATION_ERROR' });
+      }
+      update.feeAmount = amount;
+    }
     if (reminderOptOut !== undefined) update.reminderOptOut = Boolean(reminderOptOut);
 
     // Parent contact changes go through a document save, not findOneAndUpdate:
@@ -459,8 +467,24 @@ async function updateStudent(req, res, next) {
       doc.lastReminderSentAt = null;
     }
 
-    const student = await doc.save();
+    let student = await doc.save();
     const contactAudit = parentContactAudit(previousContact, student);
+
+    // A fee change alters remainingBalance and feePaid, so recompute them from
+    // the canonical formula and record the change in fee history (#1786).
+    const feeChanged = update.feeAmount !== undefined && update.feeAmount !== original.feeAmount;
+    if (feeChanged) {
+      student = await updateStudentBalance(req.schoolId, studentId) || student;
+      await StudentFeeHistory.create({
+        schoolId: req.schoolId,
+        studentId,
+        category: student.class,
+        amount: student.feeAmount,
+        paid: student.feePaid,
+        totalPaid: student.totalPaid,
+        remainingBalance: student.remainingBalance,
+      });
+    }
 
     del(KEYS.student(req.schoolId, studentId), KEYS.publicStudent(req.schoolId, studentId));
 
@@ -843,28 +867,4 @@ async function bulkImportStudents(req, res, next) {
             .lean()
         : [];
       const existingIds = new Set(existing.map(s => s.studentId));
-      const preview = { total: rows.length, wouldCreate: 0, failed: results.failed, details: results.details };
-      for (const row of validatedRows) {
-        if (existingIds.has(row.studentId)) {
-          preview.failed++;
-          if (preview.details.length < BULK_IMPORT_MAX_FAILURES) {
-            preview.details.push({
-              row: row.index + 2,
-              studentId: row.studentId,
-              error: 'Student ID already exists in this school',
-              code: 'DUPLICATE_STUDENT_ID',
-            });
-          }
-        } else {
-          preview.wouldCreate++;
-          if (preview.details.length < BULK_IMPORT_MAX_FAILURES) {
-            preview.details.push({ row: row.index + 2, studentId: row.studentId, status: 'valid' });
-          }
-        }
-      }
-      return res.status(200).json({ dryRun: true, ...preview });
-    }
-
-    // The quota is read and the rows are written under the school's quota lock,
-    // so a concurrent registration cannot take a seat between the check and the
-    // insert
+      const preview = { total: rows.length, wouldCreate

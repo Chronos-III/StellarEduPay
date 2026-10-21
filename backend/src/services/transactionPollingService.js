@@ -19,6 +19,7 @@ const { deriveCorrelationId } = require('../utils/correlationId');
 const { captureFiatSnapshot } = require('./currencyConversionService');
 const { HorizonPollBudget, orderSchoolsByPriority } = require('./horizonPollBudget');
 const { drainingWalletEntries } = require('./walletRotationService');
+const { recordUnmatchedPayment } = require('./unmatchedPaymentService');
 const { isBeforeIngestStart } = require('../utils/ingestWindow');
 
 // Metrics — imported lazily inside helpers to survive jest module resets.
@@ -138,6 +139,8 @@ async function processTransaction(tx, school, fencingToken) {
   const student = await Student.findOne({ schoolId, studentId: memo });
   if (!student) {
     logger.warn('Student not found for memo', { txHash: tx.hash, correlationId, schoolId, memo });
+    // Issue #1798 — keep the funds visible for review instead of only logging them.
+    await recordUnmatchedPayment({ schoolId, tx, payOp, memo, memoType: valid.memoType, asset, reason: 'student_not_found' });
     return { processed: false, reason: 'student_not_found' };
   }
 
@@ -887,8 +890,4 @@ module.exports = {
   _gatherSchoolSignals: gatherSchoolSignals,
   _resetBackoffState: () => {
     consecutiveErrors = 0;
-    currentIntervalMs = SYNC_INTERVAL_MS;
-    horizonUnreachableSince = null;
-    pollBudget = new HorizonPollBudget({ intervalMs: SYNC_INTERVAL_MS });
-    isPolling = true; // allow direct pollAllSchools() calls in tests
-    if (pollingInterval) { clearTimeout(pollingInterval); polling
+    currentIntervalMs = SY
