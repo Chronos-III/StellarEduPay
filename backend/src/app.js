@@ -42,6 +42,7 @@ const emailDeliveryRoutes = require('./routes/emailDeliveryRoutes');
 const emailProviderWebhookRoutes = require('./routes/emailProviderWebhookRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const authRoutes = require('./routes/authRoutes');
+const internalRoutes = require('./routes/internalRoutes');
 const emailRoutes = require('./routes/emailRoutes');
 const metricsRoute = require('./routes/metricsRoute');
 const webhookEndpointRoutes = require('./routes/webhookEndpointRoutes');
@@ -184,10 +185,17 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
+// Issue #1797 — the raw body is only kept for inbound webhook routes that verify
+// a signature over the exact bytes. Keeping a UTF-8 copy of every JSON body
+// doubled memory use (including bulk imports) and made the signed bytes depend
+// on re-decoding. The Buffer is stored as-is so signatures match the wire bytes.
+const RAW_BODY_ROUTE_RE = /^\/api\/(email-provider-webhook|email\/webhooks)(\/|$)/;
 app.use(express.json({
   limit: config.MAX_BODY_SIZE,
   verify: (req, res, buf) => {
-    req.rawBody = buf.toString('utf8');
+    if (RAW_BODY_ROUTE_RE.test(req.originalUrl.split('?')[0])) {
+      req.rawBody = buf;
+    }
   },
 }));
 app.use(requestLogger());
@@ -242,6 +250,7 @@ app.use('/api/email-deliveries', emailDeliveryRoutes);
 app.use('/api/email-provider-webhook', emailProviderWebhookRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/internal', internalRoutes);
 app.use('/api/webhook-endpoints', webhookEndpointRoutes);
 app.use('/api/webhook-deliveries', webhookDeliveryRoutes);
 app.use('/api/email', emailRoutes);
