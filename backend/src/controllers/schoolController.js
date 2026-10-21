@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const StellarSdk = require('@stellar/stellar-sdk');
 const School = require('../models/schoolModel');
 const { logAudit } = require('../services/auditService');
@@ -16,6 +17,147 @@ const {
   generateWebhookSecret,
 } = require('../services/webhookEndpointService');
 const { isSupportedCurrency } = require('../services/currencyConversionService');
+
+// Issue #1773: constant-time string comparison that does not leak length.
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a || ''));
+  const bufB = Buffer.from(String(b || ''));
+  const len = Math.max(bufA.length, bufB.length, 1);
+  const padA = Buffer.alloc(len);
+  const padB = Buffer.alloc(len);
+  bufA.copy(padA);
+  bufB.copy(padB);
+  return crypto.timingSafeEqual(padA, padB) && bufA.length === bufB.length;
+}
+
+// Issue #1773: shared step-up confirmation for sensitive actions (wallet
+// rotation, webhook-secret rotation). Replaces the old plaintext
+// ADMIN_PASSWORD comparison, which:
+//   - could never pass on hashed-credential (ADMIN_PASSWORD_HASH) deployments,
+//   - checked DB users against the wrong (shared env) credential,
+//   - acted as an unthrottled password oracle.
+// Now: bcrypt against ADMIN_PASSWORD_HASH for the env super-admin (legacy
+// safeEqual fallback to ADMIN_PASSWORD only when the hash is unset), bcrypt
+// against user.passwordHash for DB users, a required TOTP code when MFA is
+// enabled, failures counted toward the same lockout as login, and both
+// success and failure audited.
+async function verifyStepUp(req, { password, mfaCode } = {}) {
+  const auditContext = req.auditContext || {};
+  const performedBy = auditContext.performedBy || (req.user && (req.user.email || req.user.id)) || 'unknown';
+  const schoolId = req.params && req.params.schoolId;
+
+  const audit = async (result, details) => {
+    try {
+      await logAudit({
+        schoolId,
+        action: 'step_up_verification',
+        performedBy,
+        targetId: schoolId,
+        targetType: 'school',
+        details,
+        result,
+        ipAddress: auditContext.ipAddress,
+        userAgent: auditContext.userAgent,
+      });
+    } catch {
+      // Auditing must never mask the step-up outcome.
+    }
+  };
+
+  const fail = async (reason) => {
+    await audit('failure', { reason });
+    return { ok: false, reason };
+  };
+
+  const user = req.user || null;
+  const isDbUser = !!(user && user.passwordHash);
+
+  // --- Lockout check (same path as login) -------------------------------
+  const lockoutService = require('../services/lockoutService');
+  const lockoutKey = isDbUser
+    ? (user.email || user.id)
+    : (req.ip || (req.connection && req.connection.remoteAddress) || 'env-admin');
+
+  try {
+    const locked = await lockoutService.isLockedOut(lockoutKey);
+    if (locked) {
+      return fail('locked_out');
+    }
+  } catch {
+    // If the lockout store is unavailable, fail closed on the password check
+    // below rather than blocking all step-ups.
+  }
+
+  // --- Password verification -------------------------------------------
+  if (!password || typeof password !== 'string') {
+    return fail('missing_password');
+  }
+
+  let passwordOk = false;
+  if (isDbUser) {
+    passwordOk = await bcrypt.compare(password, user.passwordHash);
+  } else {
+    const hash = process.env.ADMIN_PASSWORD_HASH;
+    if (hash) {
+      passwordOk = await bcrypt.compare(password, hash);
+    } else if (process.env.ADMIN_PASSWORD) {
+      // Legacy fallback: plaintext env var, only when no hash is configured.
+      passwordOk = safeEqual(password, process.env.ADMIN_PASSWORD);
+    }
+  }
+
+  if (!passwordOk) {
+    try {
+      await lockoutService.recordLoginFailure(lockoutKey);
+    } catch {
+      // best-effort
+    }
+    return fail('invalid_password');
+  }
+
+  // --- MFA verification -------------------------------------------------
+  const mfaEnabled = isDbUser
+    ? !!user.mfaEnabled
+    : !!(req.school && req.school.mfaEnabled);
+
+  if (mfaEnabled) {
+    if (!mfaCode || typeof mfaCode !== 'string') {
+      return fail('missing_mfa_code');
+    }
+    let mfaOk = false;
+    try {
+      const mfaService = require('../services/mfaService');
+      const secret = isDbUser ? user.mfaSecret : (req.school && req.school.mfaSecret);
+      if (typeof mfaService.verifyToken === 'function') {
+        mfaOk = await mfaService.verifyToken(secret, mfaCode);
+      } else if (typeof mfaService.verifyTotp === 'function') {
+        mfaOk = await mfaService.verifyTotp(secret, mfaCode);
+      }
+    } catch {
+      mfaOk = false;
+    }
+    if (!mfaOk) {
+      try {
+        await lockoutService.recordLoginFailure(lockoutKey);
+      } catch {
+        // best-effort
+      }
+      return fail('invalid_mfa_code');
+    }
+  }
+
+  // Success — reset the failure counter, same as a successful login.
+  try {
+    if (typeof lockoutService.resetLoginFailures === 'function') {
+      await lockoutService.resetLoginFailures(lockoutKey);
+    }
+  } catch {
+    // best-effort
+  }
+
+  await audit('success', { mfaUsed: mfaEnabled });
+  return { ok: true };
+}
 
 function isValidTimezone(tz) {
   try {
@@ -230,24 +372,14 @@ async function updateSchool(req, res, next) {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
     }
 
-    // Issue #670: Step-up authentication for stellarAddress changes
+    // Issue #670 / #1773: Step-up authentication for stellarAddress changes
     if (updates.stellarAddress) {
-      const expectedPassword = process.env.ADMIN_PASSWORD;
-      const providedPassword = req.body.confirmPassword;
+      const stepUp = await verifyStepUp(req, {
+        password: req.body.confirmPassword,
+        mfaCode: req.body.mfaCode,
+      });
 
-      if (!expectedPassword || !providedPassword) {
-        return res.status(403).json({
-          error: 'Password confirmation required for stellarAddress change',
-          code: 'STEP_UP_REQUIRED',
-        });
-      }
-
-      // Constant-time comparison to prevent timing attacks
-      const crypto = require('crypto');
-      const bufExpected = Buffer.from(expectedPassword);
-      const bufProvided = Buffer.from(providedPassword);
-      
-      if (bufExpected.length !== bufProvided.length || !crypto.timingSafeEqual(bufExpected, bufProvided)) {
+      if (!stepUp.ok) {
         return res.status(403).json({
           error: 'Password confirmation required for stellarAddress change',
           code: 'STEP_UP_REQUIRED',
@@ -400,16 +532,12 @@ async function rotateStellarAddress(req, res, next) {
     // Step-up authentication — same pattern as updateSchool()'s stellarAddress
     // path: a valid admin session alone (requireAdminAuth) is not sufficient
     // to move where a school's fee payments are received.
-    const expectedPassword = process.env.ADMIN_PASSWORD;
-    const bufExpected = Buffer.from(expectedPassword || '');
-    const bufProvided = Buffer.from(confirmPassword || '');
-    const passwordOk =
-      !!expectedPassword &&
-      !!confirmPassword &&
-      bufExpected.length === bufProvided.length &&
-      crypto.timingSafeEqual(bufExpected, bufProvided);
+    const stepUp = await verifyStepUp(req, {
+      password: confirmPassword,
+      mfaCode: req.body && req.body.mfaCode,
+    });
 
-    if (!passwordOk) {
+    if (!stepUp.ok) {
       return res.status(403).json({
         error: 'Password confirmation required for stellarAddress rotation',
         code: 'STEP_UP_REQUIRED',
@@ -495,18 +623,11 @@ async function rotateStellarAddress(req, res, next) {
 async function rotateWebhookSecret(req, res, next) {
   try {
     setWebhookDeprecationHeaders(res);
-    const { confirmPassword, overlapSeconds } = req.body || {};
+    const { confirmPassword, mfaCode, overlapSeconds } = req.body || {};
 
-    const expectedPassword = process.env.ADMIN_PASSWORD;
-    const bufExpected = Buffer.from(expectedPassword || '');
-    const bufProvided = Buffer.from(confirmPassword || '');
-    const passwordOk =
-      !!expectedPassword &&
-      !!confirmPassword &&
-      bufExpected.length === bufProvided.length &&
-      crypto.timingSafeEqual(bufExpected, bufProvided);
+    const stepUp = await verifyStepUp(req, { password: confirmPassword, mfaCode });
 
-    if (!passwordOk) {
+    if (!stepUp.ok) {
       return res.status(403).json({
         error: 'Password confirmation required for webhookSecret rotation',
         code: 'STEP_UP_REQUIRED',

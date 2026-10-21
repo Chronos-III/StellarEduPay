@@ -2,6 +2,8 @@
 
 ## Overview
 
+Two subsystems disagree about what a "short" payment means.
+
 This document defines the **canonical student balance formula** used across all
 payment pipelines in StellarEduPay and explains how partial (installment) payments
 are reconciled, how credit adjustments are applied, and how the system determines
@@ -19,6 +21,23 @@ whether a student has paid in full.
 Every pipeline that records a payment **must** call `updateStudentBalance(schoolId,
 studentId, { session })` after persisting the payment record, and **must not** write
 `Student.totalPaid`, `Student.remainingBalance`, or `Student.feePaid` directly.
+
+### What the running code does
+
+Partial payments are **accepted and recorded as `SUCCESS`** — funds have
+already arrived on-chain. The `Payment.feeValidationStatus` field records
+`partial` for any payment below the total fee, including plan installments.
+This field describes the payment against the total fee and is what the balance,
+receipt, and reporting code reads.
+
+The `Payment` model carries an `underpaidReconciliation` sub-document
+(`status`, `appliedCredit`, `creditAppliedAt`, `creditAppliedBy`,
+`refundTxHash`, `refundInitiatedAt`, `refundCompletedAt`, `refundNote`) that
+is populated by the refund service when a refund is processed.
+
+A plan holder's installment is credited immediately toward the student's
+cumulative balance; the remaining shortfall is reflected in the student's
+`remainingBalance`.
 
 ### Formula
 
