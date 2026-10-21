@@ -50,6 +50,18 @@ services:
       - EMAIL_SENDGRID_WEBHOOK_PUBLIC_KEY=${EMAIL_SENDGRID_WEBHOOK_PUBLIC_KEY:-}
       # Date after which the deprecated V1 webhook signature is never sent (#1539).
       - WEBHOOK_V1_SUNSET=${WEBHOOK_V1_SUNSET:-2027-02-28}
+      # Encryption-at-rest keys (issue #1778). Both are 64-hex (32-byte) keys.
+      # Without them, parent email/phone and webhook secrets are stored in
+      # plaintext; the backend refuses to start in production unless both are
+      # set (or ALLOW_PLAINTEXT_PII=true, development only). Generate with:
+      #   openssl rand -hex 32
+      # STUDENT_PII_ENCRYPTION_KEY_PREVIOUS is optional and only used while
+      # rotating the PII key (decrypt-only fallback, mirroring webhook secrets).
+      - STUDENT_PII_ENCRYPTION_KEY=${STUDENT_PII_ENCRYPTION_KEY:-}
+      - STUDENT_PII_ENCRYPTION_KEY_PREVIOUS=${STUDENT_PII_ENCRYPTION_KEY_PREVIOUS:-}
+      - WEBHOOK_SECRET_ENCRYPTION_KEY=${WEBHOOK_SECRET_ENCRYPTION_KEY:-}
+      # Development-only escape hatch; never set this in production.
+      - ALLOW_PLAINTEXT_PII=${ALLOW_PLAINTEXT_PII:-}
     depends_on:
       mongo:
         condition: service_healthy

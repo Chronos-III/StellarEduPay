@@ -80,6 +80,8 @@ function redirectToLogin() {
   try {
     localStorage.removeItem("schoolId");
     localStorage.removeItem("userId");
+    // Super-admin school choice belongs to the previous session; don't carry it over.
+    localStorage.removeItem("selectedSchoolId");
   } catch {
     // localStorage unavailable (private browsing, disabled storage) — the
     // hard redirect below still ends the session from the app's perspective.

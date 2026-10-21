@@ -226,6 +226,10 @@ const concurrentMiddleware = createConcurrentRequestMiddleware({
 // Mounted before the rate-limiter so Prometheus scrapes are never throttled.
 app.use('/metrics', metricsRoute);
 
+// Issue #1792 — unauthenticated runtime config read on every frontend page load
+// (TestnetBanner network-mismatch guard), so it is mounted before the rate limiter.
+app.use('/api/public-config', publicConfigRoutes);
+
 app.use(concurrentMiddleware.rateLimiter((req) => req.ip));
 app.use(concurrentMiddleware.requestQueue());
 

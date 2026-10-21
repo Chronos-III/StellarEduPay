@@ -8,6 +8,7 @@ const { logAudit } = require('../services/auditService');
 const { verifyStellarAccountFunding } = require('../services/stellarAccountVerificationService');
 const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 const schoolCache = require('../services/schoolCacheInvalidator');
+const { buildWalletRotation } = require('../services/walletRotationService');
 const {
   parseOverlapSeconds,
   applySecretRotation,
@@ -459,6 +460,23 @@ async function updateSchool(req, res, next) {
       warning = fundingWarning;
     }
 
+    // Changing the address through this route is a rotation too: retire the
+    // old address and start the new cursor at its current ledger (#1799).
+    if (updates.stellarAddress && updates.stellarAddress !== original.stellarAddress) {
+      let rotation;
+      try {
+        rotation = await buildWalletRotation(original, updates.stellarAddress);
+      } catch {
+        return res.status(503).json({
+          error: 'Could not read the new wallet\'s transaction history from Horizon. Retry the change.',
+          code: 'HORIZON_UNAVAILABLE',
+        });
+      }
+      updates.syncCursor = rotation.syncCursor;
+      updates.walletActiveFrom = rotation.walletActiveFrom;
+      updates.$push = { walletHistory: rotation.retired };
+    }
+
     const school = await School.findOneAndUpdate(
       { schoolId: req.params.schoolId, isActive: true },
       updates,
@@ -513,7 +531,7 @@ async function updateSchool(req, res, next) {
 // useful during an incident review.
 async function rotateStellarAddress(req, res, next) {
   try {
-    const { stellarAddress, reason, confirmPassword } = req.body || {};
+    const { stellarAddress, reason, confirmPassword, backfill } = req.body || {};
 
     if (!reason || typeof reason !== 'string' || !reason.trim()) {
       return res.status(400).json({
@@ -564,13 +582,25 @@ async function rotateStellarAddress(req, res, next) {
     // updateSchool()'s stellarAddress path).
     const { warning } = await verifyStellarAccountFunding(stellarAddress);
 
+    // The new address starts at its current ledger, so an existing account's
+    // history is not replayed; `backfill: true` opts in to a full replay (#1799).
+    let rotation;
+    try {
+      rotation = await buildWalletRotation(school, stellarAddress, { backfill: backfill === true });
+    } catch {
+      return res.status(503).json({
+        error: 'Could not read the new wallet\'s transaction history from Horizon. Retry the rotation.',
+        code: 'HORIZON_UNAVAILABLE',
+      });
+    }
+
+    // The old address stays in walletHistory and keeps being polled until its
+    // drain window closes (docs/runbooks/wallet-rotation.md).
+    school.walletHistory.push(rotation.retired);
     school.previousStellarAddress = previousStellarAddress;
     school.stellarAddress = stellarAddress;
-    // A cursor scoped to the old address has no meaning against the new
-    // address's transaction history — see docs/runbooks/wallet-rotation.md
-    // for draining the old address and confirming no in-flight payments are
-    // missed across the cutover.
-    school.syncCursor = null;
+    school.syncCursor = rotation.syncCursor;
+    school.walletActiveFrom = rotation.walletActiveFrom;
     // The new wallet's pre-existing history must not be credited as fees (#1818).
     school.ingestStartsAt = new Date();
     await school.save();
@@ -587,6 +617,8 @@ async function rotateStellarAddress(req, res, next) {
         details: {
           previousStellarAddress,
           newStellarAddress: stellarAddress,
+          drainUntil: rotation.retired.drainUntil,
+          backfill: backfill === true,
           reason: reason.trim(),
           severity: 'high',
         },

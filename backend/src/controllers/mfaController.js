@@ -567,22 +567,74 @@ async function verifyAndEnableUserMfa(req, res) {
       severity: 'high',
     });
 
-    // #1356 — REQUIRE_MFA: this request's token may have been a restricted
-    // mfaSetupPending token. Reissue the access-token cookie without that
-    // flag so the just-completed setup takes effect immediately, without
-    // forcing the admin to log in again.
+    // #1356 / #1739 — REQUIRE_MFA: this request's token may have been a restricted
+    // mfaSetupPending token. Reissue the access-token cookie without that flag so the
+    // just-completed enrolment takes effect immediately, without forcing the admin to
+    // log in again.
+    //
+    // Fix 1 (#1739): use parseTTL() so that JWT_ACCESS_TOKEN_TTL="8h" resolves to
+    // 28800 seconds instead of parseInt("8h") === 8 (the bug that caused 8-second TTLs).
+    //
+    // Fix 2 (#1739): rotate the refresh token — revoke the old restricted family and
+    // issue a brand-new refresh token whose stored metadata no longer contains
+    // mfaSetupPending. Without this, handleRefresh copies the flag from the stored
+    // metadata and re-mints a restricted access token on every silent refresh even
+    // after enrolment is complete, keeping the user in the /mfa-setup loop.
     if (req.user?.mfaSetupPending) {
       const jwt = require('jsonwebtoken');
+      const { parseTTL, getStore, issueRefreshToken } = require('./authController');
       const { role, userId: uid, schoolId, roles } = req.user;
-      const accessTTL = parseInt(process.env.JWT_ACCESS_TOKEN_TTL, 10) || 8 * 3600;
-      const newToken = jwt.sign({ role, userId: uid, schoolId, roles }, process.env.JWT_SECRET, { expiresIn: accessTTL });
-      res.cookie('admin_token', newToken, {
+
+      const accessTTL  = parseTTL('JWT_ACCESS_TOKEN_TTL',  8 * 3600);
+      const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
+
+      // Build the full, unrestricted payload (no mfaSetupPending).
+      const newPayload = { role, userId: uid, schoolId, roles };
+      const newAccessToken = jwt.sign(newPayload, process.env.JWT_SECRET, { expiresIn: accessTTL });
+
+      // Rotate the refresh token: revoke the old family, issue a clean new one.
+      const store = getStore();
+      const oldRefreshToken = req.cookies?.admin_refresh_token;
+      if (oldRefreshToken) {
+        const oldMeta = await store.getToken(oldRefreshToken).catch(() => null);
+        if (oldMeta?.familyId) {
+          await store.revokeFamily(oldMeta.familyId, refreshTTL).catch(() =>
+            logger.warn('[MFA] Failed to revoke old refresh-token family after enrolment', { familyId: oldMeta.familyId })
+          );
+          if (oldMeta.sessionId) {
+            await store.delSession(oldMeta.sessionId).catch(() =>
+              logger.debug('[MFA] delSession after MFA enrolment missed')
+            );
+          }
+        }
+        await store.delToken(oldRefreshToken).catch(() =>
+          logger.debug('[MFA] delToken after MFA enrolment missed')
+        );
+      }
+
+      let newRefreshToken;
+      try {
+        newRefreshToken = await issueRefreshToken(store, newPayload, refreshTTL, req);
+      } catch (err) {
+        logger.error('[MFA] Failed to issue new refresh token after enrolment', { error: err.message });
+        // Non-fatal for the response, but the refresh rotation didn't happen.
+        // The access token is still fresh; the next manual login will clean things up.
+      }
+
+      const cookieBase = {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'strict',
-        maxAge: accessTTL * 1000,
         path: '/',
-      });
+      };
+      res.cookie('admin_token', newAccessToken, { ...cookieBase, maxAge: accessTTL * 1000 });
+      if (newRefreshToken) {
+        res.cookie('admin_refresh_token', newRefreshToken, {
+          ...cookieBase,
+          maxAge: refreshTTL * 1000,
+          path: '/api/auth',
+        });
+      }
     }
 
     return res.json({ message: 'MFA enabled successfully.' });
