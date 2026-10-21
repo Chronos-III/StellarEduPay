@@ -134,21 +134,11 @@ async function stopAcceptingNewWork() {
       const leaderElection = require('./leaderElection');
       if (leaderElection.stop) await leaderElection.stop();
     }},
+    // Issue #1646: stop the outbox dispatcher and wait for any in-flight batch
+    // to finish before the process closes MongoDB connections beneath it.
     { name: 'outboxDispatcher', fn: async () => {
       const outbox = require('./outboxDispatcher');
       if (outbox.stopOutboxDispatcher) await outbox.stopOutboxDispatcher();
-    }},
-    { name: 'reportQueueWorker', fn: async () => {
-      const reportQueueService = require('./reportQueueService');
-      if (reportQueueService.stopWorker) await reportQueueService.stopWorker();
-    }},
-    { name: 'reportCacheInvalidator', fn: async () => {
-      const invalidator = require('./reportCacheInvalidator');
-      if (invalidator.close) await invalidator.close();
-    }},
-    { name: 'heapMonitor', fn: async () => {
-      const heap = require('../utils/heapMonitoring');
-      if (heap.stopHeapMonitoring) heap.stopHeapMonitoring();
     }},
   ];
 

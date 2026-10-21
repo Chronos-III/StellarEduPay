@@ -521,7 +521,7 @@ All workers start on server boot inside the `connectDatabase().then(...)` callba
 | Retry worker | `startRetryWorker()` | `RETRY_INTERVAL_MS` (60s) | Re-attempt failed verifications (MongoDB-backed when Redis is absent) |
 | Consistency scheduler | `startConsistencyScheduler()` | configurable | Detect DB/chain drift |
 | Reminder scheduler | `startReminderScheduler()` | `REMINDER_INTERVAL_MS` (24h) | Send fee reminder emails |
-| TX processing queue worker | `startTxQueueWorker()` | event-driven (BullMQ, **Durable via MongoDB outbox — see Queue Durability below**) | Process queued transactions submitted via `POST /api/payments/process-queue`, the stuck-payment reconciler, and any internal pathway |
+| TX processing queue worker | `startTxQueueWorker()` | event-driven (BullMQ, **Durable via MongoDB outbox — see Queue Durability below**) | Process transactions enqueued by the stuck-payment reconciler and other internal pathways (`enqueueTransaction`) |
 | Transaction retry + DLQ worker | `initializeRetryQueue()` | event-driven (BullMQ, configurable backoff with jitter) | Re-attempt transaction verifications on transient Horizon errors; permanent failures and retry exhaustion land in the dedicated dead-letter queue |
 | Report generation worker | `startReportQueueWorker()` | event-driven (BullMQ, **durable via `ReportJob` collection**) | Generate CSV/JSON reports and update `ReportJob` status to `completed` / `failed` |
 
@@ -683,7 +683,7 @@ payment, the order rules run in — and what happens when they disagree — is
 not visible from the UI alone, so it's documented here in full.
 
 **Live path:** admin page (`frontend/src/pages/fee-adjustments.jsx`) →
-`POST/PUT /api/fee-adjustments` → `feeAdjustmentController.js` →
+`POST /api/fee-adjustments` / `PUT /api/fee-adjustments/:id` → `feeAdjustmentController.js` →
 `FeeAdjustmentRule` Mongo model → `feeAdjustmentService.js`, which is what
 actually computes the fee used at payment time. See the doc comments atop
 `feeAdjustmentRuleModel.js` and `feeAdjustmentService.js` for the
