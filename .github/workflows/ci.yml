@@ -254,6 +254,8 @@ jobs:
       - run: cd frontend && npm ci && cd ..
       - name: Syntax check
         run: npm run check:syntax
+      - name: Translation coverage check
+        run: npm run check:i18n
       - name: Validate migration policy
         run: node scripts/validate-migrations.js
       - name: Run migrations against CI MongoDB
@@ -319,6 +321,8 @@ jobs:
       - run: cd frontend && npm ci && cd ..
       - name: Syntax check
         run: npm run check:syntax
+      - name: Translation coverage check
+        run: npm run check:i18n
       - name: Validate migration policy
         run: node scripts/validate-migrations.js
       - name: Run migrations against CI MongoDB
