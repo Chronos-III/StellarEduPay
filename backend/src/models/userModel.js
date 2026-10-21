@@ -27,6 +27,8 @@ const userSchema = new mongoose.Schema(
       },
     ],
     isActive: { type: Boolean, default: true, index: true },
+    // Bumped on deactivation/demotion to invalidate outstanding access tokens
+    tokenVersion: { type: Number, default: 0 },
     mfaEnabled: { type: Boolean, default: false },
     mfaSecret: { type: String, default: null },
     mfaBackupCodes: [
@@ -45,9 +47,10 @@ const userSchema = new mongoose.Schema(
     // Invitation flow
     invitationToken: { type: String, default: null },
     invitationExpires: { type: Date, default: null },
-    // Password reset flow
+    // Password reset flow (only one active token per user; overwritten on each request)
     resetToken: { type: String, default: null },
     resetExpires: { type: Date, default: null },
+    resetRequestIp: { type: String, default: null },
   },
   { timestamps: true }
 );
