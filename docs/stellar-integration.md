@@ -377,49 +377,23 @@ return   { status: 'valid',      excessAmount: 0,      message: '...' };
 |---|---|---|---|
 | `valid` | ✅ Yes | N/A | Exact match |
 | `overpaid` | ✅ Yes | N/A | Excess recorded; student is considered paid |
-| `partial` / `underpaid` | ✅ Yes (cumulative) | Requires reconciliation | Payment accepted and recorded as `SUCCESS`; cumulative balance updated. Partial credit or refund can be applied via the underpaidReconciliationService. See Issue #1039 |
+| `partial` / `underpaid` | ✅ Yes (cumulative) | N/A | Payment accepted and recorded as `SUCCESS`; cumulative balance updated. |
 | `unknown` | ❌ No | N/A | Student not found in database |
 
 ### Underpaid Payment Reconciliation (Issue #1039)
 
 Underpaid/partial payments are **accepted and recorded as `SUCCESS`** rather than rejected, because funds have already arrived on-chain. Once a partial payment is recorded, it contributes to the cumulative total and the student's remaining balance is updated accordingly.
 
-**Reconciliation Options:**
-
-1. **Partial Credit (Recommended)** - The funds are already credited toward the student's balance immediately; the remaining shortfall is communicated to the parent.
-
-2. **Refund** - If circumstances warrant (parent requested, administrative adjustment, etc.), the payment can be marked for refund via `underpaidReconciliationService.initiateRefund()`, and the actual refund transaction is completed separately on the Stellar network.
-
-**Tracking Reconciliation:**
-
-Each payment carries an `underpaidReconciliation` object tracking:
+The payment carries an `underpaidReconciliation` sub-document on the `Payment` model tracking:
 - `status`: one of `pending`, `partial_credited`, `refund_initiated`, `refund_completed`
 - `appliedCredit`: amount credited to student balance
 - `refundTxHash`: Stellar tx hash if refunded
 - `creditAppliedAt`, `refundInitiatedAt`, `refundCompletedAt`: audit timestamps
 
-**Example: Recording a Partial Payment**
-
-```js
-// Parent sends 250 XLM but fee is 1000 XLM
-const payment = await recordPayment({
-  amount: 250,
-  feeAmount: 1000,
-  // ...
-  feeValidationStatus: 'partial',  // detected during verification
-  excessAmount: 0,
-  status: 'SUCCESS',                 // accepted, not failed
-  // ...
-});
-
-// Student's balance is updated immediately
-student.totalPaid += 250;
-student.remainingBalance = 750;
-student.feePaid = false;
-
-// Admin can later apply partial credit or initiate refund
-await underpaidReconciliationService.applyPartialCredit(payment._id, 250, 'admin@school', schoolId);
-```
+These fields are populated by the refund service when a refund is processed.
+Partial payments are credited immediately toward the student's cumulative
+balance; the remaining shortfall is reflected in the student's
+`remainingBalance`.
 
 ---
 
