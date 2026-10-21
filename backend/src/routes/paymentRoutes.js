@@ -276,5 +276,4 @@ router.post("/:txHash/receipt", requireSchoolAuth(['owner', 'staff']), validateT
 
 // Student-scoped payment listing
 router.get("/:studentId", validateStudentIdParam, requireSchoolAuth(['owner', 'staff', 'read_only']), getStudentPayments);
-
 module.exports = router;

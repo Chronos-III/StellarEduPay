@@ -27,6 +27,39 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
+// ── Session revocation helper (#1772) ─────────────────────────────────────────
+// Revokes all refresh tokens/families for a user and bumps their tokenVersion
+// so any access token already issued is rejected by the auth middleware.
+// Returns the new tokenVersion (or null when the user cannot be found).
+async function revokeUserSessions(userId) {
+  if (!userId) return null;
+
+  const store = getStore();
+  const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
+
+  try {
+    await store.revokeAllUserTokens(userId, refreshTTL);
+  } catch (err) {
+    logger.warn('[AuthController] Failed to revoke user sessions', { userId, error: err.message });
+  }
+
+  // Bump tokenVersion so outstanding access tokens are invalidated immediately.
+  let newVersion = null;
+  try {
+    const User = require('../models/userModel');
+    const updated = await User.findByIdAndUpdate(
+      userId,
+      { $inc: { tokenVersion: 1 } },
+      { new: true, projection: { tokenVersion: 1 } }
+    );
+    newVersion = updated?.tokenVersion ?? null;
+  } catch (err) {
+    logger.warn('[AuthController] Failed to bump tokenVersion', { userId, error: err.message });
+  }
+
+  return newVersion;
+}
+
 // ── Per-account login lockout ─────────────────────────────────────────────────
 
 const LOGIN_FAIL_WINDOW = 900;
@@ -396,14 +429,69 @@ async function handleRefresh(req, res) {
   }
 
   // Reconstruct JWT payload from stored metadata so the refreshed token is
-  // correct for every user type, not just the super-admin (#819)
+  // correct for every user type, not just the super-admin (#819).
+  //
+  // #1739 — Re-derive mfaSetupPending from the live User record instead of
+  // copying it blindly from stored metadata. Without this, an admin who
+  // completed MFA enrolment still gets a restricted token on every silent
+  // refresh because the old metadata still contains mfaSetupPending:true,
+  // sending them back to /mfa-setup indefinitely.
+  //
+  // For DB users (meta.userId is set and is not the env super-admin) we do a
+  // lightweight lookup to check the current mfaEnabled + mfaSecret state and
+  // the school's requireMfa policy, then compute the flag fresh. This also
+  // picks up the role/schoolId changes addressed in #1528.
   const jwtPayload = {};
   if (meta.role)     jwtPayload.role     = meta.role;
   if (meta.userId)   jwtPayload.userId   = meta.userId;
   if (meta.roles)    jwtPayload.roles    = meta.roles;
   if (meta.schoolId) jwtPayload.schoolId = meta.schoolId;
   if (meta.username) jwtPayload.username = meta.username;
-  if (meta.mfaSetupPending) jwtPayload.mfaSetupPending = meta.mfaSetupPending;
+
+  // Re-derive mfaSetupPending for DB users only (super_admin has no User doc).
+  if (meta.userId && meta.userId !== 'super_admin') {
+    try {
+      const User = require('../models/userModel');
+      const liveUser = await User.findById(meta.userId).lean();
+
+      if (!liveUser || !liveUser.isActive) {
+        // Account was deleted or deactivated — refuse the refresh.
+        res.clearCookie(REFRESH_COOKIE, { path: REFRESH_COOKIE_PATH });
+        return res.status(401).json({ error: 'Account is disabled.', code: 'ACCOUNT_DISABLED' });
+      }
+
+      // Reflect any role / school changes made since the token was originally issued.
+      if (liveUser.roles)    jwtPayload.roles    = liveUser.roles;
+      if (liveUser.schoolId) jwtPayload.schoolId = liveUser.schoolId;
+
+      // Re-evaluate MFA setup requirement against live state.
+      const userHasPersonalMfa = Boolean(liveUser.mfaEnabled && liveUser.mfaSecret);
+      let schoolRequiresMfa = false;
+      if (liveUser.schoolId) {
+        try {
+          const School = require('../models/schoolModel');
+          const liveSchool = await School.findOne({ schoolId: liveUser.schoolId, isActive: true }).lean();
+          schoolRequiresMfa = Boolean(liveSchool?.requireMfa);
+        } catch {
+          // Non-fatal: fall back to false (more permissive is safer here).
+        }
+      }
+      const mfaSetupPending =
+        !userHasPersonalMfa &&
+        (process.env.REQUIRE_MFA === 'true' || schoolRequiresMfa);
+
+      if (mfaSetupPending) {
+        jwtPayload.mfaSetupPending = true;
+      }
+      // If mfaSetupPending is false we deliberately omit it so the claim
+      // disappears from the new token even if the old meta still had it.
+    } catch (err) {
+      // DB unavailable — fall back to trusting stored metadata so a transient
+      // DB hiccup doesn't log everyone out. Log so it's visible in alerts.
+      logger.warn('[AuthController] DB lookup failed during refresh; falling back to stored metadata', { error: err.message });
+      if (meta.mfaSetupPending) jwtPayload.mfaSetupPending = meta.mfaSetupPending;
+    }
+  }
 
   const accessToken = jwt.sign(jwtPayload, secret, { expiresIn: accessTTL });
 
@@ -613,12 +701,15 @@ module.exports = {
   handleListSessions,
   handleRevokeSession,
   handleChangePassword,
+  revokeUserSessions,
   // Re-exported from services/sessionStore so callers (e.g. userController)
   // can revoke sessions without optional chaining that silently no-ops.
   getStore,
   revokeAllUserSessions,
   parseTTL,
   _resetStore,
+  // Exported for use in mfaController and userController
+  issueRefreshToken,
   isLockedOut,
   isSuperAdmin,
 };

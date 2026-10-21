@@ -5,23 +5,6 @@ const Joi = require('joi');
 
 const REQUIRED_VARS = ['MONGO_URI', 'JWT_SECRET', 'RECEIPT_SIGNATURE_SECRET'];
 
-function validateEnv() {
-  const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
-
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required environment variables: ${missing.join(', ')}. ` +
-        'Please set them in your environment or .env file.'
-    );
-  }
-
-  if (process.env.JWT_SECRET.length < 32) {
-    throw new Error('JWT_SECRET must be at least 32 characters long.');
-  }
-}
-
-validateEnv();
-
 const schema = Joi.object({
   // ── Required ────────────────────────────────────────────────────────────────
   MONGO_URI: Joi.string().required(),
@@ -69,6 +52,29 @@ const schema = Joi.object({
 
   // ── Auth ────────────────────────────────────────────────────────────────────
   JWT_EXPIRES_IN: Joi.string().default("8h"),
+
+  // ── Public links ────────────────────────────────────────────────────────────
+  // Canonical public base URL used to build every outbound link (invitations,
+  // password resets, unsubscribe links, …). Required and https-only in
+  // production; falls back to localhost outside production. FRONTEND_URL is
+  // still accepted as a legacy alias during migration.
+  APP_URL: Joi.string()
+    .uri({ scheme: ["http", "https"] })
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.string()
+        .uri({ scheme: ["https"] })
+        .required()
+        .messages({
+          "any.required":
+            "APP_URL is required in production (e.g. https://app.example.com)",
+          "string.uriCustomScheme":
+            "APP_URL must be an absolute https:// URL in production",
+        }),
+      otherwise: Joi.string()
+        .uri({ scheme: ["http", "https"] })
+        .default("http://localhost:3000"),
+    }),
 
   // ── Fee reminders ───────────────────────────────────────────────────────────
   REMINDER_INTERVAL_MS: Joi.number().integer().min(0).default(60 * 60 * 1000),
@@ -149,19 +155,40 @@ const schema = Joi.object({
   .unknown(true) // tolerate variables owned by other modules during migration
   .prefs({ convert: true, abortEarly: false });
 
-const { value: env, error } = schema.validate(process.env, {
+function validateEnv() {
+  const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables: ${missing.join(', ')}. ` +
+        'Please set them in your environment or .env file.'
+    );
+  }
+
+  if (process.env.JWT_SECRET.length < 32) {
+    throw new Error('JWT_SECRET must be at least 32 characters long.');
+  }
+
+  const { error } = schema.validate(process.env, {
+    stripUnknown: false,
+  });
+
+  if (error) {
+    const details = error.details
+      .map((d) => `  - ${d.path.join(".")}: ${d.message}`)
+      .join("\n");
+    throw new Error(
+      `[Config] Invalid environment configuration:\n${details}\n` +
+        "Check your .env file against .env.example.",
+    );
+  }
+}
+
+validateEnv();
+
+const { value: env } = schema.validate(process.env, {
   stripUnknown: false,
 });
-
-if (error) {
-  const details = error.details
-    .map((d) => `  - ${d.path.join(".")}: ${d.message}`)
-    .join("\n");
-  throw new Error(
-    `[Config] Invalid environment configuration:\n${details}\n` +
-      "Check your .env file against .env.example.",
-  );
-}
 
 const PORT = env.PORT;
 const MONGO_URI = env.MONGO_URI;
@@ -332,6 +359,30 @@ const JWT_SECRET = env.JWT_SECRET;
 const JWT_SECRET_MIN_LENGTH = 32;
 const JWT_EXPIRES_IN = env.JWT_EXPIRES_IN;
 
+// ── Public links ──────────────────────────────────────────────────────────────
+// Single source of truth for outbound links. Normalised without a trailing
+// slash so callers can safely append paths (`${APP_URL}/set-password`).
+// Legacy FRONTEND_URL is honoured only when APP_URL is not set.
+const APP_URL = (env.APP_URL || process.env.FRONTEND_URL || "http://localhost:3000")
+  .trim()
+  .replace(/\/+$/, "");
+
+if (env.NODE_ENV === "production") {
+  let parsedAppUrl;
+  try {
+    parsedAppUrl = new URL(APP_URL);
+  } catch {
+    throw new Error(
+      `[Config] APP_URL must be an absolute URL in production, got: ${APP_URL}`,
+    );
+  }
+  if (parsedAppUrl.protocol !== "https:") {
+    throw new Error(
+      `[Config] APP_URL must use https:// in production, got: ${APP_URL}`,
+    );
+  }
+}
+
 // ── Fee Reminders ─────────────────────────────────────────────────────────────
 // How often the scheduler checks for unpaid fees (default: 1 hour).
 // Schools are only processed during their configured send window, so a shorter
@@ -423,6 +474,7 @@ const config = {
   JWT_SECRET,
   JWT_SECRET_MIN_LENGTH,
   JWT_EXPIRES_IN,
+  APP_URL,
   REMINDER_INTERVAL_MS,
   REMINDER_COOLDOWN_HOURS,
   REMINDER_MAX_COUNT,
