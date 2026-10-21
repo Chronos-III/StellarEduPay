@@ -7,6 +7,7 @@ const School = require('../models/schoolModel');
 const { logAudit } = require('../services/auditService');
 const logger = require('../utils/logger');
 const schoolCache = require('../services/schoolCacheInvalidator');
+const { revokeAllUserSessions } = require('../services/sessionStore');
 
 // ── MFA secret encryption (AES-256-GCM) ──────────────────────────────────────
 // Key is derived from JWT_SECRET so no extra env var is needed.
@@ -751,6 +752,11 @@ async function disableUserMfa(req, res) {
     await User.findByIdAndUpdate(userId, {
       $set: { mfaEnabled: false, mfaSecret: null, mfaBackupCodes: [] },
     });
+
+    // Disabling a second factor must not leave pre-existing sessions alive:
+    // revoke every refresh-token family for this user so any stolen cookie
+    // stops minting access tokens.
+    await revokeAllUserSessions(userId);
 
     await logAudit({
       schoolId: user.schoolId || 'system',

@@ -2,7 +2,6 @@
 
 const mongoose = require('mongoose');
 const StellarSdk = require('@stellar/stellar-sdk');
-const { encryptWebhookSecret, decryptWebhookSecret } = require('../services/webhookSecretEncryption');
 
 /**
  * School model — each school is a fully independent tenant.
@@ -55,6 +54,13 @@ const schoolSchema = new mongoose.Schema(
      * transaction on first run.
      */
     syncCursor:     { type: String, default: null },
+    /**
+     * Earliest transaction time the poller and verifier will ingest for this
+     * school's wallet (#1818). Transactions dated before it are skipped, so an
+     * existing, busy wallet does not replay its history. Null = no lower bound
+     * (legacy behaviour). New schools and rotated wallets set it to "now".
+     */
+    ingestStartsAt: { type: Date, default: null },
     adminEmail:     { type: String, default: null },
     address:        { type: String, default: null },
     /**
@@ -95,19 +101,9 @@ const schoolSchema = new mongoose.Schema(
         message: props => `'${props.value}' is not a valid IANA timezone identifier`,
       },
     },
-    /**
-     * Per-school webhook endpoint URL. Must be an https:// URL that resolves
-     * to a public IP address (RFC 1918, loopback, and link-local are rejected).
-     * Validated at registration time and on each delivery attempt.
-     */
-    webhookUrl:     { type: String, default: null },
-    /**
-     * Per-school HMAC secret used to sign outbound webhook deliveries.
-     * Recipients verify the X-StellarEduPay-Signature header to confirm
-     * the payload originated from this server and was not tampered with.
-     * Generate with: crypto.randomBytes(32).toString('hex')
-     */
-    webhookSecret:  { type: String, default: null },
+    // webhookUrl / webhookSecret were removed (#1640): outbound webhooks are
+    // configured only through WebhookEndpoint. Migration 036 converted every
+    // School.webhookUrl into a WebhookEndpoint and unset both fields.
     /**
      * Per-school webhook payload field controls.
      * Determines which fields are included in outbound webhook payloads.
@@ -304,36 +300,17 @@ const schoolSchema = new mongoose.Schema(
 
 schoolSchema.index({ slug: 1 }, { unique: true });
 schoolSchema.index({ slug: 1, isActive: 1 });
+schoolSchema.index({ isActive: 1, name: 1 });
 
 // toJSON transform to exclude sensitive fields
 schoolSchema.set('toJSON', {
   transform: (doc, ret) => {
     delete ret.jwtSecret;
-    delete ret.webhookSecret;
     delete ret.internalNotes;
     delete ret.mfaSecret;
     delete ret.mfaBackupCodes;
     return ret;
   },
-});
-
-// ── Webhook secret encryption — Issue #75 ────────────────────────────────────
-// Encrypt webhookSecret at rest before persisting; decrypt transparently on load.
-// Both operations are no-ops when WEBHOOK_SECRET_ENCRYPTION_KEY is not set,
-// so local development without the key continues to work.
-
-schoolSchema.pre('save', function (next) {
-  if (this.isModified('webhookSecret') && this.webhookSecret != null) {
-    this.webhookSecret = encryptWebhookSecret(this.webhookSecret);
-  }
-  next();
-});
-
-// Decrypt after loading from DB so callers always receive plaintext.
-schoolSchema.post('init', function () {
-  if (this.webhookSecret != null) {
-    this.webhookSecret = decryptWebhookSecret(this.webhookSecret);
-  }
 });
 
 module.exports = mongoose.model('School', schoolSchema);
